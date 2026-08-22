@@ -28,5 +28,5 @@ RUN apk add --no-cache curl \
 # supercronic binary is world-executable (chmod 0755 above).
 USER nobody:nobody
 
-ENTRYPOINT ["supercronic"]
+ENTRYPOINT ["/usr/local/bin/supercronic"]
 CMD ["/etc/supercronic/crontab"]

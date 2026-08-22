@@ -91,6 +91,14 @@ describe('docker crontabs mirror vercel.json', () => {
   })
 })
 
+describe('cron container', () => {
+  it('starts supercronic through its absolute install path', () => {
+    const dockerfile = readFileSync(join(ROOT, 'docker', 'cron.Dockerfile'), 'utf8')
+
+    expect(dockerfile).toContain('ENTRYPOINT ["/usr/local/bin/supercronic"]')
+  })
+})
+
 describe('exclusion and override tables', () => {
   it('lists no path that vercel.json no longer schedules', () => {
     const known = new Set(crons.map((c) => c.path))
