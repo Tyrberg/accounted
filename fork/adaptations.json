@@ -1,0 +1,84 @@
+{
+  "upstream": {
+    "repo": "erp-mafia/accounted",
+    "remote": "upstream",
+    "ref": "upstream/main"
+  },
+  "maxSyncAgeDays": 10,
+  "adaptations": [
+    {
+      "id": "fork-maintenance-layer",
+      "tier": 1,
+      "summary": "The fork/ directory itself: manifest, sync routine, tests and the upgrade/AGPL/upstream-contribution documentation.",
+      "why": "We follow upstream and do not develop this product ourselves, so the fork needs a maintenance layer and that layer is by definition not upstream's. It is confined to one new top-level directory and modifies no upstream file, which keeps the merge surface at zero.",
+      "paths": ["fork/"],
+      "tracked": true,
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "fork/sync.ts",
+          "pattern": "export function runSync",
+          "reason": "The sync routine is gone or renamed, so nothing is watching upstream any more."
+        },
+        {
+          "kind": "local-contains",
+          "path": "fork/README.md",
+          "pattern": "^# Fork maintenance",
+          "reason": "The upgrade procedure, the AGPL section 13 obligation and the upstream contribution rules are gone."
+        },
+        {
+          "kind": "upstream-absent",
+          "path": "fork/README.md",
+          "pattern": "[\\s\\S]",
+          "reason": "Upstream has created its own fork/ directory, so our layer now collides with theirs and has to move."
+        }
+      ]
+    },
+    {
+      "id": "docker-compose-override",
+      "tier": 1,
+      "summary": "Host-local docker-compose.override.yml on each deployment box, seeded from fork/templates/docker-compose.override.example.yml.",
+      "why": "Site-specific deployment settings (ports, volumes, resource limits, extra services) belong in Compose's own override mechanism, not in a patch to upstream's docker-compose.yml. The live file stays untracked because it is per host; the committed template is what we review and keep in step with upstream.",
+      "paths": ["docker-compose.override.yml"],
+      "tracked": false,
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "fork/templates/docker-compose.override.example.yml",
+          "pattern": "^  app:$",
+          "reason": "The template no longer overrides the app service, so a box seeded from it gets nothing."
+        },
+        {
+          "kind": "upstream-contains",
+          "path": "docker-compose.yml",
+          "pattern": "^services:$",
+          "reason": "Upstream's compose file no longer declares a services block, so the override merges into nothing."
+        },
+        {
+          "kind": "upstream-contains",
+          "path": "docker-compose.yml",
+          "pattern": "^  app:$",
+          "reason": "Upstream renamed or removed the app service. Compose merges overrides BY SERVICE NAME, so our override would silently stop applying instead of failing."
+        },
+        {
+          "kind": "upstream-contains",
+          "path": "docker-compose.yml",
+          "pattern": "^  cron:$",
+          "reason": "Upstream renamed or removed the cron service, so any override we carry for scheduled jobs silently stops applying."
+        },
+        {
+          "kind": "upstream-contains",
+          "path": "docker-compose.yml",
+          "pattern": "env_file: \\.env",
+          "reason": "Upstream stopped loading .env into the app service, so environment-variable adaptations (our tier 1 default) no longer reach the container."
+        }
+      ]
+    }
+  ]
+}

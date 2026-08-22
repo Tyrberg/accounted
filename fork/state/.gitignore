@@ -1,0 +1,6 @@
+# Run artefacts of fork/cli.ts: last-sync.json and last-report.md. They are
+# per checkout and per run, so they are never committed. A nested .gitignore
+# keeps this out of the repo-root .gitignore, which upstream owns: the whole
+# fork layer is confined to this directory.
+*
+!.gitignore
