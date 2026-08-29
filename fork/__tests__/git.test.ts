@@ -9,6 +9,8 @@ import {
   DisallowedGitCommandError,
   isAllowedGitInvocation,
   readRemotes,
+  readRemoteUrl,
+  remoteMatchesRepo,
   runGit,
   upstreamTree,
 } from '../lib/git'
@@ -26,6 +28,7 @@ describe('the git allowlist', () => {
     expect(isAllowedGitInvocation(['rev-list', '--count', 'HEAD..upstream/main'])).toBe(true)
     expect(isAllowedGitInvocation(['log', '-1', '--format=%cI', 'upstream/main'])).toBe(true)
     expect(isAllowedGitInvocation(['remote'])).toBe(true)
+    expect(isAllowedGitInvocation(['remote', 'get-url', 'upstream'])).toBe(true)
     expect(isAllowedGitInvocation(['worktree', 'add', '--detach', '/tmp/x', 'upstream/main'])).toBe(true)
     expect(isAllowedGitInvocation(['worktree', 'remove', '--force', '/tmp/x'])).toBe(true)
   })
@@ -90,6 +93,52 @@ describe('repository queries', () => {
       'upstream',
     )
     expect(missing.hasRemote).toBe(false)
+  })
+
+  it('reads the URL of the manifest remote, and reports null when git cannot', () => {
+    expect(readRemoteUrl(
+      runner({ 'git remote get-url upstream': { code: 0, stdout: 'https://github.com/erp-mafia/accounted.git\n', stderr: '' } }),
+      '/repo',
+      'upstream',
+    )).toBe('https://github.com/erp-mafia/accounted.git')
+
+    expect(readRemoteUrl(
+      runner({ 'git remote get-url upstream': { code: 2, stdout: '', stderr: 'No such remote' } }),
+      '/repo',
+      'upstream',
+    )).toBeNull()
+
+    expect(readRemoteUrl(
+      runner({ 'git remote get-url upstream': { code: 0, stdout: '  \n', stderr: '' } }),
+      '/repo',
+      'upstream',
+    )).toBeNull()
+  })
+
+  it('recognises the declared upstream repository in every URL shape git accepts', () => {
+    for (const url of [
+      'https://github.com/erp-mafia/accounted.git',
+      'https://github.com/erp-mafia/accounted',
+      'https://github.com/ERP-Mafia/Accounted/',
+      'git@github.com:erp-mafia/accounted.git',
+      'ssh://git@github.com/erp-mafia/accounted.git',
+    ]) {
+      expect(remoteMatchesRepo(url, 'erp-mafia/accounted')).toBe(true)
+    }
+  })
+
+  it('refuses a remote that points somewhere other than the declared repository', () => {
+    // The name "upstream" is not evidence of identity: a repointed remote must
+    // never be fetched, diffed and reported on as if it were upstream.
+    for (const url of [
+      'https://github.com/Tyrberg/accounted.git',
+      'https://gitlab.atteq.com/erp-mafia/gnubok.git',
+      'https://github.com/erp-mafia/accounted-fork.git',
+      'accounted',
+      '',
+    ]) {
+      expect(remoteMatchesRepo(url, 'erp-mafia/accounted')).toBe(false)
+    }
   })
 
   it('reads the changed-file list and drops blank lines', () => {

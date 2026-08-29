@@ -234,9 +234,13 @@ npx tsx fork/cli.ts sync --upstream-gates      # the weekly routine
 npx tsx fork/cli.ts status                     # is the schedule still alive?
 ```
 
-`sync` fetches upstream, resolves every anchor through `git show
-upstream/main:<path>`, reconciles the diff both ways, runs the gates in our
-tree, and (with `--upstream-gates`) runs them again in a throwaway detached
+`sync` first checks that the remote named in the manifest actually points at
+the repository the manifest declares (`erp-mafia/accounted`) — a remote's name
+is not evidence of its identity, and a repointed one would otherwise be
+fetched, diffed and gated against while the run reported a clean sync of the
+wrong repository. It then fetches upstream, resolves every anchor through `git
+show upstream/main:<path>`, reconciles the diff both ways, runs the gates in
+our tree, and (with `--upstream-gates`) runs them again in a throwaway detached
 worktree at upstream's tip, so "is upstream green" is answered by upstream's
 code rather than inferred from ours.
 
@@ -267,7 +271,7 @@ anything the flags told it not to do. Nothing is hidden by the ranking.
 PATH=/usr/local/bin:/usr/bin:/bin
 FORK_SYNC_ALERT_REPO=Tyrberg/accounted
 FORK_SYNC_HEARTBEAT_URL=https://hc-ping.com/REPLACE-WITH-YOUR-CHECK-UUID
-17 4 * * 1 deploy cd /opt/projects/accounted && npx tsx fork/cli.ts sync --upstream-gates >> /var/log/accounted-fork-sync.log 2>&1 && curl -fsS --max-time 10 "$FORK_SYNC_HEARTBEAT_URL" >/dev/null
+17 4 * * 1 deploy cd /opt/projects/accounted && npx tsx fork/cli.ts sync --upstream-gates >> fork/state/sync.log 2>&1 && curl -fsS --max-time 10 "$FORK_SYNC_HEARTBEAT_URL" >/dev/null
 ```
 
 Replace `deploy` with the user that owns the clone, and end the file with a
@@ -275,6 +279,16 @@ newline: cron ignores a last line without one. Without a heartbeat check, drop
 the `FORK_SYNC_HEARTBEAT_URL` line and the trailing `&& curl ...` rather than
 leaving the variable empty, which would make every successful run end in a
 failed `curl`.
+
+The log goes to `fork/state/sync.log` inside the clone, not to `/var/log`, on
+purpose: the redirection is opened by the shell as the cron user **before** the
+command runs, so a `/var/log/...` destination that user cannot create makes the
+job die at that redirect every week without ever executing the sync — silent in
+exactly the way this routine exists to prevent. `fork/state/` is owned by the
+clone owner and already gitignored, so it is writable by definition. Prefer
+`/var/log` only after provisioning the file for that user, e.g.
+`sudo install -o deploy -g deploy -m 0644 /dev/null /var/log/accounted-fork-sync.log`
+plus a logrotate entry.
 
 **Why a cron on the box and not a GitHub Actions workflow.** Two reasons, both
 decisive. GitHub does not run `on: schedule` workflows in forked repositories
@@ -308,7 +322,8 @@ watching is on the box, and so is the job that watches it.
 
 The routine only issues git commands from a read-only allowlist in
 [`fork/lib/git.ts`](lib/git.ts): `fetch`, `show`, `diff`, `rev-parse`,
-`rev-list`, `log`, `remote`, and the two `worktree` calls that build and remove
+`rev-list`, `log`, `remote` (including `remote get-url`), and the two
+`worktree` calls that build and remove
 the scratch checkout outside the repository. `merge`, `rebase`, `checkout`,
 `reset`, `pull`, `push`, `commit`, `add`, `clean` and `stash` are refused, and a
 test walks a full run to prove none of them is ever issued. Taking the upgrade

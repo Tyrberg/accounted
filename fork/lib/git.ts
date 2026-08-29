@@ -39,6 +39,10 @@ export const ALLOWED_GIT_INVOCATIONS: readonly { id: string; matches: (args: rea
   { id: 'log-one', matches: (a) => a[0] === 'log' && a[1] === '-1' && a.length === 4 },
   { id: 'remote', matches: (a) => a[0] === 'remote' && a.length === 1 },
   {
+    id: 'remote-get-url',
+    matches: (a) => a[0] === 'remote' && a[1] === 'get-url' && a.length === 3,
+  },
+  {
     id: 'worktree-add',
     matches: (a) => a[0] === 'worktree' && a[1] === 'add' && a[2] === '--detach' && a.length === 5,
   },
@@ -98,6 +102,38 @@ export function readRemotes(runner: Runner, cwd: string, remote: string): Remote
     ? result.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
     : []
   return { hasRemote: remotes.includes(remote), remotes }
+}
+
+/** The configured fetch URL of a remote, or null when git cannot report one. */
+export function readRemoteUrl(runner: Runner, cwd: string, remote: string): string | null {
+  const result = runGit(runner, cwd, ['remote', 'get-url', remote])
+  if (result.code !== 0) return null
+  const url = result.stdout.trim()
+  return url === '' ? null : url
+}
+
+/**
+ * Does `url` point at `owner/name` on any host?
+ *
+ * A remote named `upstream` proves nothing about where it points: it can be
+ * repointed by hand or inherited from a differently-configured clone, and the
+ * whole routine would then fetch, diff and gate against a stranger's
+ * repository while reporting success. The manifest declares the repository it
+ * means, so the URL is checked against that declaration rather than trusted.
+ *
+ * Accepts both `https://host/owner/name(.git)` and `git@host:owner/name(.git)`
+ * shapes, plus a trailing slash, and compares case-insensitively because git
+ * hosts treat owner and repository names that way.
+ */
+export function remoteMatchesRepo(url: string, repo: string): boolean {
+  const normalise = (value: string) =>
+    value.trim().replace(/\.git$/i, '').replace(/\/+$/, '').toLowerCase()
+  const normalisedUrl = normalise(url)
+  const wanted = normalise(repo)
+  if (wanted === '') return false
+  const segments = normalisedUrl.split(/[/:]/).filter(Boolean)
+  if (segments.length < 2) return false
+  return segments.slice(-2).join('/') === wanted
 }
 
 export function fetchUpstream(runner: Runner, cwd: string, remote: string): CommandResult {

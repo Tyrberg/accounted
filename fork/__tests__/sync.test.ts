@@ -56,6 +56,7 @@ const HEALTHY_TREE: Record<string, string> = {
 
 const HEALTHY_COMMANDS: Record<string, CommandResult> = {
   'git remote': { code: 0, stdout: 'origin\nupstream\n', stderr: '' },
+  'git remote get-url upstream': { code: 0, stdout: 'https://github.com/erp-mafia/accounted.git\n', stderr: '' },
   'git fetch --no-tags upstream': { code: 0, stdout: '', stderr: '' },
   'git rev-parse upstream/main': { code: 0, stdout: 'abc1234\n', stderr: '' },
   'git log -1 --format=%cI upstream/main': { code: 0, stdout: '2026-08-20T09:00:00Z\n', stderr: '' },
@@ -244,6 +245,36 @@ describe('sync', () => {
     expect(outcome.plumbingProblems.join('\n')).toContain('no "upstream" remote')
     expect(outcome.plumbingProblems.join('\n')).toContain('undeclared drift was not checked')
     expect(outcome.report).toContain('NOT CHECKED')
+  })
+
+  it('reports plumbing, not silence, when the remote named upstream points somewhere else', () => {
+    // A remote can be repointed by hand or inherited from another clone. If
+    // only the name were checked, the routine would fetch, diff and gate a
+    // stranger's repository and report a clean sync.
+    const { deps } = harness({
+      commands: {
+        'git remote get-url upstream': {
+          code: 0, stdout: 'https://github.com/Tyrberg/accounted.git\n', stderr: '',
+        },
+      },
+    })
+
+    const outcome = run(deps, options('sync'))
+
+    expect(outcome.exitCode).toBe(EXIT.plumbing)
+    expect(outcome.plumbingProblems.join('\n')).toContain('not the declared upstream erp-mafia/accounted')
+    expect(outcome.checks.find((c) => c.adaptationId === 'compose-override')?.status).toBe('unavailable')
+  })
+
+  it('reports plumbing when the upstream remote URL cannot be read', () => {
+    const { deps } = harness({
+      commands: { 'git remote get-url upstream': { code: 2, stdout: '', stderr: 'No such remote' } },
+    })
+
+    const outcome = run(deps, options('sync'))
+
+    expect(outcome.exitCode).toBe(EXIT.plumbing)
+    expect(outcome.plumbingProblems.join('\n')).toContain('could not read the URL of the "upstream" remote')
   })
 
   it('reports plumbing when the fetch fails, and does not report upstream anchors as passing', () => {

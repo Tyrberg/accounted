@@ -112,6 +112,18 @@ describe('the /etc/cron.d entry in fork/README.md', () => {
     }
   })
 
+  it('logs somewhere the cron user can actually write', () => {
+    // The shell opens the redirect BEFORE running the command, as the cron
+    // user. An absolute path that user cannot create (the classic /var/log
+    // entry) kills the job at the redirect every week without ever running the
+    // sync: silent in exactly the way this routine exists to prevent.
+    for (const line of scheduleLines) {
+      const target = line.match(/>>\s*(\S+)/)?.[1]
+      expect(target).toBeDefined()
+      expect(target?.startsWith('/')).toBe(false)
+    }
+  })
+
   it('passes the alert repo and heartbeat through the crontab environment', () => {
     // Both are documented in section 5 as the way the run makes noise; an
     // example that omits them ships a routine that alarms nowhere.

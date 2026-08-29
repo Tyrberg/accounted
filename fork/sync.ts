@@ -27,6 +27,8 @@ import {
   describeRef,
   fetchUpstream,
   readRemotes,
+  readRemoteUrl,
+  remoteMatchesRepo,
   upstreamTree,
 } from './lib/git'
 import { runGates, runUpstreamGates, type FsProbe, type GateResult } from './lib/gates'
@@ -131,12 +133,27 @@ function localTree(deps: SyncDeps): Tree {
 }
 
 function collectUpstream(deps: SyncDeps, manifest: ForkManifest, plumbing: string[]): UpstreamSnapshot {
-  const { remote, ref } = manifest.upstream
+  const { repo, remote, ref } = manifest.upstream
 
   const remotes = readRemotes(deps.runner, deps.root, remote)
   if (!remotes.hasRemote) {
     plumbing.push(
       `no "${remote}" remote in this checkout (found: ${remotes.remotes.join(', ') || 'none'}), so nothing upstream was inspected`,
+    )
+    return { available: false, tree: UNAVAILABLE_TREE }
+  }
+
+  // The remote's NAME is not evidence of its identity. Without this check a
+  // repointed or inherited "upstream" would be fetched, diffed and gated
+  // against, and the run would report a clean sync of the wrong repository.
+  const remoteUrl = readRemoteUrl(deps.runner, deps.root, remote)
+  if (remoteUrl === null) {
+    plumbing.push(`could not read the URL of the "${remote}" remote, so nothing upstream was inspected`)
+    return { available: false, tree: UNAVAILABLE_TREE }
+  }
+  if (!remoteMatchesRepo(remoteUrl, repo)) {
+    plumbing.push(
+      `the "${remote}" remote points at ${remoteUrl}, not the declared upstream ${repo}, so nothing upstream was inspected`,
     )
     return { available: false, tree: UNAVAILABLE_TREE }
   }
