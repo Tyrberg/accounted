@@ -91,6 +91,24 @@ describe('docker crontabs mirror vercel.json', () => {
   })
 })
 
+describe('cron container', () => {
+  /**
+   * Both ends of the absolute entrypoint, tied to one constant. Asserting only
+   * the ENTRYPOINT string would stay green if the install destination moved,
+   * which is the exact drift that turns a soft PATH lookup into a hard
+   * `exec: no such file or directory` crash loop.
+   */
+  it('starts supercronic through the same absolute path it installs to', () => {
+    const dockerfile = readFileSync(join(ROOT, 'docker', 'cron.Dockerfile'), 'utf8')
+
+    const installed = dockerfile.match(/-o (\/\S*\/supercronic)\b/)?.[1]
+
+    expect(installed).toBe('/usr/local/bin/supercronic')
+    expect(dockerfile).toContain(`ENTRYPOINT ["${installed}"]`)
+    expect(dockerfile).toContain(`chmod 0755 ${installed}`)
+  })
+})
+
 describe('exclusion and override tables', () => {
   it('lists no path that vercel.json no longer schedules', () => {
     const known = new Set(crons.map((c) => c.path))
