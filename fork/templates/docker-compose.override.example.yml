@@ -1,0 +1,63 @@
+# Template for the host-local docker-compose.override.yml.
+#
+# Copy this to the repo root on the deployment box and edit it there:
+#
+#   cp fork/templates/docker-compose.override.example.yml docker-compose.override.yml
+#
+# The live file is deliberately NOT committed: it is per host, and it is the
+# file people reach for when they need a quick production tweak, which is
+# exactly the kind of thing that must not end up in a fork commit that then has
+# to be rebased onto every upstream release. Compose picks it up automatically
+# on `docker compose up`, with no extra flags.
+#
+# Two rules keep this a tier 1 adaptation rather than a patch:
+#
+#   1. Only override keys that already exist upstream. Compose merges by
+#      service name, so a rename upstream makes an override silently do
+#      nothing. fork/adaptations.json anchors the service names this file
+#      relies on (app, cron) and the weekly sync alarms if they move.
+#   2. No secrets here or in the live override, and no feature toggles either.
+#      Both belong in .env, which upstream's compose file already loads via
+#      env_file. This file is about the shape of the deployment (ports,
+#      limits, volumes), never about how the application behaves.
+#
+# Anything that cannot be expressed here needs a tier 2 patch: see fork/README.md.
+
+services:
+  app:
+    # Example: publish on all interfaces because a separate reverse proxy on
+    # this host terminates TLS. Upstream binds 127.0.0.1 by default.
+    #
+    # The `!override` tag is required, and upstream's own docs/DOCKER.md uses
+    # it for the same example: Compose APPENDS to a base list instead of
+    # replacing it, so without the tag the container keeps upstream's
+    # 127.0.0.1:${PORT:-3000}:3000 binding as well and the two collide on the
+    # host port.
+    # ports: !override
+    #   - "0.0.0.0:${PORT:-3000}:3000"
+
+    # Example: raise the memory ceiling on a box that also runs imports.
+    # mem_limit: 2g
+
+    # Example: extra environment on top of .env. Keep values non-secret and
+    # keep them boring. Feature toggles do NOT go here: section 4 of
+    # fork/README.md puts them in .env, and NEXT_PUBLIC_SELF_HOSTED /
+    # NEXT_PUBLIC_REQUIRE_MFA / NEXT_PUBLIC_BANKID_ENABLED decide whether MFA
+    # and BankID are enforced at all (lib/auth/mfa.ts, lib/auth/bankid.ts). A
+    # copy-me template must never quietly turn authentication off on a host
+    # that copied it without reading it.
+    # environment:
+    #   - TZ=Europe/Stockholm
+
+    # Restates upstream's own default, so it changes nothing. It is here only
+    # to keep `app` a valid mapping while every example above is commented out.
+    restart: unless-stopped
+
+  cron:
+    # Example: pin the scheduled-job container's log retention on this host.
+    # logging:
+    #   options:
+    #     max-file: "10"
+    environment:
+      - CRON_SECRET=${CRON_SECRET}
+      - APP_URL=http://app:3000
