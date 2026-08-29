@@ -251,4 +251,23 @@ describe('SIE migration validation', () => {
     expect(table).toContain('| 2026 | opening_balance | 2614 | 0 | 0 | 0 |')
     expect(table).toContain('| 2026 | required_voucher | M1 | M1 | M1 | 0 |')
   })
+
+  it('never renders a zero difference when M1 is missing on both sides', () => {
+    const source = summarizeSIESource(2026, parsedFile(2026))
+    const withoutM1 = clone(source)
+    withoutM1.vouchers = []
+
+    const validation = validateEightYearMigration(
+      SIE_MIGRATION_YEARS.map((year) => ({ ...clone(year === 2026 ? withoutM1 : source), year })),
+      SIE_MIGRATION_YEARS.map((year) => ({ ...clone(year === 2026 ? withoutM1 : source), year }))
+    )
+
+    expect(validation.valid).toBe(false)
+    expect(validation.years.at(-1)?.differences).toContainEqual(expect.objectContaining({
+      year: 2026, metric: 'required_voucher', source: 'saknas i SIE', imported: 'saknas',
+    }))
+    const table = formatMigrationValidationTable(validation)
+    expect(table).toContain('| 2026 | required_voucher | M1 | missing | missing | mismatch |')
+    expect(table).not.toContain('| 2026 | required_voucher | M1 | missing | missing | 0 |')
+  })
 })

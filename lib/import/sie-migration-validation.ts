@@ -298,7 +298,10 @@ export function formatMigrationValidationTable(validation: EightYearMigrationVal
     if (year === 2026) {
       const sourceHasM1 = source.vouchers.some((voucher) => voucher.sourceSeries === 'M' && voucher.sourceNumber === 1)
       const importedHasM1 = imported.vouchers.some((voucher) => voucher.sourceSeries === 'M' && voucher.sourceNumber === 1)
-      result.push(`| ${year} | required_voucher | M1 | ${sourceHasM1 ? 'M1' : 'missing'} | ${importedHasM1 ? 'M1' : 'missing'} | ${sourceHasM1 === importedHasM1 ? '0' : 'mismatch'} |`)
+      // Absent on BOTH sides is not a match: compareMigrationYear() flags it as
+      // a difference, and the required M1 for Q1 2026 is exactly what this row
+      // exists to confirm. Rendering `0` there would read as verified.
+      result.push(`| ${year} | required_voucher | M1 | ${sourceHasM1 ? 'M1' : 'missing'} | ${importedHasM1 ? 'M1' : 'missing'} | ${sourceHasM1 && importedHasM1 ? '0' : 'mismatch'} |`)
     }
     for (const metric of ['opening_balance', 'closing_balance'] as const) {
       const sourceBalances = metric === 'opening_balance' ? source.openingBalances : source.closingBalances
