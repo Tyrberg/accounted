@@ -1,8 +1,10 @@
 'use client'
 
+import { UUID_RE } from '@/lib/invariants/uuid'
 import { Eye } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useToast } from '@/components/ui/use-toast'
+import { useBranding } from '@/lib/branding/brand-context'
 
 interface DocumentViewButtonProps {
   documentId: string
@@ -10,7 +12,6 @@ interface DocumentViewButtonProps {
   className?: string
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
  * Opens a document in the browser through the same-origin inline proxy
@@ -26,6 +27,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  */
 export function DocumentViewButton({ documentId, label = 'Visa dokument', className }: DocumentViewButtonProps) {
   const { toast } = useToast()
+  const { appName } = useBranding()
 
   const handleClick = () => {
     // documentId originates from staged preview_data (Record<string, unknown>);
@@ -40,10 +42,17 @@ export function DocumentViewButton({ documentId, label = 'Visa dokument', classN
       return
     }
 
-    if (!window.open(`/api/documents/${documentId}/inline`, '_blank', 'noopener,noreferrer')) {
+    // window.open() returns null BY SPEC when 'noopener' is in the features
+    // string, even on success, so passing it here made this toast fire on
+    // every successful open. Open with a real return value and sever the
+    // reverse channel manually (same pattern as lib/browser/deferred-tab.ts).
+    const tab = window.open(`/api/documents/${documentId}/inline`, '_blank')
+    if (tab) {
+      tab.opener = null
+    } else {
       toast({
         title: 'Kunde inte öppna dokumentet',
-        description: 'Tillåt popupfönster för Accounted i webbläsaren och försök igen.',
+        description: `Tillåt popupfönster för ${appName} i webbläsaren och försök igen.`,
         variant: 'destructive',
       })
     }

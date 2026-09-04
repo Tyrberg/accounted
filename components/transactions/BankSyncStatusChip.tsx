@@ -6,49 +6,18 @@ import { useTranslations } from 'next-intl'
 import { AlertTriangle, RefreshCw } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
 import { onBankSyncUpdated } from '@/lib/transactions/bank-sync-signal'
-import { useCompany } from '@/contexts/CompanyContext'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { isSelfHosted } from '@/lib/env/public-flags'
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/info-tooltip'
-
-interface ConnectionRow {
-  id: string
-  status: string | null
-  last_synced_at: string | null
-}
-
-const STALE_THRESHOLD_MS = 36 * 60 * 60 * 1000
-
-type ChipState =
-  | { kind: 'none' }
-  | { kind: 'attention'; count: number }
-  | { kind: 'stale'; mostRecent: string }
-  | { kind: 'healthy'; mostRecent: string | null }
-
-export function getChipState(rows: ConnectionRow[], now: number = Date.now()): ChipState {
-  if (rows.length === 0) return { kind: 'none' }
-
-  const needsAttention = rows.filter(
-    (r) => r.status === 'expired' || r.status === 'error',
-  )
-  if (needsAttention.length > 0) {
-    return { kind: 'attention', count: needsAttention.length }
-  }
-
-  const mostRecent = rows
-    .map((r) => r.last_synced_at)
-    .filter((s): s is string => Boolean(s))
-    .sort()
-    .pop()
-
-  if (mostRecent && now - new Date(mostRecent).getTime() > STALE_THRESHOLD_MS) {
-    return { kind: 'stale', mostRecent }
-  }
-
-  return { kind: 'healthy', mostRecent: mostRecent ?? null }
-}
+import {
+  getChipState,
+  type ConnectionRow,
+} from '@/lib/transactions/bank-sync-chip-state'
 
 export function useAgeFormatter() {
   const t = useTranslations('transactions')
@@ -68,6 +37,7 @@ export default function BankSyncStatusChip() {
   const t = useTranslations('transactions')
   const formatAge = useAgeFormatter()
   const { company } = useCompany()
+  const hasBankSync = useCapability(CAPABILITY.bank_sync)
   const [rows, setRows] = useState<ConnectionRow[] | null>(null)
 
   useEffect(() => {
@@ -79,7 +49,7 @@ export default function BankSyncStatusChip() {
     const load = () => {
       supabase
         .from('bank_connections')
-        .select('id, status, last_synced_at')
+        .select('id, status, last_synced_at, consent_expires')
         .eq('company_id', companyId)
         .then(({ data, error }) => {
           if (cancelled) return
@@ -102,15 +72,34 @@ export default function BankSyncStatusChip() {
 
   if (!rows) return null
 
-  const state = getChipState(rows)
+  const state = getChipState(rows, { hasBankSync })
 
   if (state.kind === 'none') return null
+
+  if (state.kind === 'paused') {
+    // Same remedy split as BankSyncNowButton: hosted points at billing,
+    // self-host at the connector key (never the Stripe page).
+    const selfHosted = isSelfHosted()
+    return (
+      <Link
+        href={selfHosted ? '/settings/banking' : '/settings/billing'}
+        className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1 text-xs text-attn transition-colors hover:bg-muted/50"
+      >
+        <AlertTriangle className="h-3.5 w-3.5" />
+        <span>
+          {selfHosted
+            ? t('bank_sync_paused_connector_key')
+            : t('bank_sync_paused_subscription')}
+        </span>
+      </Link>
+    )
+  }
 
   if (state.kind === 'attention') {
     return (
       <Link
         href="/settings/banking"
-        className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs text-destructive transition-colors hover:bg-destructive/10"
+        className="inline-flex items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs text-destructive transition-colors hover:bg-destructive/10"
       >
         <AlertTriangle className="h-3.5 w-3.5" />
         <span>
@@ -122,11 +111,31 @@ export default function BankSyncStatusChip() {
     )
   }
 
-  if (state.kind === 'stale') {
+  if (state.kind === 'expiring') {
+    // The consent is still alive, so the connection syncs today; the ochre
+    // text says "act before it dies" without the terracotta of a dead one.
     return (
       <Link
         href="/settings/banking"
-        className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 bg-warning/5 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10"
+        className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1 text-xs text-attn transition-colors hover:bg-muted/50"
+      >
+        <AlertTriangle className="h-3.5 w-3.5" />
+        <span>
+          {state.count === 1
+            ? t('bank_sync_expiring_one', { days: state.daysLeft })
+            : t('bank_sync_expiring_many', { count: state.count, days: state.daysLeft })}
+        </span>
+      </Link>
+    )
+  }
+
+  if (state.kind === 'stale') {
+    // Same neutral shape as the healthy chip: the ochre text is the signal,
+    // never an amber box (convention 12: status colors are data, not chrome).
+    return (
+      <Link
+        href="/settings/banking"
+        className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1 text-xs text-attn transition-colors hover:bg-muted/50"
       >
         <AlertTriangle className="h-3.5 w-3.5" />
         <span>
@@ -141,7 +150,7 @@ export default function BankSyncStatusChip() {
   return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="inline-flex cursor-help items-center gap-1.5 rounded-md border border-border bg-muted/30 px-2.5 py-1 text-xs text-muted-foreground">
+          <span className="inline-flex cursor-help items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1 text-xs text-muted-foreground">
             <RefreshCw className="h-3.5 w-3.5" />
             <span>
               {t('bank_sync_auto_nightly')}

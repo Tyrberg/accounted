@@ -7,12 +7,18 @@ import {
   CannotEditNonDraftError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
+  CorrectionChainTooDeepError,
   EntryAlreadyReversedError,
   EntryDateOutsideFiscalPeriodError,
   FiscalPeriodNotFoundError,
+  withUnusedVoucherAllocation,
   JournalEntryNotBalancedError,
   JournalEntryNotFoundError,
 } from '@/lib/bookkeeping/errors'
+import {
+  correctionChainDepth,
+  CORRECTION_CHAIN_GUARD_DEPTH,
+} from '@/lib/core/bookkeeping/correction-chain'
 import { resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
 import {
   normalizeLineDimensions,
@@ -23,17 +29,21 @@ import {
   assertMandatoryDimensions,
   fetchActiveDimensionRules,
   isDimensionRuleExemptSource,
+  isDimensionValidationExemptSource,
 } from '@/lib/bookkeeping/dimension-rules'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
 import { syncInvoiceStatusFromPaymentEntry, isPaymentSourceType } from '@/lib/bookkeeping/payment-sync'
 import { getActor } from '@/lib/bookkeeping/actor-context'
 import type {
+  AssetDisposalType,
+  AssetJamkningDirection,
   CreateJournalEntryInput,
   CreateJournalEntryLineInput,
   JournalEntry,
   JournalEntryLine,
   JournalEntrySourceType,
+  VatTreatment,
 } from '@/types'
 
 const log = createLogger('bookkeeping.engine')
@@ -191,8 +201,7 @@ export async function findFiscalPeriod(
  * Build line insert objects from input lines, resolving account IDs and
  * including tax_code and the dimensions bag
  */
-function buildLineInserts(
-  entryId: string,
+function buildLineValues(
   lines: CreateJournalEntryLineInput[],
   accountIdMap: Map<string, string>
 ) {
@@ -202,7 +211,6 @@ function buildLineInserts(
     // (20260702230000): writing them explicitly would error.
     const dimensions = normalizeLineDimensions(line)
     return {
-      journal_entry_id: entryId,
       account_number: line.account_number,
       account_id: accountIdMap.get(line.account_number) || null,
       debit_amount: Math.round((line.debit_amount || 0) * 100) / 100,
@@ -216,6 +224,17 @@ function buildLineInserts(
       sort_order: index,
     }
   })
+}
+
+function buildLineInserts(
+  entryId: string,
+  lines: CreateJournalEntryLineInput[],
+  accountIdMap: Map<string, string>
+) {
+  return buildLineValues(lines, accountIdMap).map((line) => ({
+    journal_entry_id: entryId,
+    ...line,
+  }))
 }
 
 /**
@@ -252,7 +271,14 @@ export async function createDraftEntry(
   // enabled companies get registry validation with a typed Swedish rejection.
   // Runs before any insert so a rejection leaves no orphan rows. Reversal/
   // storno/correction paths bypass this: they copy posted data verbatim.
-  await validateEntryDimensions(supabase, companyId, lines)
+  // Accrual dissolutions bypass it for exactly that reason too: they replay
+  // the origin entry's bag, so a value archived after the origin was posted
+  // must not be able to strand the remaining months as pending and leave the
+  // interim 17xx/29xx account overstated. See
+  // DIMENSION_VALIDATION_EXEMPT_SOURCE_TYPES.
+  if (!isDimensionValidationExemptSource(input.source_type)) {
+    await validateEntryDimensions(supabase, companyId, lines)
+  }
 
   // Validate that entry_date falls within the selected fiscal period
   const { data: period, error: periodError } = await supabase
@@ -660,6 +686,123 @@ export async function commitEntry(
   return result
 }
 
+export interface CommitAssetDisposalInput {
+  asset_id: string
+  fiscal_period_id: string
+  disposal_type: AssetDisposalType
+  disposed_at: string
+  disposed_proceeds: number
+  proceeds_vat: number
+  vat_treatment: VatTreatment | null
+  current_depreciation: number
+  jamkning_amount: number
+  jamkning_direction: AssetJamkningDirection
+  jamkning_remaining_years: number | null
+  jamkning_total_years: number | null
+  jamkning_original_input_vat: number | null
+  jamkning_original_deduction_percent: number | null
+  jamkning_new_deduction_percent: number | null
+}
+
+/**
+ * Commit a prepared asset-disposal draft and update the asset register in the
+ * same database transaction. The dedicated RPC delegates voucher numbering to
+ * commit_journal_entry, so disposal cannot leave a posted voucher without the
+ * corresponding immutable register state.
+ */
+export async function commitAssetDisposal(
+  supabase: SupabaseClient,
+  companyId: string,
+  userId: string,
+  entryId: string | null,
+  input: CommitAssetDisposalInput,
+): Promise<JournalEntry | null> {
+  const actor = getActor()
+  const { error } = await supabase.rpc('commit_asset_disposal', {
+    p_company_id: companyId,
+    p_asset_id: input.asset_id,
+    p_entry_id: entryId,
+    p_fiscal_period_id: input.fiscal_period_id,
+    p_disposal_type: input.disposal_type,
+    p_disposed_at: input.disposed_at,
+    p_disposed_proceeds: input.disposed_proceeds,
+    p_proceeds_vat: input.proceeds_vat,
+    p_vat_treatment: input.vat_treatment,
+    p_current_depreciation: input.current_depreciation,
+    p_jamkning_amount: input.jamkning_amount,
+    p_jamkning_direction: input.jamkning_direction,
+    p_jamkning_remaining_years: input.jamkning_remaining_years,
+    p_jamkning_total_years: input.jamkning_total_years,
+    p_jamkning_original_input_vat: input.jamkning_original_input_vat,
+    p_jamkning_original_deduction_percent: input.jamkning_original_deduction_percent,
+    p_jamkning_new_deduction_percent: input.jamkning_new_deduction_percent,
+    p_actor_type: actor?.type ?? null,
+    p_actor_label: actor?.label ?? null,
+  })
+
+  if (error) {
+    log.error('commit_asset_disposal RPC failed', error, {
+      operation: 'commit_asset_disposal',
+      companyId,
+      userId,
+      entityType: 'asset',
+      entityId: input.asset_id,
+      journalEntryId: entryId,
+      pgCode: (error as { code?: string }).code,
+    })
+    throw new BookkeepingDatabaseError('commit_asset_disposal', error.message)
+  }
+
+  if (!entryId) return null
+
+  // The RPC has already committed the voucher and the register update at this
+  // point. A transient reload failure must not masquerade as a failed
+  // disposal, so retry once and log the divergence before surfacing it.
+  let completeEntry: JournalEntry | null = null
+  let lastFetchError: { message: string } | null = null
+  for (let attempt = 0; attempt < 2 && !completeEntry; attempt++) {
+    const { data, error: fetchError } = await supabase
+      .from('journal_entries')
+      .select('*, lines:journal_entry_lines(*)')
+      .eq('id', entryId)
+      .eq('company_id', companyId)
+      .single()
+    if (data && !fetchError) {
+      completeEntry = data as JournalEntry
+    } else {
+      lastFetchError = fetchError ?? { message: 'posted entry not found' }
+    }
+  }
+
+  if (!completeEntry) {
+    log.error(
+      'asset disposal committed but posted entry reload failed',
+      lastFetchError,
+      {
+        operation: 'commit_asset_disposal',
+        companyId,
+        userId,
+        entityType: 'asset',
+        entityId: input.asset_id,
+        journalEntryId: entryId,
+      },
+    )
+    throw new BookkeepingDatabaseError(
+      'fetch_asset_disposal_entry',
+      `disposal voucher is committed but could not be reloaded: ${
+        lastFetchError?.message ?? 'posted entry not found'
+      }`,
+    )
+  }
+
+  const result = completeEntry
+  await eventBus.emit({
+    type: 'journal_entry.committed',
+    payload: { entry: result, userId, companyId },
+  })
+  return result
+}
+
 /**
  * Create a journal entry with lines (verifikation)
  * Convenience wrapper: creates draft + commits in one step.
@@ -713,13 +856,187 @@ export async function createJournalEntry(
   }
 }
 
+export interface OpeningBalanceReplacementResult {
+  newEntryId: string
+  stornoEntryId: string
+  newVoucherNumber: number
+  stornoVoucherNumber: number
+}
+
+/**
+ * Atomically replace a period's posted opening balance with a new engine
+ * voucher and a storno of the old voucher. The database function owns the
+ * period row lock, authorization, compare-and-swap check, voucher commits,
+ * status transition, and pointer swap in one transaction.
+ */
+export async function replaceOpeningBalanceEntry(
+  supabase: SupabaseClient,
+  companyId: string,
+  userId: string,
+  expectedOldEntryId: string,
+  input: CreateJournalEntryInput,
+): Promise<OpeningBalanceReplacementResult> {
+  if (input.source_type !== 'opening_balance') {
+    throw new BookkeepingDatabaseError(
+      'replace_opening_balance',
+      'Replacement entry must use source_type opening_balance',
+    )
+  }
+
+  const balance = validateBalance(input.lines)
+  if (!balance.valid) {
+    throw new JournalEntryNotBalancedError(
+      balance.totalDebit,
+      balance.totalCredit,
+      'draft',
+    )
+  }
+
+  await validateEntryDimensions(supabase, companyId, input.lines)
+
+  const accountIdMap = await resolveAccountIds(supabase, companyId, input.lines)
+  const accountNumbers = [...new Set(input.lines.map((line) => line.account_number))]
+  let missingAccounts = accountNumbers.filter((number) => !accountIdMap.has(number))
+
+  if (missingAccounts.length > 0) {
+    const seeded = await backfillStandardBASAccounts(
+      supabase,
+      companyId,
+      userId,
+      missingAccounts,
+    )
+    if (seeded.length > 0) {
+      const refreshed = await resolveAccountIds(supabase, companyId, input.lines)
+      for (const [number, id] of refreshed) accountIdMap.set(number, id)
+      missingAccounts = accountNumbers.filter((number) => !accountIdMap.has(number))
+    }
+    if (missingAccounts.length > 0) {
+      throw new AccountsNotInChartError(missingAccounts)
+    }
+  }
+
+  const voucherSeries = input.voucher_series
+    ?? await resolveSeriesFromSettings(supabase, companyId, 'opening_balance')
+  const preparedLines = buildLineValues(input.lines, accountIdMap)
+  const actor = getActor()
+
+  const { data, error } = await supabase.rpc('commit_opening_balance_replacement', {
+    p_company_id: companyId,
+    p_period_id: input.fiscal_period_id,
+    p_expected_old_entry_id: expectedOldEntryId,
+    p_user_id: userId,
+    p_entry_date: input.entry_date,
+    p_description: input.description,
+    p_voucher_series: voucherSeries,
+    p_lines: preparedLines,
+    p_actor_type: actor?.type ?? null,
+    p_actor_label: actor?.label ?? null,
+  })
+
+  if (error) {
+    log.error('commit_opening_balance_replacement RPC failed', error, {
+      operation: 'replace_opening_balance',
+      companyId,
+      userId,
+      entityType: 'journal_entry',
+      entityId: expectedOldEntryId,
+      fiscalPeriodId: input.fiscal_period_id,
+      pgCode: (error as { code?: string }).code,
+      pgDetails: (error as { details?: string }).details,
+      pgHint: (error as { hint?: string }).hint,
+    })
+    throw new BookkeepingDatabaseError('replace_opening_balance', error.message)
+  }
+
+  type RpcRow = {
+    new_entry_id: string
+    storno_entry_id: string
+    new_voucher_number: number
+    storno_voucher_number: number
+  }
+  const row = (Array.isArray(data) ? data[0] : data) as RpcRow | null
+  if (!row?.new_entry_id || !row.storno_entry_id) {
+    throw new BookkeepingDatabaseError(
+      'replace_opening_balance',
+      'Atomic replacement returned no journal entry ids',
+    )
+  }
+
+  const result: OpeningBalanceReplacementResult = {
+    newEntryId: row.new_entry_id,
+    stornoEntryId: row.storno_entry_id,
+    newVoucherNumber: row.new_voucher_number,
+    stornoVoucherNumber: row.storno_voucher_number,
+  }
+
+  const { data: entries, error: entriesError } = await supabase
+    .from('journal_entries')
+    .select('*, lines:journal_entry_lines(*)')
+    .eq('company_id', companyId)
+    .in('id', [expectedOldEntryId, result.newEntryId, result.stornoEntryId])
+
+  if (entriesError) {
+    log.error('atomic opening balance replacement committed but entry refresh failed', entriesError, {
+      companyId,
+      entityId: result.newEntryId,
+    })
+    return result
+  }
+
+  const byId = new Map(
+    ((entries ?? []) as JournalEntry[]).map((entry) => [entry.id, entry]),
+  )
+  const originalEntry = byId.get(expectedOldEntryId)
+  const newEntry = byId.get(result.newEntryId)
+  const stornoEntry = byId.get(result.stornoEntryId)
+
+  if (!originalEntry || !newEntry || !stornoEntry) {
+    log.error(
+      'atomic opening balance replacement committed but event entries are missing',
+      new Error('journal entry refresh returned incomplete replacement data'),
+      {
+        companyId,
+        expectedOldEntryId,
+        newEntryId: result.newEntryId,
+        stornoEntryId: result.stornoEntryId,
+        missingOriginalEntry: !originalEntry,
+        missingNewEntry: !newEntry,
+        missingStornoEntry: !stornoEntry,
+      },
+    )
+  }
+
+  if (newEntry) {
+    await eventBus.emit({
+      type: 'journal_entry.committed',
+      payload: { entry: newEntry, userId, companyId },
+    })
+  }
+  if (stornoEntry) {
+    await eventBus.emit({
+      type: 'journal_entry.committed',
+      payload: { entry: stornoEntry, userId, companyId },
+    })
+  }
+  if (originalEntry && stornoEntry) {
+    await eventBus.emit({
+      type: 'journal_entry.reversed',
+      payload: { originalEntry, reversalEntry: stornoEntry, userId, companyId },
+    })
+  }
+
+  return result
+}
+
 /**
  * Get the current date in Swedish timezone (Europe/Stockholm).
  * Avoids UTC date shift when server runs in a different timezone.
+ * Pass `now` to format a specific instant instead of the current time.
  */
-export function getSwedishLocalDate(): string {
-  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Stockholm' }).format(new Date())
+export function getSwedishLocalDate(now: Date = new Date()): string {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Stockholm' }).format(now)
 }
+
 
 /**
  * Create a reversal entry for an existing journal entry
@@ -730,7 +1047,15 @@ export async function reverseEntry(
   companyId: string,
   userId: string,
   entryId: string,
-  reversalDate?: string
+  reversalDate?: string,
+  options?: {
+    /**
+     * Bypass the correction-chain depth guard: reversing an entry that is
+     * already CORRECTION_CHAIN_GUARD_DEPTH+ links deep throws
+     * CorrectionChainTooDeepError unless set (see storno-service correctEntry).
+     */
+    allowDeepChain?: boolean
+  }
 ): Promise<JournalEntry> {
 
   // Fetch original entry with lines
@@ -762,6 +1087,16 @@ export async function reverseEntry(
     throw new CannotReverseStornoError(original.source_type)
   }
 
+  // Chain-depth guard: a storno on an entry already deep in a rättelse chain
+  // is almost always an agent reflexively cancelling its own correction
+  // (Christoffer case 2026-08-11). Same guard and bypass as correctEntry.
+  if (!options?.allowDeepChain) {
+    const chain = await correctionChainDepth(supabase, companyId, original)
+    if (chain.depth >= CORRECTION_CHAIN_GUARD_DEPTH) {
+      throw new CorrectionChainTooDeepError(chain.depth, chain.rootVoucher)
+    }
+  }
+
   const lines = (original.lines as JournalEntryLine[]) || []
 
   // Create reversed lines (swap debit and credit, preserve dimensions)
@@ -790,18 +1125,33 @@ export async function reverseEntry(
     original.fiscal_period_id,
     original.voucher_series || 'A'
   )
+  const unusedVoucherAllocation = {
+    fiscalPeriodId: original.fiscal_period_id,
+    voucherSeries: original.voucher_series || 'A',
+    voucherNumber,
+  }
 
   // Resolve account IDs: include inactive rows. The accounts on the
   // original committed entry were active at commit time; if the user has
   // since toggled one off, the storno must still be allowed to go through
   // (BFL 5 kap 5§). Only a truly missing chart row (rare: would require
   // the row to have been deleted) still throws AccountsNotInChartError.
-  const accountIdMap = await resolveAccountIds(supabase, companyId, reversedLines, { includeInactive: true })
+  let accountIdMap: Map<string, string>
+  try {
+    accountIdMap = await resolveAccountIds(supabase, companyId, reversedLines, { includeInactive: true })
+  } catch (resolveError) {
+    // The sequence RPC committed, but no reversal row exists yet. Carry the
+    // exact unused number so the caller can document this real gap.
+    throw withUnusedVoucherAllocation(resolveError, unusedVoucherAllocation)
+  }
 
   const reversalAccountNumbers = [...new Set(reversedLines.map(l => l.account_number))]
   const missingReversalAccounts = reversalAccountNumbers.filter(num => !accountIdMap.has(num))
   if (missingReversalAccounts.length > 0) {
-    throw new AccountsNotInChartError(missingReversalAccounts)
+    throw withUnusedVoucherAllocation(
+      new AccountsNotInChartError(missingReversalAccounts),
+      unusedVoucherAllocation,
+    )
   }
 
   // Create reversal entry with reverses_id link
@@ -823,8 +1173,18 @@ export async function reverseEntry(
     .select()
     .single()
 
-  if (reversalError || !reversalEntry) {
-    throw new BookkeepingDatabaseError('create_reversal_entry', reversalError?.message)
+  if (reversalError) {
+    // PostgreSQL rejected the insert, so the allocated number is confirmed
+    // unused and can be explained without guessing from the original entry.
+    throw withUnusedVoucherAllocation(
+      new BookkeepingDatabaseError('create_reversal_entry', reversalError.message),
+      unusedVoucherAllocation,
+    )
+  }
+  if (!reversalEntry) {
+    // No database error means the outcome is ambiguous. Do not label the
+    // number unused unless the engine has a confirmed failure state.
+    throw new BookkeepingDatabaseError('create_reversal_entry', undefined)
   }
 
   // Insert reversal lines with dimensions
@@ -835,6 +1195,9 @@ export async function reverseEntry(
     .insert(lineInserts)
 
   if (linesError) {
+    // Keep the reversal header as cancelled bookkeeping evidence. The gap
+    // detector counts every non-draft header, including cancelled rows, so
+    // this allocation is still used and must not be labelled as a gap.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new BookkeepingDatabaseError('create_reversal_lines', linesError.message)
@@ -847,6 +1210,8 @@ export async function reverseEntry(
     .eq('id', reversalEntry.id)
 
   if (postError) {
+    // As above, cleanup preserves the allocated voucher on the cancelled
+    // header. A failed or ambiguous cleanup also cannot prove it unused.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new BookkeepingDatabaseError('post_reversal_entry', postError.message)
@@ -866,6 +1231,7 @@ export async function reverseEntry(
   if (casError || !updatedOriginal || updatedOriginal.length === 0) {
     // Another concurrent reversal already changed the status: mark the orphaned
     // reversal as cancelled so it's excluded from reports but remains traceable.
+    // Its header still occupies the voucher number, so no gap metadata applies.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new EntryAlreadyReversedError()
@@ -877,13 +1243,146 @@ export async function reverseEntry(
   // as bokförd forever, and has no re-booking affordance: the agent paths
   // (lib/pending-operations/commit.ts) already did this manually after every
   // reverseEntry call; the dashboard reverse route did not.
+  //
+  // The worklist's "unbooked" predicate is is_business IS NULL (see
+  // lib/worklist/types.ts), not journal_entry_id IS NULL, so clearing only the
+  // link left the stornoed row invisible in Att bokföra and in the nav badge
+  // (#1950) while the storno dialog (reverse_warning) promised the return.
+  // The engine therefore resets the same triple the uncategorize paths write
+  // (is_business, category, journal_entry_id), plus reconciliation_method:
+  // it describes how the link was made, and the link is gone (the koppla-bort
+  // path in lib/reconciliation/bank-reconciliation.ts resets it the same way).
   const { error: unlinkError } = await supabase
     .from('transactions')
-    .update({ journal_entry_id: null })
+    .update({
+      journal_entry_id: null,
+      is_business: null,
+      category: null,
+      reconciliation_method: null,
+    })
     .eq('company_id', companyId)
     .eq('journal_entry_id', entryId)
   if (unlinkError) {
     log.error('failed to unlink transactions from reversed entry', unlinkError, { entryId })
+  }
+
+  // Same promise, second anchor. Bulk-booked rows (bulk_book_transactions RPC)
+  // and residual verifikat (lib/reconciliation/residual.ts) anchor bank lines
+  // through transaction_voucher_links; for a samlingsverifikat with N>1 rows
+  // that junction is the ONLY anchor (journal_entry_id stays NULL), so the
+  // UPDATE above matches nothing and all N rows keep is_business = true
+  // against a status='reversed' entry. The link rows go the way koppla-bort
+  // removes them, and a row returns to Att bokföra only when no anchor is
+  // left: a residual booking keeps the main verifikat in journal_entry_id
+  // while its junction row points at the small residual verifikat, and
+  // stornoing the residual must not put a still-booked row back in the list.
+  const { data: junctionRows, error: junctionReadError } = await supabase
+    .from('transaction_voucher_links')
+    .select('transaction_id')
+    .eq('company_id', companyId)
+    .eq('journal_entry_id', entryId)
+  if (junctionReadError) {
+    log.error('failed to read voucher links of reversed entry', junctionReadError, { entryId })
+  } else if (junctionRows && junctionRows.length > 0) {
+    const junctionTxIds = [
+      ...new Set((junctionRows as Array<{ transaction_id: string }>).map((r) => r.transaction_id)),
+    ]
+    const { error: junctionDeleteError } = await supabase
+      .from('transaction_voucher_links')
+      .delete()
+      .eq('company_id', companyId)
+      .eq('journal_entry_id', entryId)
+    if (junctionDeleteError) {
+      log.error('failed to delete voucher links of reversed entry', junctionDeleteError, { entryId })
+    } else {
+      const { data: remainingRows, error: remainingError } = await supabase
+        .from('transaction_voucher_links')
+        .select('transaction_id, role, allocated_amount')
+        .eq('company_id', companyId)
+        .in('transaction_id', junctionTxIds)
+      if (remainingError) {
+        log.error('failed to read remaining voucher links after storno', remainingError, {
+          entryId,
+        })
+      } else {
+        const remainingByTx = new Map<string, Array<{ role: string; allocated_amount: number }>>()
+        for (const row of (remainingRows ?? []) as Array<{
+          transaction_id: string
+          role?: string | null
+          allocated_amount?: number | string | null
+        }>) {
+          const rows = remainingByTx.get(row.transaction_id) ?? []
+          rows.push({ role: row.role ?? 'bank_line', allocated_amount: Number(row.allocated_amount ?? 0) })
+          remainingByTx.set(row.transaction_id, rows)
+        }
+        // A row split over several verifikat (1:N, lib/reconciliation/
+        // bank-reconciliation.ts linkTransactionToVouchers) is anchored by
+        // 'bank_line' slices that sum to its amount. Reversing one of them
+        // leaves a partial anchor: the row would read as booked while the
+        // ledger no longer explains it, and the reconciliation difference
+        // would move by the reversed slice with nothing to act on. Such a
+        // row goes back to Att bokföra whole: the surviving slices are
+        // dropped (their vouchers surface as unmatched again) and the row is
+        // released like a bulk-booked one. Rows whose remaining anchors
+        // still sum to the amount (bulk-book, one row per transaction) or
+        // include a non-bank_line anchor (a residual booking) are untouched.
+        const partialSplitIds: string[] = []
+        const candidates = junctionTxIds.filter((id) => (remainingByTx.get(id) ?? []).length > 0)
+        if (candidates.length > 0) {
+          const { data: txRows, error: txReadError } = await supabase
+            .from('transactions')
+            .select('id, amount, journal_entry_id')
+            .eq('company_id', companyId)
+            .in('id', candidates)
+          if (txReadError) {
+            log.error('failed to read split transactions after storno', txReadError, { entryId })
+          } else {
+            for (const tx of (txRows ?? []) as Array<{
+              id: string
+              amount: number | string | null
+              journal_entry_id: string | null
+            }>) {
+              if (tx.journal_entry_id) continue
+              const rows = remainingByTx.get(tx.id) ?? []
+              if (!rows.every((r) => r.role === 'bank_line')) continue
+              const anchored = rows.reduce((sum, r) => sum + r.allocated_amount, 0)
+              if (Math.abs(Math.round((anchored - Number(tx.amount ?? 0)) * 100) / 100) > 0.005) {
+                partialSplitIds.push(tx.id)
+              }
+            }
+          }
+        }
+        if (partialSplitIds.length > 0) {
+          const { error: partialDeleteError } = await supabase
+            .from('transaction_voucher_links')
+            .delete()
+            .eq('company_id', companyId)
+            .in('transaction_id', partialSplitIds)
+          if (partialDeleteError) {
+            log.error('failed to drop the surviving slices of a split transaction after storno', partialDeleteError, {
+              entryId,
+            })
+          }
+        }
+        const stillAnchored = new Set(
+          [...remainingByTx.keys()].filter((id) => !partialSplitIds.includes(id)),
+        )
+        const releaseIds = junctionTxIds.filter((id) => !stillAnchored.has(id))
+        if (releaseIds.length > 0) {
+          const { error: releaseError } = await supabase
+            .from('transactions')
+            .update({ is_business: null, category: null, reconciliation_method: null })
+            .eq('company_id', companyId)
+            .in('id', releaseIds)
+            .is('journal_entry_id', null)
+          if (releaseError) {
+            log.error('failed to release junction-linked transactions of reversed entry', releaseError, {
+              entryId,
+            })
+          }
+        }
+      }
+    }
   }
 
   // Same hazard one table over: a period whose opening_balance_entry_id still

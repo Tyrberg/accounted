@@ -18,6 +18,14 @@ import type {
 // Core Event Types: discriminated union of all system events
 // ============================================================
 
+/**
+ * Who runs AI extraction on an uploaded document.
+ * - 'invoice-inbox': the inbox extracts and mirrors the result itself.
+ * - 'none': nobody should; the caller already holds the booking.
+ * Unset: the document-extraction extension extracts (default).
+ */
+export type DocumentExtractionOwner = 'invoice-inbox' | 'none'
+
 export type CoreEvent =
   // Bookkeeping
   | { type: 'journal_entry.drafted'; payload: { entry: JournalEntry; userId: string; companyId: string } }
@@ -26,7 +34,14 @@ export type CoreEvent =
   | { type: 'journal_entry.reversed'; payload: { originalEntry: JournalEntry; reversalEntry: JournalEntry; userId: string; companyId: string } }
   | { type: 'journal_entry.deleted'; payload: { entryId: string; voucherSeries: string; voucherNumber: number; userId: string; companyId: string } }
   // Documents
-  | { type: 'document.uploaded'; payload: { document: DocumentAttachment; userId: string; companyId: string } }
+  // extractionOwner: set by the invoice inbox on documents it extracts itself,
+  // so the document-extraction extension yields instead of racing it (the
+  // inbox row does not exist yet when this event fires inside uploadDocument).
+  // 'none' is an explicit opt-out: the uploader already knows the booking
+  // (provider underlag import links each file to its posted verifikat), so
+  // running a paid model over it would buy nothing. The extension stamps the
+  // row as skipped instead of extracting.
+  | { type: 'document.uploaded'; payload: { document: DocumentAttachment; userId: string; companyId: string; extractionOwner?: DocumentExtractionOwner } }
   | { type: 'document.accessed'; payload: { document: { id: string; file_name: string }; userId: string; companyId: string } }
   | { type: 'document.deleted'; payload: { document: { id: string; file_name: string }; userId: string; companyId: string } }
   // Invoicing
@@ -54,11 +69,56 @@ export type CoreEvent =
   | { type: 'transaction.synced'; payload: { transactions: Transaction[]; userId: string; companyId: string } }
   | { type: 'transaction.categorized'; payload: { transaction: Transaction; account: string; taxCode: string; userId: string; companyId: string } }
   | { type: 'transaction.reconciled'; payload: { transaction: Transaction; journalEntryId: string; method: ReconciliationMethod; userId: string; companyId: string } }
+  // Account-keyed reconciliation (lib/reconciliation/actions.ts): one event per
+  // link made or removed on any reconcilable account (bank:<cash_account_id>,
+  // skattekonto, later manual:NNNN). `transaction.reconciled` keeps firing for
+  // bank links made through the bank engine; these are the kind-agnostic
+  // signals the flows builder triggers on.
+  | { type: 'reconciliation.matched'; payload: { accountKey: string; externalId: string; journalEntryId: string; method: 'manual' | 'proposal'; userId: string; companyId: string } }
+  | { type: 'reconciliation.unmatched'; payload: { accountKey: string; externalId: string; previousJournalEntryId: string | null; userId: string; companyId: string } }
+  // Sign-off: the human (or agent-staged, user-approved) assertion "reconciled
+  // through this date" on one account (lib/reconciliation/signoff.ts), and its undo.
+  | { type: 'reconciliation.signed_off'; payload: { accountKey: string; signoffId: string; throughDate: string; unexplainedDifference: number | null; userId: string; companyId: string } }
+  | { type: 'reconciliation.reopened'; payload: { accountKey: string; signoffId: string; throughDate: string; reason: string | null; userId: string; companyId: string } }
   // Bank connection lifecycle: consent + account selection are the
   // GDPR/PSD2 audit points; emitted to event_log for compliance trail.
   | { type: 'bank_connection.consent_granted'; payload: { connectionId: string; bankName: string | null; accountCount: number; consentExpiresAt: string | null; userId: string; companyId: string } }
   | { type: 'bank_connection.account_selection_changed'; payload: { connectionId: string; bankName: string | null; previousStatus: string; newStatus: string; enabledCount: number; totalCount: number; userId: string; companyId: string } }
   | { type: 'bank_connection.revoked'; payload: { connectionId: string; bankName: string | null; userId: string; companyId: string } }
+  // Emitted when a new or renewed connection supersedes an older row for the
+  // same bank in the same company: the old row is parked as 'revoked' with
+  // superseded_by pointing at the replacement, and its transactions are
+  // re-pointed. connectionId is the SUPERSEDED (old) row, mirroring .revoked.
+  | { type: 'bank_connection.superseded'; payload: { connectionId: string; supersededById: string; bankName: string | null; userId: string; companyId: string } }
+  // Emitted when the bank/provider redirects the OAuth callback back with an
+  // error instead of an authorization code: denied consent, a bank-side
+  // failure (e.g. Handelsbanken's missing corporate fullmakt), or an expired
+  // signing session. Durable failure trail (issue #1716): the pending row is
+  // deleted right after and console logs expire, so without this event
+  // support cannot answer which attempt failed, with which error, on whose
+  // side. connectionId may reference a row deleted by the same request.
+  | { type: 'bank_connection.consent_denied'; payload: {
+      connectionId: string
+      bankName: string | null
+      psuType: string | null
+      errorCode: string
+      errorDescription: string | null
+      priorStatus: string
+      userId: string
+      companyId: string
+    } }
+  // Emitted when the code-for-session exchange or connection finalization
+  // throws after the bank redirected back successfully. Same audit doctrine
+  // as consent_denied: the fresh-connect row is deleted by cleanup and the
+  // console log expires, leaving support nothing to answer from.
+  | { type: 'bank_connection.finalize_failed'; payload: {
+      connectionId: string
+      bankName: string | null
+      reason: string
+      priorStatus: string
+      userId: string
+      companyId: string
+    } }
   // Emitted when the PSD2 callback fails to mirror a returned account into
   // cash_accounts. ASVS V16 / ISO 27001 A.8.15: security-relevant failures
   // must land in a structured audit log (event_log, 30-day TTL) rather than
@@ -78,6 +138,13 @@ export type CoreEvent =
   // land in event_log for the audit trail, mirroring bank_connection.*.
   | { type: 'stripe.connected'; payload: { connectionId: string; stripeAccountId: string; livemode: boolean; userId: string; companyId: string } }
   | { type: 'stripe.disconnected'; payload: { connectionId: string; stripeAccountId: string | null; reason: 'user' | 'revoked_upstream'; userId: string; companyId: string } }
+  // WooCommerce store lifecycle: same audit doctrine as stripe.* (a third
+  // party's API credentials are granted/dropped).
+  | { type: 'woocommerce.connected'; payload: { connectionId: string; storeUrl: string; userId: string; companyId: string } }
+  | { type: 'woocommerce.disconnected'; payload: { connectionId: string; storeUrl: string | null; reason: 'user' | 'revoked_upstream'; userId: string; companyId: string } }
+  // Shopify store lifecycle: same audit doctrine as stripe.*/woocommerce.*.
+  | { type: 'shopify.connected'; payload: { connectionId: string; shopDomain: string; userId: string; companyId: string } }
+  | { type: 'shopify.disconnected'; payload: { connectionId: string; shopDomain: string | null; reason: 'user' | 'revoked_upstream'; userId: string; companyId: string } }
   // Periods
   | { type: 'period.locked'; payload: { period: FiscalPeriod; userId: string; companyId: string } }
   | { type: 'period.unlocked'; payload: { period: FiscalPeriod; userId: string; companyId: string } }
@@ -146,18 +213,6 @@ export type CoreEvent =
   | { type: 'skattekonto.balance.changed'; payload: { previousBalance: number; currentBalance: number; userId: string; companyId: string } }
   | { type: 'skattekonto.transaction.upcoming'; payload: { transaktionsdatum: string; forfallodatum: string; transaktionstext: string; beloppSkatteverket: number; userId: string; companyId: string } }
   | { type: 'skattekonto.connection.expired'; payload: { reason: 'REFRESH_EXHAUSTED' | 'SESSION_EXPIRED' | 'TOKEN_CORRUPTED'; userId: string; companyId: string } }
-  // Fired when the SKV saldo and GL 1630 sum diverge beyond the configured
-  // tolerance. The drift handler emails the company contact; UI surfaces a
-  // dashboard tile via /api/extensions/skatteverket/skattekonto/drift.
-  | { type: 'skattekonto.drift_detected'; payload: {
-      drift: number                       // SKV saldo - GL 1630 sum (signed)
-      saldoSkatteverket: number
-      glSum1630: number
-      fetchedAt: number                   // ms epoch from the snapshot
-      unbookedCount: number               // skattekonto rows without journal_entry_id ≤ fetchedAt
-      userId: string
-      companyId: string
-    } }
   // Company & account lifecycle
   | { type: 'company.deleted'; payload: { companyId: string; userId: string; archivedAt: string } }
   | { type: 'account.deleted'; payload: { userId: string; deletedAt: string } }
@@ -168,17 +223,28 @@ export type CoreEvent =
   | { type: 'mcp.tool_called'; payload: {
       tool: string                                  // e.g. 'gnubok_create_invoice'
       requiredScope: string | null                  // from TOOL_SCOPE_MAP, null if unscoped
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null                        // api_key id, oauth client, etc.
       actorLabel: string | null                     // human-readable actor label
       latencyMs: number                             // wall-clock time inside execute()
       success: boolean                              // true iff the tool returned without throwing AND was invoked (not denied)
       isError: boolean                              // matches the JSON-RPC tool-result isError flag returned to the client
       errorCode: string | null                      // structured error code from tool-result.toToolError when applicable
-      errorKind: 'execution' | 'scope_denied' | 'capability_denied' | 'company_access_denied' | 'unknown_tool' | 'test_key_write_blocked' | null
+      errorKind: 'execution' | 'scope_denied' | 'capability_denied' | 'company_access_denied' | 'invalid_arguments' | 'unknown_tool' | 'test_key_write_blocked' | 'bridge_refused' | null
+                                                    // bridge_refused: gnubok_call_tool was pointed at a write tool, or at nothing.
+                                                    // invalid_arguments: the call never reached the tool because its arguments
+                                                    // were rejected (unknown parameter, malformed company_id). Split out of
+                                                    // company_access_denied, which used to swallow both and send triage
+                                                    // looking for a permissions problem that did not exist.
       errorMessage: string | null                   // human-readable error message (truncated to 500 chars), null on success.
                                                     // Raw material for clustering real agent failures into curated gotchas:
                                                     // errorCode alone can't distinguish "period locked" from "unbalanced".
+      errorDetail: string | null
+      errorCause: string | null  // errorCauseTag(err): SQLSTATE / coded-error code / error class name, <= 64 chars. The clustering key for rows whose errorMessage is the UNKNOWN_ERROR constant (#2051); never a raw driver message, which can quote row values.                    // The specific English diagnostic, when message_sv is a generic registry
+                                                    // default that says nothing (VALIDATION_ERROR -> "Förfrågan innehåller
+                                                    // ogiltiga uppgifter."). Null when it would only repeat errorMessage.
+                                                    // Without it a 604-call outage looked identical to a typo in the logs:
+                                                    // the agent was told exactly what was wrong, and we were not.
       requestId: string | number | null             // JSON-RPC request id (helps correlate with client-side logs)
       userId: string
       companyId: string
@@ -191,7 +257,7 @@ export type CoreEvent =
   // the caller's scope set.
   | { type: 'mcp.tools_list_called'; payload: {
       toolCount: number                             // tools actually returned (post scope filter)
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       latencyMs: number
@@ -210,7 +276,7 @@ export type CoreEvent =
       success: boolean
       errorCode: string | null
       latencyMs: number
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       requestId: string | number | null
@@ -226,7 +292,7 @@ export type CoreEvent =
   | { type: 'mcp.workflow_started'; payload: {
       slug: string                                  // e.g. 'month-end-close'
       sessionId: string | null
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       userId: string
@@ -238,7 +304,7 @@ export type CoreEvent =
       outcome: 'success' | 'abandoned' | 'failed'
       stepsCompleted: number | null                 // null when not tracked granularly
       durationMs: number | null
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       userId: string
@@ -253,7 +319,7 @@ export type CoreEvent =
       slug: string                                  // e.g. 'modifier/holding-ab', 'month-end-close'
       tier: 'workflow' | 'horizontal' | 'vertical' | 'modifier'
       sessionId: string | null
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       userId: string
@@ -267,7 +333,7 @@ export type CoreEvent =
       fromTool: string
       toTool: string
       sessionId: string | null
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       userId: string
@@ -282,7 +348,7 @@ export type CoreEvent =
       toolName: string | null
       skillSlug: string | null
       sessionId: string | null
-      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+      actorType: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
       actorId: string | null
       actorLabel: string | null
       userId: string
@@ -302,8 +368,3 @@ export type EventPayload<T extends CoreEventType> = Extract<CoreEvent, { type: T
 /** Handler function for a specific event type */
 export type EventHandler<T extends CoreEventType> = (payload: EventPayload<T>) => Promise<void> | void
 
-/** Subscription: event type + handler */
-export interface EventSubscription<T extends CoreEventType = CoreEventType> {
-  eventType: T
-  handler: EventHandler<T>
-}

@@ -7,7 +7,10 @@
     ]
   },
   "naiveOreRound": {
-    "count": 641
+    "count": 615
+  },
+  "handRolledInvariants": {
+    "count": 113
   },
   "ledgerScanningReports": {
     "count": 4,
@@ -16,6 +19,49 @@
       "lib/bokslut/reserves/periodiseringsfond-service.ts",
       "lib/bokslut/tax-provision/bolagsskatt-calculator.ts",
       "lib/bokslut/tax-provision/sarskild-loneskatt-calculator.ts"
+    ]
+  },
+  "dialogOverflowRisk": {
+    "count": 7,
+    "files": [
+      "app/(dashboard)/supplier-invoices/[id]/page.tsx",
+      "components/bookkeeping/JournalEntryForm.tsx",
+      "components/invoices/PaymentBookingDialog.tsx",
+      "components/invoices/SendInvoiceDialog.tsx",
+      "components/reports/views/index.tsx",
+      "components/salary/NewEmployeeDialog.tsx",
+      "components/transactions/InvoiceMatchDialog.tsx"
+    ]
+  },
+  "rawReferenceFetch": {
+    "count": 0,
+    "files": []
+  },
+  "providerHosts": {
+    "count": 22,
+    "files": [
+      "app/api/connect/bank/[...path]/route.ts",
+      "extensions/general/bolagsverket/lib/client.ts",
+      "extensions/general/enable-banking/index.ts",
+      "extensions/general/enable-banking/lib/api-client.ts",
+      "extensions/general/mail/lib/gmail-client.ts",
+      "extensions/general/skatteverket/index.ts",
+      "extensions/general/skatteverket/lib/connector-mode.ts",
+      "extensions/general/skatteverket/lib/ombud-client.ts",
+      "extensions/general/skatteverket/lib/skattekonto-client.ts",
+      "extensions/general/tic/index.ts",
+      "extensions/general/tic/lib/bankid-client.ts",
+      "extensions/general/tic/lib/bankid-types.ts",
+      "extensions/general/whatsapp-inbox/lib/graph-api.ts",
+      "lib/connect/upstreams/enable-banking-jwt.ts",
+      "lib/invoices/transports/qvalia.ts",
+      "lib/providers/bjornlunden/config.ts",
+      "lib/providers/bjornlunden/oauth.ts",
+      "lib/providers/bokio/client.ts",
+      "lib/providers/bokio/config.ts",
+      "lib/providers/briox/config.ts",
+      "lib/providers/fortnox/config.ts",
+      "lib/providers/visma/config.ts"
     ]
   }
 }

@@ -46,6 +46,9 @@ export const ResponseMetaSchema = z.object({
   next_cursor: z.string().nullable().optional(),
   audit: ResponseAuditSchema.optional(),
   partial_expansions: z.array(z.string()).optional(),
+  // Endpoint-specific register-coverage disclosure (e.g. invoices.list:
+  // { covers_from, has_pre_register_invoices }). Documented per endpoint.
+  coverage: z.record(z.string(), z.unknown()).optional(),
 })
 
 /**
@@ -205,9 +208,6 @@ export function listEndpoints(): EndpointDefinition[] {
   return Array.from(ENDPOINTS.values())
 }
 
-export function getEndpoint(method: HttpMethod, path: string): EndpointDefinition | undefined {
-  return ENDPOINTS.get(`${method} ${path}`)
-}
 
 /**
  * Resolve the registered endpoint for a CONCRETE request path (e.g.
@@ -275,9 +275,38 @@ function zodToJsonSchema(schema: ZodTypeAny): JsonSchema {
     case 'optional':
     case 'ZodOptional':
     case 'nullable':
-    case 'ZodNullable': {
+    case 'ZodNullable':
+    // A `.default()` field accepts the inner type on input; the object case
+    // below additionally treats it as not-required.
+    case 'default':
+    case 'ZodDefault': {
       const inner = (def as { innerType: ZodTypeAny }).innerType
       return zodToJsonSchema(inner)
+    }
+    case 'record':
+    case 'ZodRecord': {
+      const valueType = (def as { valueType?: ZodTypeAny }).valueType
+      return {
+        type: 'object',
+        additionalProperties: valueType ? zodToJsonSchema(valueType) : true,
+      }
+    }
+    // `.transform()` / `.pipe()` wrappers: describe the INPUT side, which is
+    // what an API caller must send. `z.preprocess()` is the mirror image:
+    // its input side IS the callable (a ZodTransform, no describable type),
+    // and the schema the cleaned value must satisfy sits on the output side.
+    case 'pipe':
+    case 'ZodPipeline': {
+      const pipeDef = def as { in?: ZodTypeAny; out?: ZodTypeAny }
+      const inDef = (pipeDef.in as unknown as { _def?: { type?: string; typeName?: string } } | undefined)?._def
+      const inDisc = inDef?.type ?? inDef?.typeName ?? ''
+      const side = ['transform', 'ZodEffects'].includes(inDisc) ? pipeDef.out : pipeDef.in
+      return side ? zodToJsonSchema(side) : {}
+    }
+    case 'effects':
+    case 'ZodEffects': {
+      const inner = (def as { schema?: ZodTypeAny }).schema
+      return inner ? zodToJsonSchema(inner) : {}
     }
     case 'object':
     case 'ZodObject': {
@@ -286,9 +315,12 @@ function zodToJsonSchema(schema: ZodTypeAny): JsonSchema {
       const required: string[] = []
       for (const [key, value] of Object.entries(shape)) {
         properties[key] = zodToJsonSchema(value)
-        const valueDef = (value as unknown as { _def: { typeName?: string; type?: string } })._def
-        const valueDisc = valueDef.type ?? valueDef.typeName ?? ''
-        if (valueDisc !== 'optional' && valueDisc !== 'ZodOptional') {
+        // A field may be omitted exactly when the schema accepts undefined:
+        // covers optional and defaulted fields, and wrappers that only carry
+        // optionality inside (e.g. a preprocess pipe over `.optional()`),
+        // which a top-level discriminator check misclassifies as required.
+        const mayOmit = value.safeParse(undefined).success
+        if (!mayOmit) {
           required.push(key)
         }
       }
@@ -351,9 +383,21 @@ export function generateOpenApiSpec(serverUrl: string): OpenApiSpec {
 
     // Binary responses (e.g. application/pdf) declare a `format: binary`
     // schema rather than deriving from the Zod success type.
+    // The registry's worked `example` travels with the schema as an OpenAPI
+    // media-type `example`. Without this the examples reached only the docs
+    // markdown builder (lib/docs/content/reference.ts): the spec itself carried
+    // none, so neither /api/v1/openapi.json consumers nor the generated
+    // skills/accounted-api ever saw a concrete request or response body.
+    // Attached to JSON media types only: a binary response (application/pdf)
+    // has no meaningful JSON example to show.
     const successContent = def.response.contentType && def.response.contentType !== 'application/json'
       ? { [def.response.contentType]: { schema: { type: 'string', format: 'binary' } } }
-      : { 'application/json': { schema: zodToJsonSchema(def.response.success) } }
+      : {
+          'application/json': {
+            schema: zodToJsonSchema(def.response.success),
+            example: def.example.response,
+          },
+        }
 
     // 204 No Content endpoints (DELETEs returning noContent()) carry no body:
     // emit a bare 204 instead of a 200 { data, meta } so the spec stops
@@ -361,6 +405,53 @@ export function generateOpenApiSpec(serverUrl: string): OpenApiSpec {
     const successResponse = def.response.success === NoBodyResponse
       ? { '204': { description: 'No Content' } }
       : { '200': { description: 'Success', content: successContent } }
+
+    // Path parameters, derived from the `:param` pattern itself so every
+    // templated segment is declared even though routes don't register a
+    // params schema. All v1 path params are string ids.
+    const parameters = [...def.path.matchAll(/:([^/]+)/g)].map(([, name]) => ({
+      name,
+      in: 'path',
+      required: true,
+      schema: { type: 'string' },
+    }))
+
+    // Request body from the registered Zod schema. In multipart bodies a
+    // part registered as `z.unknown()` is by convention the binary file part
+    // (see documents.upload); the converter turns it into an empty schema,
+    // which is rewritten here to `format: binary` so client generators
+    // produce correct multipart uploads.
+    let requestBody: Record<string, unknown> | undefined
+    if (def.request?.body) {
+      const contentType = def.request.contentType ?? 'application/json'
+      let bodySchema = zodToJsonSchema(def.request.body)
+      if (contentType === 'multipart/form-data' && bodySchema.properties) {
+        bodySchema = {
+          ...bodySchema,
+          properties: Object.fromEntries(
+            Object.entries(bodySchema.properties).map(([key, prop]) => [
+              key,
+              Object.keys(prop).length === 0
+                ? { type: 'string', format: 'binary' }
+                : prop,
+            ]),
+          ),
+        }
+      }
+      requestBody = {
+        required: true,
+        content: {
+          [contentType]: {
+            schema: bodySchema,
+            // Only JSON bodies carry a worked example; a multipart upload's
+            // example would be a file part, which JSON cannot express.
+            ...(def.example.request && contentType === 'application/json'
+              ? { example: def.example.request }
+              : {}),
+          },
+        },
+      }
+    }
 
     const operationDef: Record<string, unknown> = {
       operationId: def.operation,
@@ -377,6 +468,8 @@ export function generateOpenApiSpec(serverUrl: string): OpenApiSpec {
       'x-reversible': def.reversible,
       'x-dry-run-supported': def.dryRunSupported,
       ...(def.scope ? { 'x-required-scope': def.scope } : {}),
+      ...(parameters.length > 0 ? { parameters } : {}),
+      ...(requestBody ? { requestBody } : {}),
       responses: {
         ...successResponse,
         '400': { description: 'Validation error', $ref: '#/components/responses/Error' },
@@ -417,10 +510,3 @@ export function generateOpenApiSpec(serverUrl: string): OpenApiSpec {
   }
 }
 
-/**
- * Test-only escape hatch. Clears the registry: used in unit tests so a test
- * that registers a fake endpoint doesn't leak into the next test.
- */
-export function _resetRegistryForTests(): void {
-  ENDPOINTS.clear()
-}

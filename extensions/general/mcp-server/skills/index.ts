@@ -8,6 +8,8 @@ import { payrollMonthlySkill } from './payroll-monthly'
 import { bankReconciliationSkill } from './bank-reconciliation'
 import { kreditfakturaProcessSkill } from './kreditfaktura-process'
 import { customerOnboardingSkill } from './customer-onboarding'
+import { reconcileMonthSkill } from './reconcile-month'
+import { onboardingSkill } from './onboarding'
 import { loadAtomsAsSkills, loadReferenceById } from './atoms'
 
 /** Static workflow skills the server ships with. Tier: 'workflow'. */
@@ -20,12 +22,9 @@ export const workflowSkills: Skill[] = [
   bankReconciliationSkill,
   kreditfakturaProcessSkill,
   customerOnboardingSkill,
+  reconcileMonthSkill,
+  onboardingSkill,
 ]
-
-/** @deprecated Use `workflowSkills` for the static set, or `loadAllSkills(supabase)`
- *  for the unified list (workflows + atoms). Kept for backwards compatibility
- *  with prior imports. */
-export const skills = workflowSkills
 
 /**
  * Resolve a skill by slug. Checks the static workflow array first (synchronous,

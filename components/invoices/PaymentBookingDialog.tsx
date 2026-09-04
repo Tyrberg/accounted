@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
+import { useAccounts, useCashAccounts, useCompanySettings } from '@/lib/reference-data/hooks'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import {
@@ -22,11 +23,11 @@ import LinkVoucherPicker from '@/components/invoices/LinkVoucherPicker'
 import { proposePaymentLines, resolveInvoicePaymentSourceType } from '@/lib/bookkeeping/propose-payment-lines'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { formatCurrency, formatDate } from '@/lib/utils'
-import { createClient } from '@/lib/supabase/client'
 import { useCompany } from '@/contexts/CompanyContext'
 import { Plus, Trash2, Loader2 } from 'lucide-react'
 import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
-import type { Invoice, InvoiceItem, Customer, BASAccount, EntityType } from '@/types'
+import type { EntityType } from '@/types'
+import type { InvoiceWithRelations } from '@/components/invoices/types'
 import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
 
 type DuplicateMatchReason = 'ocr_exact' | 'name_amount_fuzzy' | 'amount_only'
@@ -40,14 +41,6 @@ interface DuplicateCandidate {
   reference: string | null
   match_reason: DuplicateMatchReason
   match_confidence: number
-}
-
-interface InvoiceWithRelations extends Invoice {
-  customer: Customer
-  items: InvoiceItem[]
-  // Present once an issuance verifikat has been booked (faktureringsmetoden);
-  // absent on kontantmetoden invoices that recognise revenue at payment.
-  journal_entry_id?: string | null
 }
 
 interface PaymentBookingDialogProps {
@@ -67,7 +60,6 @@ export default function PaymentBookingDialog({
 }: PaymentBookingDialogProps) {
   const { toast } = useToast()
   const router = useRouter()
-  const supabase = createClient()
   const { company } = useCompany()
   const t = useTranslations('invoice_payment_dialog')
 
@@ -77,7 +69,16 @@ export default function PaymentBookingDialog({
     amount_only: t('match_reason_amount_only'),
   }
 
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  // Session-cached reference data (lib/reference-data), seeded by the
+  // dashboard layout: the chart and the settings are known on the first
+  // paint, so the proposed lines and the voucher preview resolve as soon as
+  // the dialog opens instead of after two sequential requests.
+  const { accounts, isLoading: accountsLoading, error: accountsError } = useAccounts()
+  const {
+    settings: companySettings,
+    isLoading: settingsLoading,
+    error: settingsError,
+  } = useCompanySettings()
   const [catalog, setCatalog] = useState<CatalogAccount[]>([])
   const [lines, setLines] = useState<FormLine[]>([])
   const accountNameByNumber = useMemo(() => {
@@ -92,7 +93,15 @@ export default function PaymentBookingDialog({
   const [tab, setTab] = useState<'new' | 'existing'>('new')
   // Drives the "Befintlig verifikation" picker copy: cash links against a 19xx
   // debit, accrual against a 1510 credit.
-  const [accountingMethod, setAccountingMethod] = useState<'accrual' | 'cash'>('accrual')
+  const accountingMethod: 'accrual' | 'cash' =
+    companySettings?.accounting_method === 'cash' ? 'cash' : 'accrual'
+  // The bank account the invoice asked to be paid to (1930 when none was
+  // chosen): the proposed debit lands there, same as the route's default.
+  const { cashAccounts, isLoading: cashAccountsLoading } = useCashAccounts()
+  const chosenPaymentAccount = useMemo(() => {
+    const id = (invoice as { payment_cash_account_id?: string | null }).payment_cash_account_id
+    return id ? cashAccounts.find((a) => a.id === id)?.ledger_account ?? undefined : undefined
+  }, [cashAccounts, invoice])
   // source_type the booking will use: drives the voucher-series preview so the
   // number shown matches what mark-paid will actually create.
   const [sourceType, setSourceType] =
@@ -110,38 +119,30 @@ export default function PaymentBookingDialog({
       return
     }
 
+    // Reference data still loading (no seed, first mount of the session):
+    // the effect re-runs once it lands.
+    if (accountsLoading || settingsLoading || cashAccountsLoading) return
+
     let cancelled = false
 
     async function init() {
       try {
-        // Fetch accounts
-        const [accountsRes, fetchedCatalog] = await Promise.all([
-          fetch('/api/bookkeeping/accounts'),
-          loadBasCatalog(),
-        ])
-        if (!accountsRes.ok) throw new Error(t('load_chart_failed'))
-        const accountsData = await accountsRes.json()
-        const fetchedAccounts: BASAccount[] = accountsData.data || []
-
+        if (accountsError) throw new Error(t('load_chart_failed'))
         if (!company?.id) throw new Error(t('no_active_company'))
-
-        // Fetch company settings
-        const { data: settings, error: settingsError } = await supabase
-          .from('company_settings')
-          .select('accounting_method, entity_type, ore_rounding')
-          .eq('company_id', company.id)
-          .maybeSingle()
-
         if (settingsError) throw new Error(t('load_settings_failed'))
+
+        const fetchedCatalog = await loadBasCatalog()
         if (cancelled) return
 
-        setAccounts(fetchedAccounts)
         setCatalog(fetchedCatalog)
 
-        const accountingMethod = (settings?.accounting_method || 'accrual') as 'accrual' | 'cash'
-        const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
-
-        setAccountingMethod(accountingMethod)
+        const settings = companySettings
+        // /api/settings used to fall back to the company row's entity type
+        // when company_settings.entity_type is null; the cached row does not.
+        const entityType: EntityType =
+          (settings?.entity_type as EntityType | null | undefined) ??
+          company.entity_type ??
+          'enskild_firma'
 
         setSourceType(
           resolveInvoicePaymentSourceType({
@@ -165,9 +166,15 @@ export default function PaymentBookingDialog({
             items: invoice.items,
             default_dimensions: invoice.default_dimensions,
             ore_rounding: invoice.ore_rounding,
+            deduction_total: invoice.deduction_total,
+            // #1717: lets the proposal clear the actual remaining on a
+            // partially_paid invoice (öre write-off when < 1 kr remains).
+            paid_amount: invoice.paid_amount,
+            remaining_amount: invoice.remaining_amount,
           },
           accountingMethod,
           entityType,
+          paymentAccount: chosenPaymentAccount,
           companyOreRounding:
             typeof settings?.ore_rounding === 'boolean' ? settings.ore_rounding : undefined,
         })
@@ -188,7 +195,11 @@ export default function PaymentBookingDialog({
 
     init()
     return () => { cancelled = true }
-  }, [open, invoice.id, company?.id])
+  // companySettings and accountingMethod are read at init time on purpose: a
+  // background revalidation of the settings row must not re-run init()
+  // (and reset the user's lines) mid-dialog.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, invoice.id, company?.id, accountsLoading, settingsLoading, cashAccountsLoading, chosenPaymentAccount, accountsError, settingsError])
 
   // Voucher-series preview: resolve the upcoming serie + nummer the same way the
   // booking engine will, so a misconfigured series is visible before confirming.
@@ -321,7 +332,10 @@ export default function PaymentBookingDialog({
       <DialogContent className="sm:max-w-[680px]">
         <DialogHeader>
           <DialogTitle>
-            {t('title')}{invoice.invoice_number ? t('title_suffix', { number: invoice.invoice_number }) : ''}
+            {/* data-ph-mask: the invoice number is user data */}
+            {t('title')}{invoice.invoice_number ? (
+              <span data-ph-mask="">{t('title_suffix', { number: invoice.invoice_number })}</span>
+            ) : ''}
             {nextVoucher && (
               <span className="ml-1 text-muted-foreground tabular-nums">
                 ({nextVoucher.series}{nextVoucher.next})

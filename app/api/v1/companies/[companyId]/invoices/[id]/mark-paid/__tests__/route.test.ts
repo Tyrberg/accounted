@@ -42,6 +42,14 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
   findFiscalPeriod: vi.fn().mockResolvedValue('fp-1'),
 }))
 
+// Issue #1259: settling the invoice retires the suggestion pointers at it.
+// Mocked so the assertion is on the orchestration; the helper's own query
+// shape is pinned by lib/invoices/__tests__/clear-settled-invoice-suggestions.test.ts.
+const { mockClearSuggestions } = vi.hoisted(() => ({ mockClearSuggestions: vi.fn() }))
+vi.mock('@/lib/invoices/clear-settled-invoice-suggestions', () => ({
+  clearSettledInvoiceSuggestions: mockClearSuggestions,
+}))
+
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import {
   createInvoicePaymentJournalEntry as mockedPayment,
@@ -133,7 +141,7 @@ const PAID_INVOICE = {
   status: 'paid',
   remaining_amount: 0,
   paid_amount: 12500,
-  paid_at: '2026-05-12',
+  paid_at: '2026-05-12T12:00:00Z',
 }
 
 beforeEach(() => {
@@ -151,6 +159,7 @@ beforeEach(() => {
 
 describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
   it('books a full payment under faktureringsmetoden (accrual default)', async () => {
+    const calls: RecordedCall[] = []
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -159,7 +168,8 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
           { data: PAID_INVOICE, error: null },
         ],
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
-      }),
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
+      }, calls),
     )
 
     const paidHandler = vi.fn()
@@ -177,13 +187,47 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     const body = await res.json()
     expect(body.data.status).toBe('paid')
     expect(body.data.remaining_amount).toBe(0)
+    expect(body.data.paid_at).toBe('2026-05-12T12:00:00Z')
     expect(body.data.journal_entry_id).toBe('jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj')
     expect(mockPayment).toHaveBeenCalled()
     expect(mockCash).not.toHaveBeenCalled()
     // invoice.paid must fire so registered webhooks fan out (issue #825).
     expect(paidHandler).toHaveBeenCalledTimes(1)
     expect(paidHandler).toHaveBeenCalledWith(
-      expect.objectContaining({ companyId: COMPANY_ID, userId: USER_ID, paymentAmount: 12500 }),
+      expect.objectContaining({
+        companyId: COMPANY_ID,
+        userId: USER_ID,
+        paymentAmount: 12500,
+        invoice: expect.objectContaining({ paid_at: '2026-05-12T12:00:00Z' }),
+      }),
+    )
+    const invoiceUpdate = calls.find((call) => call.table === 'invoices' && call.method === 'update')
+    expect(invoiceUpdate?.args[0]).toMatchObject({ paid_at: '2026-05-12T12:00:00Z' })
+    // #2019: the AR sub-ledger row (what the kontantmetod cut-off reads) is
+    // written with the voucher and no bank transaction, before the update.
+    const paymentInsert = calls.find(
+      (call) => call.table === 'invoice_payments' && call.method === 'insert',
+    )
+    expect(paymentInsert?.args[0]).toMatchObject({
+      user_id: USER_ID,
+      company_id: COMPANY_ID,
+      invoice_id: INVOICE_ID,
+      payment_date: '2026-05-12',
+      amount: 12500,
+      currency: 'SEK',
+      journal_entry_id: 'jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj',
+      transaction_id: null,
+    })
+    expect(calls.findIndex((c) => c.table === 'invoice_payments' && c.method === 'insert'))
+      .toBeLessThan(calls.findIndex((c) => c.table === 'invoices' && c.method === 'update'))
+    // Issue #1259: the invoice is settled, so no transaction may keep pointing
+    // at it as a match suggestion.
+    expect(mockClearSuggestions).toHaveBeenCalledTimes(1)
+    expect(mockClearSuggestions).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY_ID,
+      'invoice',
+      INVOICE_ID,
     )
   })
 
@@ -196,6 +240,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
           { data: PAID_INVOICE, error: null },
         ],
         company_settings: { data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -222,6 +267,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
             { data: PAID_INVOICE, error: null },
           ],
           company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          invoice_payments: { data: { id: 'ip-1' }, error: null },
         },
         calls,
       ),
@@ -241,8 +287,13 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     // routing reads it; omitting it silently forces the cash path.
     expect(invoiceSelects.length).toBeGreaterThanOrEqual(2)
     expect(String(invoiceSelects[0].args[0])).toContain('journal_entry_id')
+    // ...and deduction_total: the ROT/RUT settlement derivation reads it, and
+    // the mock harness ignores projections, so without this assertion the
+    // route can green-test while fetching a row that lacks the column.
+    expect(String(invoiceSelects[0].args[0])).toContain('deduction_total')
     // Response select (the update's .select) keeps the public contract unchanged.
     expect(String(invoiceSelects[1].args[0])).not.toContain('journal_entry_id')
+    expect(String(invoiceSelects[1].args[0])).not.toContain('deduction_total')
   })
 
   it('clears AR (payment entry) when a cash-method company pays an invoice booked at send', async () => {
@@ -258,6 +309,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
           { data: PAID_INVOICE, error: null },
         ],
         company_settings: { data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -287,6 +339,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
             { data: PAID_INVOICE, error: null },
           ],
           company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          invoice_payments: { data: { id: 'ip-1' }, error: null },
         },
         calls,
       ),
@@ -318,6 +371,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: SENT_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -345,6 +399,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: SENT_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -369,6 +424,142 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     expect(mockPayment).not.toHaveBeenCalled()
   })
 
+  it('accepts the kontantmetoden ROT payment entry: the 1513 leg is not customer money', async () => {
+    // remaining_amount is stored net of the ROT/RUT deduction; the cash entry
+    // still books the gross shape with a 1513 debit for Skatteverket's share.
+    // Summing all debits (124 000) used to reject every such invoice against
+    // the 86 800 remaining by exactly deduction_total.
+    const ROT_INVOICE = {
+      ...SENT_INVOICE,
+      subtotal: 99200,
+      vat_amount: 24800,
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: ROT_INVOICE, error: null },
+          { data: { ...ROT_INVOICE, status: 'paid', remaining_amount: 0, paid_amount: 86800, paid_at: '2026-08-29T12:00:00Z' }, error: null },
+        ],
+        company_settings: { data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
+        transactions: { data: [], error: null },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-08-29',
+          lines: [
+            { account_number: '1930', debit_amount: 86800, credit_amount: 0 },
+            { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+            { account_number: '3001', debit_amount: 0, credit_amount: 99200 },
+            { account_number: '2611', debit_amount: 0, credit_amount: 24800 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.status).toBe('paid')
+    expect(body.data.remaining_amount).toBe(0)
+    expect(body.data.paid_amount).toBe(86800)
+  })
+
+  it('rejects the cash-shaped 1513 lines on a ROT invoice already booked at send', async () => {
+    // Booked-at-send accrual ROT invoice: 1513 was debited in the
+    // registration entry, so a 1513 debit in the PAYMENT lines would double
+    // 1513 and double-count revenue + VAT. The 1513 exclusion must be gated
+    // off, leaving the gross sum (124 000) to trip the overpayment guard
+    // against the net remaining (86 800), exactly as before the fix.
+    const BOOKED_ROT_INVOICE = {
+      ...SENT_INVOICE,
+      subtotal: 99200,
+      vat_amount: 24800,
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+      journal_entry_id: 'rrrrrrrr-rrrr-4rrr-8rrr-rrrrrrrrrrrr',
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: BOOKED_ROT_INVOICE, error: null },
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
+        transactions: { data: [], error: null },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          lines: [
+            { account_number: '1930', debit_amount: 86800, credit_amount: 0 },
+            { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+            { account_number: '3001', debit_amount: 0, credit_amount: 99200 },
+            { account_number: '2611', debit_amount: 0, credit_amount: 24800 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockPayment).not.toHaveBeenCalled()
+    expect(mockCash).not.toHaveBeenCalled()
+  })
+
+  it('still rejects when the bank leg alone overpays a ROT invoice', async () => {
+    const ROT_INVOICE = {
+      ...SENT_INVOICE,
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: ROT_INVOICE, error: null },
+        company_settings: { data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
+        transactions: { data: [], error: null },
+      }),
+    )
+
+    // 90 000 to the bank exceeds the 86 800 customer share even after the
+    // 1513 exclusion: the overpayment guard must still fire.
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          lines: [
+            { account_number: '1930', debit_amount: 90000, credit_amount: 0 },
+            { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+            { account_number: '3001', debit_amount: 0, credit_amount: 127200 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockPayment).not.toHaveBeenCalled()
+    expect(mockCash).not.toHaveBeenCalled()
+  })
+
   it('absorbs an öresavrundning overshoot on SEK custom lines (rounded "Att betala")', async () => {
     // Invoice stored with öre (1234.75); the PDF shows 1235.00 and the customer
     // pays that. The 3740 line carries the residual and the invoice settles in
@@ -388,6 +579,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
           { data: { ...ORE_INVOICE, status: 'paid', remaining_amount: 0, paid_amount: 1234.75 }, error: null },
         ],
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
         transactions: { data: [], error: null },
       }),
     )
@@ -463,6 +655,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: SENT_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -510,6 +703,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: SENT_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
         transactions: {
           data: [
             {
@@ -551,6 +745,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
           { data: PAID_INVOICE, error: null },
         ],
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
         // transactions queue not consulted: force=true short-circuits the guard
       }),
     )
@@ -584,6 +779,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: SENT_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
         transactions: {
           data: [
             {
@@ -690,6 +886,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
             },
           ],
           company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          invoice_payments: { data: { id: 'ip-1' }, error: null },
           transactions: {
             data: [
               {
@@ -737,6 +934,9 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     // the transactions scan never runs: the matching bank row above would
     // otherwise have 409'd a perfectly valid partial payment.
     expect(calls.some((c) => c.table === 'transactions')).toBe(false)
+    // Issue #1259: a partially paid invoice is still matchable, so the
+    // suggestions pointing at it must survive.
+    expect(mockClearSuggestions).not.toHaveBeenCalled()
   })
 
   it('still runs the duplicate guard when the converted SEK lines settle a EUR invoice in full', async () => {
@@ -749,6 +949,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: EUR_INVOICE, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
         transactions: {
           // In kronor: the candidate lookup scans transactions.amount, which is SEK.
           data: [
@@ -794,6 +995,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: { ...EUR_INVOICE, exchange_rate: null, total_sek: null }, error: null },
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        invoice_payments: { data: { id: 'ip-1' }, error: null },
       }),
     )
 
@@ -836,6 +1038,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
             },
           ],
           company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          invoice_payments: { data: { id: 'ip-1' }, error: null },
         },
         calls,
       ),

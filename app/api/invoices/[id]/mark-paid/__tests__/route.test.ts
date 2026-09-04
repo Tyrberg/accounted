@@ -9,7 +9,7 @@ import {
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => Promise.resolve(mockSupabase),
 }))
@@ -168,6 +168,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     // Fetch company settings (now before update due to journal-first ordering)
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
     // Update invoice status (CAS guard: returns matched row)
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockCreateInvoicePaymentJournalEntry.mockResolvedValue({ id: 'je-1' })
@@ -175,7 +176,10 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     const paidHandler = vi.fn()
     eventBus.on('invoice.paid', paidHandler)
 
-    const request = createMockRequest('/api/invoices/inv-1/mark-paid', { method: 'POST' })
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: { payment_date: '2026-05-12' },
+    })
     const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
     const { status, body } = await parseJsonResponse<{
       success: boolean
@@ -183,6 +187,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
       paid_amount: number
       remaining_amount: number
       journal_entry_id: string | null
+      paid_at: string | null
     }>(response)
 
     expect(status).toBe(200)
@@ -191,6 +196,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     expect(body.paid_amount).toBe(12500)
     expect(body.remaining_amount).toBe(0)
     expect(body.journal_entry_id).toBe('je-1')
+    expect(body.paid_at).toBe('2026-05-12T12:00:00Z')
     // invoice.paid must fire so registered webhooks fan out (issue #825).
     expect(paidHandler).toHaveBeenCalledTimes(1)
     expect(paidHandler).toHaveBeenCalledWith(
@@ -198,7 +204,13 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
         companyId: 'company-1',
         userId: 'user-1',
         paymentAmount: 12500,
-        invoice: expect.objectContaining({ id: 'inv-1', status: 'paid', paid_amount: 12500, remaining_amount: 0 }),
+        invoice: expect.objectContaining({
+          id: 'inv-1',
+          status: 'paid',
+          paid_amount: 12500,
+          remaining_amount: 0,
+          paid_at: '2026-05-12T12:00:00Z',
+        }),
       }),
     )
     expect(mockCreateInvoicePaymentJournalEntry).toHaveBeenCalledWith(
@@ -210,7 +222,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
       undefined,
       expect.anything(),
       undefined, // paymentAmount: full settle
-      undefined // settlementAccountNumber: default 1930
+      '1930' // settlementAccountNumber: no chosen payee account, so the default
     )
   })
 
@@ -256,6 +268,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     enqueue({ data: [], error: null })
     enqueue({ data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null })
     // Update invoice status (CAS guard: returns matched row)
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockCreateInvoiceCashEntry.mockResolvedValue({ id: 'je-2' })
@@ -278,7 +291,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
       expect.any(String),
       'enskild_firma',
       expect.anything(),
-      undefined // settlementAccountNumber: default 1930
+      '1930' // settlementAccountNumber: no chosen payee account, so the default
     )
   })
 
@@ -307,6 +320,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     // Fetch company settings (before update, journal-first ordering)
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
     // Update invoice status (CAS guard: returns matched row)
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockFindFiscalPeriod.mockResolvedValue('fp-1')
@@ -449,6 +463,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     enqueue({ data: invoice, error: null })
     // Guard query is SKIPPED because force=true short-circuits the check
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockCreateInvoicePaymentJournalEntry.mockResolvedValue({ id: 'je-force' })
@@ -477,6 +492,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     // No guard query enqueued: guard is skipped for partial payments
     enqueue({ data: invoice, error: null })
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockFindFiscalPeriod.mockResolvedValue('fp-1')
@@ -524,6 +540,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
 
     enqueue({ data: invoice, error: null })
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null }) // CAS update matched
 
     mockFindFiscalPeriod.mockResolvedValue('fp-1')
@@ -556,6 +573,53 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     expect(body.journal_entry_id).toBe('je-ore')
   })
 
+  it('accepts a partially_paid invoice and closes it with a bank-less öre write-off (#1717)', async () => {
+    // An invoice stuck with a sub-krona remaining (öresavrundning on an
+    // earlier payment path). The dialog proposes Dr 3740 / Cr 1510 for the
+    // remaining; booking it flips the invoice to paid. No customer →
+    // duplicate guard skips.
+    const invoice = makeInvoice({
+      id: 'inv-1',
+      status: 'partially_paid',
+      total: 12500.4,
+      paid_amount: 12500,
+      remaining_amount: 0.4,
+    })
+
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // CAS update matched
+
+    mockFindFiscalPeriod.mockResolvedValue('fp-1')
+    mockCreateJournalEntry.mockResolvedValue({ id: 'je-writeoff' })
+
+    const writeOffLines = [
+      { account_number: '3740', debit_amount: 0.4, credit_amount: 0 },
+      { account_number: '1510', debit_amount: 0, credit_amount: 0.4 },
+    ]
+
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: { lines: writeOffLines },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{
+      success: boolean
+      status: string
+      paid_amount: number
+      remaining_amount: number
+      journal_entry_id: string
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.success).toBe(true)
+    expect(body.status).toBe('paid')
+    expect(body.paid_amount).toBe(12500.4)
+    expect(body.remaining_amount).toBe(0)
+    expect(body.journal_entry_id).toBe('je-writeoff')
+  })
+
   it('returns 400 MATCH_AMOUNT_EXCEEDS_REMAINING when custom lines overpay the invoice', async () => {
     // No customer → duplicate guard skips; the overpayment guard must reject
     // BEFORE any journal entry is created (planInvoicePayment runs first).
@@ -579,6 +643,133 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     expect((body.error as unknown as { code: string }).code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
     expect(mockCreateJournalEntry).not.toHaveBeenCalled()
     expect(mockCreateInvoicePaymentJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('accepts the kontantmetoden ROT payment entry: the 1513 leg is not customer money', async () => {
+    // proposeCashLines' own prefill on a ROT invoice: total 124 000, 30 %
+    // deduction 37 200, remaining_amount stored net (86 800). Summing all
+    // debits (124 000) used to trip MATCH_AMOUNT_EXCEEDS_REMAINING by exactly
+    // the deduction, making every ROT/RUT cash invoice un-payable.
+    const invoice = makeInvoice({
+      id: 'inv-1',
+      status: 'sent',
+      subtotal: 99200,
+      vat_amount: 24800,
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+    })
+
+    // Fetch invoice
+    enqueue({ data: invoice, error: null })
+    // Fetch company settings
+    enqueue({ data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null })
+    // Update invoice status (CAS guard: returns matched row)
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
+    enqueue({ data: [{ id: 'inv-1' }], error: null })
+
+    mockFindFiscalPeriod.mockResolvedValue('fp-1')
+    mockCreateJournalEntry.mockResolvedValue({ id: 'je-rot' })
+
+    const rotCashLines = [
+      { account_number: '1930', debit_amount: 86800, credit_amount: 0 },
+      { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+      { account_number: '3001', debit_amount: 0, credit_amount: 99200 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 24800 },
+    ]
+
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: { payment_date: '2026-08-29', lines: rotCashLines },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{
+      success: boolean
+      status: string
+      paid_amount: number
+      remaining_amount: number
+      journal_entry_id: string | null
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.success).toBe(true)
+    expect(body.status).toBe('paid')
+    expect(body.paid_amount).toBe(86800)
+    expect(body.remaining_amount).toBe(0)
+    expect(body.journal_entry_id).toBe('je-rot')
+    // The verifikat still books the FULL entry including the 1513 leg.
+    expect(mockCreateJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({ lines: rotCashLines }),
+    )
+  })
+
+  it('rejects the cash-shaped 1513 lines on a ROT invoice already booked at send', async () => {
+    // 1513 was already debited in the registration entry; a 1513 debit in the
+    // payment lines would double it and double-count revenue + VAT. The
+    // exclusion is gated off for booked invoices, so the gross sum (124 000)
+    // still trips the guard against the net remaining (86 800).
+    const invoice = makeInvoice({
+      id: 'inv-1',
+      status: 'sent',
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+      journal_entry_id: 'je-registration',
+    })
+
+    enqueue({ data: invoice, error: null })
+
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: {
+        lines: [
+          { account_number: '1930', debit_amount: 86800, credit_amount: 0 },
+          { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+          { account_number: '3001', debit_amount: 0, credit_amount: 99200 },
+          { account_number: '2611', debit_amount: 0, credit_amount: 24800 },
+        ],
+      },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect((body.error as unknown as { code: string }).code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('still rejects when the bank leg alone overpays a ROT invoice', async () => {
+    const invoice = makeInvoice({
+      id: 'inv-1',
+      status: 'sent',
+      total: 124000,
+      deduction_total: 37200,
+      remaining_amount: 86800,
+    })
+
+    enqueue({ data: invoice, error: null })
+
+    // Bank 90 000 exceeds the 86 800 customer share even after the 1513
+    // exclusion: the overpayment guard must still fire.
+    const overpayLines = [
+      { account_number: '1930', debit_amount: 90000, credit_amount: 0 },
+      { account_number: '1513', debit_amount: 37200, credit_amount: 0 },
+      { account_number: '3001', debit_amount: 0, credit_amount: 127200 },
+    ]
+
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: { lines: overpayLines },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect((body.error as unknown as { code: string }).code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
   })
 
   it('surfaces ocr_exact match_reason when tx reference normalizes to invoice_number', async () => {
@@ -686,6 +877,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     enqueue({ data: [], error: null })
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
     // Update invoice status (CAS guard: returns matched row)
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockCreateInvoicePaymentJournalEntry.mockResolvedValue({ id: 'je-auto' })
@@ -734,6 +926,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     // No duplicate-guard probes enqueued: 500 EUR < 1 000 EUR remaining, so the
     // guard is skipped entirely.
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockFindFiscalPeriod.mockResolvedValue('fp-1')
@@ -912,6 +1105,7 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
 
     enqueue({ data: invoice, error: null })
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
     enqueue({ data: [{ id: 'inv-1' }], error: null })
 
     mockCreateInvoicePaymentJournalEntry.mockResolvedValue({ id: 'je-eur-full' })
@@ -928,5 +1122,62 @@ describe('POST /api/invoices/[id]/mark-paid', () => {
     expect(body.status).toBe('paid')
     expect(body.paid_amount).toBe(1000)
     expect(body.remaining_amount).toBe(0)
+  })
+
+  it('refuses to mark a quote paid: an offert is not a claim', async () => {
+    const quote = makeInvoice({ status: 'sent', document_type: 'quote', quote_status: 'accepted' })
+    enqueue({ data: quote, error: null })
+
+    const request = createMockRequest('/api/invoices/q-1/mark-paid', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'q-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('INVOICE_QUOTE_NOT_PAYABLE')
+    expect(mockCreateInvoicePaymentJournalEntry).not.toHaveBeenCalled()
+  })
+
+  // Issue #2019: the manual flow flipped the invoice to paid without an
+  // invoice_payments row, so the kontantmetod cut-off saw no payment date and
+  // re-booked the paid invoice as a fordran at bokslut.
+  it('records the manual payment in invoice_payments with the voucher and no bank transaction', async () => {
+    const customer = makeCustomer()
+    const invoice = makeInvoice({
+      id: 'inv-1',
+      status: 'sent',
+      total: 12500,
+      currency: 'SEK',
+      customer,
+    })
+
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: [], error: null }) // duplicate guard: merchant_name
+    enqueue({ data: [], error: null }) // duplicate guard: description
+    enqueue({ data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null })
+    enqueue({ data: { id: 'ip-1' }, error: null }) // invoice_payments insert
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // CAS update matched
+
+    mockCreateInvoiceCashEntry.mockResolvedValue({ id: 'je-cash' })
+
+    const request = createMockRequest('/api/invoices/inv-1/mark-paid', {
+      method: 'POST',
+      body: { payment_date: '2026-08-28' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    const inserts = findCalls('invoice_payments', 'insert')
+    expect(inserts).toHaveLength(1)
+    expect(inserts[0][0]).toMatchObject({
+      user_id: 'user-1',
+      company_id: 'company-1',
+      invoice_id: 'inv-1',
+      payment_date: '2026-08-28',
+      amount: 12500,
+      currency: 'SEK',
+      journal_entry_id: 'je-cash',
+      transaction_id: null,
+    })
   })
 })

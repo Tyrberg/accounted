@@ -6,7 +6,7 @@ import { useTranslations } from 'next-intl'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Loader2, Building2, AlertCircle } from 'lucide-react'
+import { Loader2, AlertCircle, Briefcase } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
 import { useToast } from '@/components/ui/use-toast'
 import { getBranding } from '@/lib/branding/service'
@@ -197,14 +197,14 @@ export default function InvitePage() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="min-h-dvh flex items-center justify-center bg-background">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-background">
+    <div className="min-h-dvh flex flex-col bg-background">
       <header className="relative bg-[#141414] text-white overflow-hidden">
         <div className="absolute inset-0 pointer-events-none" aria-hidden>
           <div
@@ -270,7 +270,7 @@ export default function InvitePage() {
                 <Card className="p-6">
                   <div className="flex items-start gap-4">
                     <div className="p-2.5 rounded-lg bg-muted/50">
-                      <Building2 className="h-5 w-5 text-muted-foreground" />
+                      <Briefcase className="h-5 w-5 text-muted-foreground" />
                     </div>
                     <div>
                       <p className="font-medium">{invite.companyName}</p>
@@ -309,7 +309,7 @@ export default function InvitePage() {
                 <Card className="p-6">
                   <div className="flex items-start gap-4">
                     <div className="p-2.5 rounded-lg bg-muted/50">
-                      <Building2 className="h-5 w-5 text-muted-foreground" />
+                      <Briefcase className="h-5 w-5 text-muted-foreground" />
                     </div>
                     <div>
                       <p className="font-medium">{invite.companyName}</p>
@@ -337,7 +337,7 @@ export default function InvitePage() {
                 <Card className="p-6">
                   <div className="flex items-start gap-4">
                     <div className="p-2.5 rounded-lg bg-muted/50">
-                      <Building2 className="h-5 w-5 text-muted-foreground" />
+                      <Briefcase className="h-5 w-5 text-muted-foreground" />
                     </div>
                     <div>
                       <p className="font-medium">{invite.companyName}</p>
@@ -365,7 +365,7 @@ export default function InvitePage() {
                 <Card className="p-6">
                   <div className="flex items-start gap-4">
                     <div className="p-2.5 rounded-lg bg-muted/50">
-                      <Building2 className="h-5 w-5 text-muted-foreground" />
+                      <Briefcase className="h-5 w-5 text-muted-foreground" />
                     </div>
                     <div>
                       <p className="font-medium">{invite.companyName}</p>

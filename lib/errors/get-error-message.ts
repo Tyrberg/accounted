@@ -20,6 +20,10 @@
 import { formatCurrency } from '@/lib/utils'
 // Pure module (no next/server): safe for the client bundles this file lives in.
 import { formatDimensionValidationIssues } from '@/lib/bookkeeping/dimension-errors'
+import {
+  describeMissingInvoicePaymentAccount,
+  isInvoicePaymentAccountCurrency,
+} from '@/lib/invoices/payment-accounts'
 import { getErrorEntry, hasErrorEntry } from './structured-errors'
 
 type ErrorContext =
@@ -69,6 +73,10 @@ const HTTP_STATUS_MAP: Record<number, Bilingual> = {
   403: { sv: 'Du har inte behörighet att utföra denna åtgärd.', en: 'You do not have permission to perform this action.' },
   404: { sv: 'Resursen kunde inte hittas.', en: 'The resource could not be found.' },
   409: { sv: 'En konflikt uppstod. Ladda om sidan och försök igen.', en: 'A conflict occurred. Reload the page and try again.' },
+  // 413 is answered by the hosting platform, before any route runs, with a
+  // plain-text body: the status is the only thing a caller has to go on.
+  413: { sv: 'Filen är för stor för att skickas. Försök igen med en mindre fil.', en: 'The file is too large to send. Try again with a smaller file.' },
+  415: { sv: 'Filtypen stöds inte.', en: 'That file type is not supported.' },
   422: { sv: 'Uppgifterna kunde inte bearbetas. Kontrollera fälten och försök igen.', en: 'The data could not be processed. Check the fields and try again.' },
   429: { sv: 'För många förfrågningar. Vänta en stund och försök igen.', en: 'Too many requests. Wait a moment and try again.' },
   500: { sv: 'Ett oväntat serverfel uppstod. Försök igen senare.', en: 'An unexpected server error occurred. Please try again later.' },
@@ -94,6 +102,10 @@ const GENERIC_FALLBACK: Bilingual = { sv: 'Något gick fel. Försök igen.', en:
 
 // Known error patterns → user-friendly Swedish messages
 const ERROR_PATTERN_MAP: [RegExp, string | null][] = [
+  [
+    /reason must be 500 characters or fewer/i,
+    'Motiveringen får vara högst 500 tecken.',
+  ],
   [
     /locked\/closed fiscal period/i,
     'Perioden är låst. Verifikationen kan inte skapas i en stängd eller låst period.',
@@ -142,6 +154,19 @@ const ERROR_PATTERN_MAP: [RegExp, string | null][] = [
     /already has a journal entry/i,
     'Transaktionen är redan bokförd. Ångra kategoriseringen om du vill ändra den.',
   ],
+  [
+    // GoTrue rejects supabase.auth.signUp with this when the installation
+    // runs with disable_signup (closed self-hosted instances). The invitee
+    // cannot fix it themselves: point them to whoever runs the installation.
+    /signups? not allowed/i,
+    'Kontoregistrering är avstängd på den här installationen. Kontakta den som bjöd in dig eller din administratör för att få ett konto.',
+  ],
+  [
+    // GoTrue could not send its own mail (admin invite, confirmation,
+    // recovery): almost always missing SMTP configuration on self-hosted.
+    /error sending (invite|confirmation|recovery|magic link|email change) email/i,
+    'E-postmeddelandet kunde inte skickas av autentiseringstjänsten. Kontrollera installationens SMTP-inställningar och försök igen.',
+  ],
 ]
 
 /**
@@ -161,10 +186,97 @@ function tryMatchKnownError(message: string): string | null {
 }
 
 /**
- * Simple heuristic to detect already-translated Swedish messages.
- * If the message contains common Swedish words/patterns, pass it through.
+ * Swedish tokens that mark a sentence as Swedish. STRONG ones are
+ * unambiguous (never English, rare in technical output) and count 2 on their
+ * own; WEAK ones are common function words that also exist in English or are
+ * too short to be decisive ("till", "den", "det") and count 1 each. Words
+ * that are plainly English as well ("under", "men", "om", "en", "vi") are
+ * left out on purpose, so an English framework message cannot score on them.
  */
-function isSwedishUserMessage(message: string): boolean {
+const SWEDISH_STRONG_WORDS = [
+  'och', 'att', 'inte', 'är', 'ska', 'finns', 'ingen', 'inget', 'inga', 'redan',
+  'bara', 'hos', 'från', 'eller', 'utan', 'också', 'endast', 'ännu', 'igen',
+  'kunde', 'gick', 'går', 'måste', 'får', 'saknas', 'lyckades', 'misslyckades',
+  'bifogad', 'svarade',
+]
+const SWEDISH_WEAK_WORDS = [
+  'för', 'med', 'till', 'det', 'den', 'ett', 'av', 'på', 'som', 'har', 'kan',
+  'när', 'över', 'mot', 'vid', 'efter', 'innan', 'alla', 'sedan', 'här', 'där',
+  'din', 'ditt', 'dina', 'denna', 'detta', 'dessa', 'minst', 'högst',
+]
+// The strong list is probed with .test(), so it must NOT be global: a global
+// regex keeps lastIndex between calls and silently fails the next message.
+// The weak list is iterated with matchAll(), which requires the g flag and
+// clones the regex per call.
+const wordListRe = (words: string[], flags: string) =>
+  new RegExp(`(^|[^\\p{L}])(${words.join('|')})(?=$|[^\\p{L}])`, flags)
+const SWEDISH_STRONG_RE = wordListRe(SWEDISH_STRONG_WORDS, 'iu')
+const SWEDISH_WEAK_RE = wordListRe(SWEDISH_WEAK_WORDS, 'giu')
+
+/**
+ * Signs that a string is a technical leak rather than a sentence written for
+ * the user: stack frames, file:line references, JS/Node error vocabulary,
+ * Postgres/PostgREST/SQL fragments, JSON, URLs. A message carrying any of
+ * these is never shown raw, whatever language it is in.
+ */
+const TECHNICAL_LEAK_PATTERNS: RegExp[] = [
+  /\bat \S+ \(/, // stack frame: "at fn (file:1:2)"
+  /\.(?:ts|tsx|js|mjs|cjs):\d+/, // file:line
+  /\b(?:TypeError|ReferenceError|SyntaxError|RangeError|EvalError)\b/,
+  /cannot read propert/i,
+  /is not a function\b/i,
+  /is not defined\b/i,
+  /\bundefined\b/,
+  /\bNaN\b/,
+  /\bPGRST\d+/,
+  /\bSQLSTATE\b/,
+  /violates .*constraint/i,
+  /duplicate key value/i,
+  /relation "/i,
+  /column "/i,
+  /syntax error at/i,
+  /\bE(?:CONN\w+|TIMEDOUT|NOTFOUND|PIPE|HOSTUNREACH)\b/,
+  /fetch failed/i,
+  /unexpected token/i,
+  /\{\s*"/, // JSON object start
+  /https?:\/\//,
+]
+
+/**
+ * Whether a free-text string reads as a Swedish sentence written for the user
+ * (issue #2086): it carries å/ä/ö or Swedish words, and shows no sign of
+ * being a technical leak (see TECHNICAL_LEAK_PATTERNS). Scoring: å/ä/ö or
+ * any STRONG word counts 2, each distinct WEAK word 1, pass at 2. So "Inget
+ * skattekonto är registrerat hos Skatteverket." and "Kopplingen misslyckades."
+ * pass; "Failed to fetch customer", "Redirect till /login" and
+ * "TypeError: x is not a function" do not.
+ */
+export function looksLikeUserFacingSwedish(message: string): boolean {
+  const text = message.trim()
+  if (!text) return false
+  if (TECHNICAL_LEAK_PATTERNS.some((p) => p.test(text))) return false
+  if (/[åäöÅÄÖ]/.test(text)) return true
+  if (SWEDISH_STRONG_RE.test(text)) return true
+  const weak = new Set<string>()
+  for (const m of text.matchAll(SWEDISH_WEAK_RE)) weak.add(m[2].toLowerCase())
+  return weak.size >= 2
+}
+
+/**
+ * Whether a route's free-text `error` / `message` string is a user-facing
+ * Swedish message that should be shown as-is.
+ *
+ * Two ways in. The keyword list below is the original test; it stays because
+ * callers rely on the odd tokens it lets through (e.g. "session"). It was also
+ * the ONLY test until issue #2086: a correct sentence without one of the ~30
+ * keywords ("Inget skattekonto är registrerat hos Skatteverket.") was dropped
+ * and replaced with the generic HTTP-500 text, whose "försök igen senare"
+ * advice was wrong for the case. 155 of the 631 message_sv strings in
+ * structured-errors.ts failed the keyword test. looksLikeUserFacingSwedish is
+ * the second way in, and a registry-wide test pins that every message_sv
+ * passes one of the two.
+ */
+export function isSwedishUserMessage(message: string): boolean {
   const swedishPatterns = [
     /kunde inte/i,
     /kan inte/i,
@@ -197,8 +309,10 @@ function isSwedishUserMessage(message: string): boolean {
     /clearingnummer/i,
     /nummer är/i,
     /tillgängligt/i,
+    /verifikation/i,
+    /importera|importen/i,
   ]
-  return swedishPatterns.some((p) => p.test(message))
+  return swedishPatterns.some((p) => p.test(message)) || looksLikeUserFacingSwedish(message)
 }
 
 /**
@@ -329,6 +443,20 @@ export function getErrorMessage(
         details?: unknown
       }
 
+      // Say what is missing for THIS invoice's currency: on a SEK invoice the
+      // registry's currency-neutral text read as a foreign-currency account
+      // when the gap was the company's bankgiro (#2126). Before the English
+      // registry shortcut on purpose: both locales get the specific text.
+      if (structured.code === 'INVOICE_SEND_PAYMENT_ACCOUNT_MISSING') {
+        // Own local name on purpose: the sek-labelled-amount guard keys
+        // currency reads by owner path, and `details` is also the owner of
+        // the SEK-only journal totals formatted further down.
+        const paymentDetails = structured.details as { currency?: unknown } | undefined
+        if (isInvoicePaymentAccountCurrency(paymentDetails?.currency)) {
+          return pick(describeMissingInvoicePaymentAccount(paymentDetails.currency), locale)
+        }
+      }
+
       // For English UI, return the registry's English message for any known
       // code instead of falling through to the Swedish branches below (which
       // ignored locale: English users were shown Swedish prose). The Swedish
@@ -446,6 +574,20 @@ export function getErrorMessage(
         return 'Rättelsen saknar ekonomisk innebörd: varje konto netto till noll. En rättelse måste beskriva en faktisk affärshändelse (BFL 5 kap. 5 §).'
       }
 
+      if (structured.code === 'CORRECTION_CHAIN_TOO_DEEP') {
+        const details = structured.details as
+          | { depth?: number; chainRootVoucher?: string | null }
+          | undefined
+        const depthPart =
+          typeof details?.depth === 'number'
+            ? `Kedjan är redan ${details.depth} nivåer djup`
+            : 'Rättelsekedjan är redan flera nivåer djup'
+        const rootPart = details?.chainRootVoucher
+          ? ` (ursprungsverifikat ${details.chainRootVoucher})`
+          : ''
+        return `${depthPart}${rootPart}. Räkna ut nettoeffekten av hela kedjan och gör EN rättelse istället, eller skicka allow_deep_chain=true för att rätta ändå.`
+      }
+
       if (structured.code === 'BOOKKEEPING_DATABASE_ERROR') {
         // A DB-layer error may carry a user-relevant cause (e.g. period lock
         // trigger). Try the known-pattern map before falling back to the
@@ -464,9 +606,11 @@ export function getErrorMessage(
         // Known codes without a dynamic branch above (e.g. CANNOT_REVERSE_STORNO)
         // carry raw English engine messages: prefer the registry's Swedish
         // message so no typed code surfaces English in a Swedish UI.
+        // A code flagged thrown_message_sv composes its Swedish text at the
+        // throw site (a date, an amount): that text wins over the static entry.
         if (locale === 'sv' && typeof structured.code === 'string' && !isSwedishUserMessage(structured.message)) {
           const entry = getErrorEntry(structured.code)
-          if (entry?.message_sv) return entry.message_sv
+          if (entry?.message_sv && !entry.thrown_message_sv) return entry.message_sv
         }
         return structured.message
       }
@@ -535,6 +679,107 @@ export function getErrorMessage(
 
   // 6. Generic fallback
   return pick(GENERIC_FALLBACK, locale)
+}
+
+// PSD2 bank-connection OAuth callback errors. The Enable Banking callback
+// route redirects the browser back to /settings/banking with a user-facing
+// message. The raw provider code/description used to be passed through
+// verbatim ("server_error", "invalid_state"), which left a stuck user with
+// nothing to act on and support with nothing to answer (issue #1716: the
+// Handelsbanken corporate fullmakt failures). Known codes get a Swedish
+// explanation; the raw provider description is appended in parentheses so
+// the underlying error still reaches the user (and a screenshot to support).
+const BANK_CONNECTION_ERROR_MAP: Record<string, string> = {
+  server_error:
+    'Banken kunde inte slutföra godkännandet på grund av ett fel på bankens sida. Försök igen om en stund. Gäller det företagskonton kan banken kräva en fullmakt innan kopplingen godkänns.',
+  temporarily_unavailable:
+    'Bankens anslutningstjänst är tillfälligt otillgänglig. Försök igen om en stund.',
+  invalid_request:
+    'Banken avvisade anslutningsförfrågan som ogiltig. Försök igen, och kontakta supporten om felet kvarstår.',
+  // Internal callback tokens (not from the bank) that were previously shown raw.
+  invalid_state:
+    'Anslutningsförsöket kunde inte matchas mot ett pågående försök. Det kan hända om försöket tog för lång tid eller om ett nytt försök startades under tiden. Starta bankkopplingen på nytt.',
+  missing_parameters:
+    'Banken skickade ett ofullständigt svar tillbaka. Starta bankkopplingen på nytt.',
+  invalid_code_format:
+    'Banken skickade ett ogiltigt svar tillbaka. Starta bankkopplingen på nytt.',
+}
+
+const BANK_CONNECTION_CANCELLED_MESSAGE =
+  'Anslutningen avbröts hos banken innan den slutfördes. Ingen bankkoppling skapades. Försök igen och slutför alla steg hos banken.'
+
+const BANK_CONNECTION_SESSION_EXPIRED_MESSAGE =
+  'Bankens inloggningssession hann gå ut innan anslutningen slutfördes. Starta bankkopplingen på nytt och slutför alla steg hos banken direkt.'
+
+const BANK_CONNECTION_FALLBACK_MESSAGE =
+  'Banken avvisade anslutningen. Försök igen, och kontakta supporten om felet kvarstår.'
+
+// Same shape the callback route keys its expired-vs-error decision on.
+const BANK_SESSION_EXPIRY_PATTERN =
+  /session.?expired|expired.?session|closed.?session|session.?closed|invalid.?session|session.?not.?found/i
+
+/**
+ * Map a PSD2 authorization callback outcome (OAuth error code plus optional
+ * provider description) to a Swedish user message. Always Swedish: the bank
+ * redirect carries no locale, and bank-connection surfaces follow the
+ * user-facing-errors-are-Swedish rule.
+ */
+export function getBankConnectionErrorMessage(
+  errorCode: string,
+  errorDescription?: string | null
+): string {
+  const code = errorCode.trim()
+  const description = errorDescription?.trim() || null
+  const combined = `${code} ${description ?? ''}`
+
+  // User cancelled at the bank: an expected outcome, keep it clean without
+  // echoing the provider text back.
+  if (code === 'access_denied' || /cancel/i.test(combined)) {
+    return BANK_CONNECTION_CANCELLED_MESSAGE
+  }
+
+  let base: string
+  if (BANK_SESSION_EXPIRY_PATTERN.test(combined)) {
+    base = BANK_CONNECTION_SESSION_EXPIRED_MESSAGE
+  } else {
+    base = BANK_CONNECTION_ERROR_MAP[code] ?? BANK_CONNECTION_FALLBACK_MESSAGE
+  }
+
+  // Surface the underlying provider error: without it the user (and support,
+  // via a screenshot) cannot tell one failure from another.
+  return description && description !== code ? `${base} (${description})` : base
+}
+
+const PROVIDER_REASON_PREFIX: Bilingual = {
+  sv: 'Leverantörens svar',
+  en: 'Provider response',
+}
+
+/**
+ * The provider refused ONE register while the grant itself keeps working: a
+ * Fortnox account without rights to leverantörsregistret, a Bokio token with a
+ * narrower scope. Never say "återanslut" here, the reconnect re-mints the same
+ * grant and hits the same 403.
+ *
+ * The base copy is the registry's PROVIDER_RESOURCE_FORBIDDEN entry, not a
+ * second copy of it: the same sentence has to reach the toast, the API
+ * envelope and the public error catalogue (lib/docs/content/errors.ts renders
+ * the registry verbatim). The entry's existence is locked by
+ * lib/errors/__tests__/structured-errors.test.ts.
+ *
+ * `reason` is the provider's own sentence (e.g. Fortnox'
+ * "Saknar behörighet för leverantörsregister."), appended verbatim because it
+ * is the only part that names the register. Omitted when the provider sent an
+ * opaque body, which Bokio does.
+ */
+export function getProviderResourceForbiddenMessage(
+  reason?: string | null,
+  locale: ErrorLocale = 'sv',
+): string {
+  const entry = getErrorEntry('PROVIDER_RESOURCE_FORBIDDEN')!
+  const base = pick({ sv: entry.message_sv, en: entry.message_en }, locale)
+  const detail = reason?.trim()
+  return detail ? `${base} ${pick(PROVIDER_REASON_PREFIX, locale)}: "${detail}"` : base
 }
 
 /**

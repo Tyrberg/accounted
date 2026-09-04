@@ -14,6 +14,12 @@ vi.mock('@/lib/currency/riksbanken', () => ({
   convertToSEK: vi.fn(),
 }))
 
+const mockResolveRate = vi.fn()
+vi.mock('@/lib/currency/supplier-invoice-rate', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/currency/supplier-invoice-rate')>()
+  return { ...actual, resolveSupplierInvoiceExchangeRate: (...args: unknown[]) => mockResolveRate(...args) }
+})
+
 describe('gnubok_create_supplier_invoice_from_inbox: registration', () => {
   it('is registered with idempotent + non-read-only annotations', () => {
     const tool = tools.find((t) => t.name === 'gnubok_create_supplier_invoice_from_inbox')
@@ -238,6 +244,49 @@ describe('gnubok_create_supplier_invoice_from_inbox: execute', () => {
     expect(result.preview.vat_amount).toBe(250)
   })
 
+  it('resolves a foreign supplier by VAT number when the document carries no org number', async () => {
+    // The extractor leaves orgNumber null for non-Swedish entities by design,
+    // so momsregistreringsnumret is the only exact key an EU supplier has.
+    const supabase = makeMock({
+      inbox: {
+        id: 'inbox-vat',
+        status: 'received',
+        extracted_data: {
+          ...baseExtracted,
+          supplier: {
+            name: 'Adobe Systems Software Ireland Ltd',
+            orgNumber: null,
+            vatNumber: 'IE6364992H',
+          },
+        },
+        matched_supplier_id: null,
+        created_supplier_invoice_id: null,
+        document_id: 'doc-vat',
+      },
+      supplierByOrg: null,
+      supplierByName: null,
+      supplierList: [
+        { id: 'other-supplier', name: 'Some GmbH', org_number: null, vat_number: 'DE123456789' },
+        {
+          id: 'adobe-supplier',
+          name: 'ADOBE SYSTEMS SOFTWARE IRELAND LTD',
+          org_number: null,
+          vat_number: 'IE6364992H',
+        },
+      ],
+      supplierRecord: { id: 'adobe-supplier', default_expense_account: null },
+    })
+    const tool = tools.find((t) => t.name === 'gnubok_create_supplier_invoice_from_inbox')!
+    const result = (await tool.execute(
+      { inbox_item_id: 'inbox-vat', dry_run: true },
+      'company-1', 'user-1', supabase,
+    )) as { preview: { supplier_id: string; supplier_resolution: string; extracted_vat_number: string | null } }
+
+    expect(result.preview.supplier_id).toBe('adobe-supplier')
+    expect(result.preview.supplier_resolution).toBe('lookup_vat_number')
+    expect(result.preview.extracted_vat_number).toBe('IE6364992H')
+  })
+
   it('falls through to org_number lookup when no matched supplier', async () => {
     const supabase = makeMock({
       inbox: {
@@ -331,6 +380,7 @@ describe('gnubok_create_supplier_invoice_from_inbox: execute', () => {
     expect(result.preview.unresolved_supplier).toEqual({
       extracted_name: 'Acme AB',
       extracted_org_number: '5566778899',
+      extracted_vat_number: null,
     })
     // Next hint prefills gnubok_create_supplier from the extraction.
     expect(result.next.tool).toBe('gnubok_create_supplier')
@@ -610,6 +660,69 @@ describe('gnubok_create_supplier_invoice_from_inbox: execute', () => {
     expect(params.vat_amount).toBe(120)
   })
 
+  it('rejects apply_slp when the line resolves to a non-741x account (staging-time guard)', async () => {
+    // The executor (commitCreateSupplierInvoiceFromInbox) refuses the same
+    // combination at commit time; rejecting at staging means the agent learns
+    // immediately instead of a human approving a doomed operation.
+    const supabase = makeMock({
+      inbox: {
+        id: 'inbox-slp-1',
+        status: 'received',
+        extracted_data: baseExtracted, // line resolves to supplier default / 4000
+        matched_supplier_id: 'supplier-1',
+        created_supplier_invoice_id: null,
+        document_id: 'doc-slp-1',
+      },
+    })
+    const tool = tools.find((t) => t.name === 'gnubok_create_supplier_invoice_from_inbox')!
+    await expect(
+      tool.execute(
+        {
+          inbox_item_id: 'inbox-slp-1',
+          line_overrides: [{ line_number: 1, apply_slp: true }],
+        },
+        'company-1', 'user-1', supabase,
+      ),
+    ).rejects.toThrow(/7410-7419/)
+  })
+
+  it('stages apply_slp into the operation items when the line resolves to a 741x account', async () => {
+    const inserts: Array<Record<string, unknown>> = []
+    const supabase = makeMock({
+      inbox: {
+        id: 'inbox-slp-2',
+        status: 'received',
+        extracted_data: {
+          ...baseExtracted,
+          lineItems: [
+            { description: 'Tjänstepension', quantity: 1, unit_price: 10000, line_total: 10000, vat_rate: 0, vat_amount: 0 },
+          ],
+        },
+        matched_supplier_id: 'supplier-1',
+        created_supplier_invoice_id: null,
+        document_id: 'doc-slp-2',
+      },
+      inserts,
+    })
+    const tool = tools.find((t) => t.name === 'gnubok_create_supplier_invoice_from_inbox')!
+    const result = (await tool.execute(
+      {
+        inbox_item_id: 'inbox-slp-2',
+        line_overrides: [{ line_number: 1, account_number: '7412', apply_slp: true }],
+      },
+      'company-1', 'user-1', supabase,
+    )) as { staged: boolean }
+
+    expect(result.staged).toBe(true)
+    const params = inserts[0].params as {
+      items: Array<{ account_number: string; apply_slp?: boolean }>
+    }
+    // The executor reads item.apply_slp === true to book the 7533/2514 pair:
+    // without this plumbing the flag was unreachable from MCP.
+    expect(params.items[0].account_number).toBe('7412')
+    expect(params.items[0].apply_slp).toBe(true)
+  })
+
   it('invoice_date_override rescues an inbox item with no extracted invoiceDate', async () => {
     const extractedNoDate = {
       ...baseExtracted,
@@ -670,5 +783,132 @@ describe('gnubok_create_supplier_invoice_from_inbox: execute', () => {
     await expect(
       tool.execute({ inbox_item_id: 'inbox-5' }, 'company-1', 'user-1', supabase),
     ).rejects.toThrow(/no extracted_data/)
+  })
+})
+
+/**
+ * FX resolution at staging time (feedback seq 299742): the tool used to call
+ * fetchExchangeRate WITHOUT the supabase client, so neither the shared
+ * exchange_rates cache nor the last-cached-observation fallback was reachable
+ * and a Riksbanken 429 surfaced as exchange_rate: null / lookup_failed for a
+ * date that resolved fine a minute later. The staged op was then unapprovable
+ * (SI_FX_RATE_MISSING at commit) with no way to supply the rate.
+ */
+describe('gnubok_create_supplier_invoice_from_inbox: exchange rate resolution', () => {
+  const usdExtracted = {
+    ...baseExtracted,
+    invoice: { ...baseExtracted.invoice, currency: 'USD', invoiceDate: '2026-04-24' },
+  }
+  const usdInbox = {
+    id: 'inbox-usd',
+    status: 'received',
+    extracted_data: usdExtracted,
+    matched_supplier_id: 'supplier-1',
+    created_supplier_invoice_id: null,
+    document_id: 'doc-usd',
+  }
+  const tool = () => tools.find((t) => t.name === 'gnubok_create_supplier_invoice_from_inbox')!
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockResolveRate.mockReset()
+  })
+
+  it('resolves through the shared resolver WITH the supabase client (cache + last-cached fallback reachable)', async () => {
+    mockResolveRate.mockResolvedValue({
+      ok: true,
+      rate: { currency: 'USD', rate: 9.51731, exchangeRate: 9.51731, exchangeRateDate: '2026-04-24', source: 'fetched' },
+    })
+    const supabase = makeMock({ inbox: usdInbox })
+    const result = (await tool().execute(
+      { inbox_item_id: 'inbox-usd', dry_run: true },
+      'company-1',
+      'user-1',
+      supabase,
+    )) as { preview: Record<string, unknown> }
+
+    expect(mockResolveRate).toHaveBeenCalledWith(supabase, {
+      currency: 'USD',
+      invoiceDate: '2026-04-24',
+      suppliedRate: null,
+    })
+    expect(result.preview.exchange_rate).toBe(9.51731)
+    expect(result.preview.exchange_rate_source).toBe('riksbanken')
+    expect(result.preview.exchange_rate_hint).toBeUndefined()
+  })
+
+  it('exchange_rate_override is passed as the supplied rate and echoed as source "supplied"', async () => {
+    mockResolveRate.mockResolvedValue({
+      ok: true,
+      rate: { currency: 'USD', rate: 9.6, exchangeRate: 9.6, exchangeRateDate: null, source: 'supplied' },
+    })
+    const inserts: Array<Record<string, unknown>> = []
+    const supabase = makeMock({ inbox: usdInbox, inserts })
+    const result = (await tool().execute(
+      { inbox_item_id: 'inbox-usd', exchange_rate_override: 9.6 },
+      'company-1',
+      'user-1',
+      supabase,
+    )) as { preview: Record<string, unknown> }
+
+    expect(mockResolveRate).toHaveBeenCalledWith(supabase, {
+      currency: 'USD',
+      invoiceDate: '2026-04-24',
+      suppliedRate: 9.6,
+    })
+    expect(result.preview.exchange_rate).toBe(9.6)
+    expect(result.preview.exchange_rate_source).toBe('supplied')
+    // The staged params carry the rate the reviewer saw, so the executor's
+    // resolver trusts it verbatim instead of re-fetching.
+    const staged = inserts[0]?.params as Record<string, unknown> | undefined
+    expect(staged?.exchange_rate).toBe(9.6)
+  })
+
+  it('lookup failure stays visible as lookup_failed and tells the agent what unblocks approval', async () => {
+    mockResolveRate.mockResolvedValue({ ok: false, currency: 'USD', invoiceDate: '2026-04-24' })
+    const supabase = makeMock({ inbox: usdInbox })
+    const result = (await tool().execute(
+      { inbox_item_id: 'inbox-usd', dry_run: true },
+      'company-1',
+      'user-1',
+      supabase,
+    )) as { preview: Record<string, unknown> }
+
+    expect(result.preview.exchange_rate).toBeNull()
+    expect(result.preview.exchange_rate_source).toBe('lookup_failed')
+    expect(result.preview.exchange_rate_hint).toMatch(/exchange_rate_override \(SEK per 1 USD\)/)
+  })
+
+  it('rejects a non-positive or non-numeric exchange_rate_override before touching the resolver', async () => {
+    const supabase = makeMock({ inbox: usdInbox })
+    await expect(
+      tool().execute({ inbox_item_id: 'inbox-usd', exchange_rate_override: '9,6' }, 'company-1', 'user-1', supabase),
+    ).rejects.toThrow(/exchange_rate_override must be a positive number \(SEK per 1 USD\); got "9,6"/)
+    await expect(
+      tool().execute({ inbox_item_id: 'inbox-usd', exchange_rate_override: 0 }, 'company-1', 'user-1', supabase),
+    ).rejects.toThrow(/must be a positive number/)
+    expect(mockResolveRate).not.toHaveBeenCalled()
+  })
+
+  it('an implausible override is refused with a pointer at the invoice, never silently replaced', async () => {
+    mockResolveRate.mockResolvedValue({ ok: false, currency: 'USD', invoiceDate: '2026-04-24' })
+    const supabase = makeMock({ inbox: usdInbox })
+    await expect(
+      tool().execute({ inbox_item_id: 'inbox-usd', exchange_rate_override: 250000 }, 'company-1', 'user-1', supabase),
+    ).rejects.toThrow(/exchange_rate_override 250000 was refused as implausible/)
+  })
+
+  it('a SEK invoice does not consult the resolver and reports not_applicable', async () => {
+    const supabase = makeMock({
+      inbox: { ...usdInbox, id: 'inbox-sek', extracted_data: baseExtracted },
+    })
+    const result = (await tool().execute(
+      { inbox_item_id: 'inbox-sek', dry_run: true },
+      'company-1',
+      'user-1',
+      supabase,
+    )) as { preview: Record<string, unknown> }
+    expect(mockResolveRate).not.toHaveBeenCalled()
+    expect(result.preview.exchange_rate_source).toBe('not_applicable')
   })
 })

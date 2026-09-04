@@ -38,12 +38,28 @@ interface MockLine {
   source_type?: string | null
 }
 
+interface MockChartAccount {
+  account_number: string
+  account_name: string
+  account_class: number
+  default_vat_rate: number | null
+  default_vat_treatment: string | null
+}
+
 /**
  * Table-routed Supabase double. journal_entries / journal_entry_lines serve the
  * fixture; everything else (transactions, supplier_invoices, company_settings)
  * comes back empty so no unrelated blocker fires.
  */
-function mockSupabase(lines: MockLine[]) {
+function mockSupabase(
+  lines: MockLine[],
+  chartAccounts: MockChartAccount[] = [],
+  companySettings: Record<string, unknown> | null = {
+    moms_period: 'monthly',
+    vat_taxable_base_over_40m: false,
+  },
+  companyEntityType: 'aktiebolag' | 'enskild_firma' | null = null,
+) {
   const entries = [
     ...new Map(
       lines.map((l, i) => {
@@ -75,7 +91,7 @@ function mockSupabase(lines: MockLine[]) {
     const chain: Record<string, unknown> = {}
     const settled = { data: rows, error: null, count: rows.length }
     chain.range = () => settled
-    chain.single = async () => ({ data: null, error: null })
+    chain.single = async () => ({ data: rows[0] ?? null, error: null })
     chain.maybeSingle = async () => ({ data: null, error: null })
     chain.then = (resolve: (v: unknown) => void) => resolve(settled)
     for (const m of [
@@ -91,6 +107,13 @@ function mockSupabase(lines: MockLine[]) {
     from: (table: string) => {
       if (table === 'journal_entries') return makeChain(entries)
       if (table === 'journal_entry_lines') return makeChain(bareLines)
+      if (table === 'chart_of_accounts') return makeChain(chartAccounts)
+      if (table === 'company_settings') {
+        return makeChain(companySettings ? [companySettings] : [])
+      }
+      if (table === 'companies') {
+        return makeChain(companyEntityType ? [{ entity_type: companyEntityType }] : [])
+      }
       return makeChain([])
     },
     // The missing-underlag blocker reads the verifikat_without_documents RPC,
@@ -107,6 +130,179 @@ function mockSupabase(lines: MockLine[]) {
 const PERIOD = { period_type: 'monthly', year: 2026, period: 1 }
 
 describe('gnubok_vat_close_check: declaration completeness', () => {
+  it('reads the over-40M setting and returns the following-month 26th deadline', async () => {
+    const result = await computeVatCloseCheck(
+      PERIOD,
+      'company-1',
+      mockSupabase([], [], {
+        moms_period: 'monthly',
+        vat_taxable_base_over_40m: true,
+      }),
+    )
+
+    expect(result.payment.deadline).toBe('2026-02-26')
+    expect(result.payment.deadline_label).toBe('26 februari 2026')
+  })
+
+  it('surfaces an unavailable deadline instead of guessing when settings are missing', async () => {
+    const result = await computeVatCloseCheck(
+      PERIOD,
+      'company-1',
+      mockSupabase([], [], null),
+    )
+
+    expect(result.payment.deadline).toBeNull()
+    expect(result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'deadline_unavailable',
+      severity: 'high',
+    }))
+    expect(result.ready_to_close).toBe(false)
+  })
+
+  it('does not fall back to the company row when annual settings omit entity type', async () => {
+    const result = await computeVatCloseCheck(
+      { period_type: 'yearly', year: 2026, period: 1 },
+      'company-1',
+      mockSupabase([], [], {
+        moms_period: 'yearly',
+        vat_taxable_base_over_40m: false,
+        fiscal_year_start_month: 1,
+        vat_has_eu_trade: false,
+        vat_filing_method: 'electronic',
+      }, 'aktiebolag'),
+    )
+
+    expect(result.payment.deadline).toBeNull()
+    expect(result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'deadline_unavailable',
+      severity: 'high',
+    }))
+    expect(result.ready_to_close).toBe(false)
+  })
+
+  it.each([
+    ['enskild_firma', false, '2027-05-12'],
+    ['aktiebolag', true, '2027-02-26'],
+  ] as const)('does not require an annual filing method for %s with EU trade %s', async (
+    entityType,
+    vatHasEuTrade,
+    expectedDeadline,
+  ) => {
+    const result = await computeVatCloseCheck(
+      { period_type: 'yearly', year: 2026, period: 1 },
+      'company-1',
+      mockSupabase([], [], {
+        moms_period: 'yearly',
+        vat_taxable_base_over_40m: false,
+        entity_type: entityType,
+        fiscal_year_start_month: 1,
+        vat_has_eu_trade: vatHasEuTrade,
+        vat_filing_method: null,
+      }),
+    )
+
+    expect(result.payment.deadline).toBe(expectedDeadline)
+    expect(result.blockers).not.toContainEqual(expect.objectContaining({
+      kind: 'deadline_unavailable',
+    }))
+  })
+
+  it('requires an annual filing method for an AB without EU trade', async () => {
+    const result = await computeVatCloseCheck(
+      { period_type: 'yearly', year: 2026, period: 1 },
+      'company-1',
+      mockSupabase([], [], {
+        moms_period: 'yearly',
+        vat_taxable_base_over_40m: false,
+        entity_type: 'aktiebolag',
+        fiscal_year_start_month: 1,
+        vat_has_eu_trade: false,
+        vat_filing_method: null,
+      }),
+    )
+
+    expect(result.payment.deadline).toBeNull()
+    expect(result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'deadline_unavailable',
+      severity: 'high',
+    }))
+  })
+
+  it('includes a null-rate 3011 with matching domestic VAT evidence (#1289)', async () => {
+    const result = await computeVatCloseCheck(
+      PERIOD,
+      'company-1',
+      mockSupabase(
+        [
+          { entry: 'e1', account_number: '3011', credit_amount: 9725 },
+          { entry: 'e1', account_number: '2611', credit_amount: 2431.25 },
+          { entry: 'e1', account_number: '1510', debit_amount: 12156.25 },
+        ],
+        [{
+          account_number: '3011',
+          account_name: 'Försäljning tjänster inom Sverige, 25 % moms',
+          account_class: 3,
+          default_vat_rate: null,
+          default_vat_treatment: null,
+        }],
+      ),
+    )
+
+    expect(result.rutor.ruta05).toBe(9725)
+    expect(result.rutor.ruta10).toBe(2431.25)
+    expect(result.declaration_checks.map((finding) => finding.code))
+      .not.toContain('OUTPUT_VAT_WITHOUT_SALES_BASE')
+    expect(result.ready_to_close).toBe(true)
+  })
+
+  it('honors an explicit override of a standard BAS revenue account', async () => {
+    const result = await computeVatCloseCheck(
+      PERIOD,
+      'company-1',
+      mockSupabase(
+        [
+          { entry: 'e1', account_number: '3011', credit_amount: 1000 },
+          { entry: 'e1', account_number: '1510', debit_amount: 1000 },
+        ],
+        [{
+          account_number: '3011',
+          account_name: 'Momsfri försäljning',
+          account_class: 3,
+          default_vat_rate: 0,
+          default_vat_treatment: 'exempt',
+        }],
+      ),
+    )
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('accepts a custom EU goods basis account in the MCP close check', async () => {
+    const result = await computeVatCloseCheck(
+      PERIOD,
+      'company-1',
+      mockSupabase(
+        [
+          { entry: 'e1', account_number: '4056', debit_amount: 1000 },
+          { entry: 'e1', account_number: '2440', credit_amount: 1000 },
+          { entry: 'e1', account_number: '2614', credit_amount: 250 },
+          { entry: 'e1', account_number: '2645', debit_amount: 250 },
+        ],
+        [{
+          account_number: '4056',
+          account_name: 'Inköp varor EU 25 %',
+          account_class: 4,
+          default_vat_rate: 0.25,
+          default_vat_treatment: 'reverse_charge_eu_goods',
+        }],
+      ),
+    )
+
+    expect(result.declaration_checks.map((finding) => finding.code))
+      .not.toContain('RC_BASIS_MISSING')
+    expect(result.ready_to_close).toBe(true)
+  })
+
   it('refuses the #1164 declaration: fiktiv moms on 2614/2645 with no basbelopp on 44xx/45xx', async () => {
     // Both VAT legs of a reverse-charge purchase booked, but the cost went
     // straight to 6540 instead of the 4535 basis account, so rutor 20-24 stay

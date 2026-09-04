@@ -9,6 +9,7 @@ import {
   sectorNameKey,
 } from '@/lib/extensions/i18n'
 import type { SectorSlug } from '@/lib/extensions/types'
+import { getRequestAppName } from '@/lib/branding/request-brand'
 import CategoryBadge from '@/components/extensions/CategoryBadge'
 import { WORKSPACES } from '@/lib/extensions/_generated/workspace-map'
 import { Button } from '@/components/ui/button'
@@ -27,13 +28,16 @@ export default async function ExtensionDetailPage({
   const sector = getSector(sectorSlug as SectorSlug)
 
   const t = await getTranslations('extensions')
+  // Some long descriptions carry the {appName} ICU parameter (WL-12 appName
+  // sweep); passing it unconditionally is harmless for messages without it.
+  const appName = await getRequestAppName()
 
   const nameKey = extensionNameKey(definition.slug)
   const descriptionKey = extensionDescriptionKey(definition.slug)
   const longDescriptionKey = extensionLongDescriptionKey(definition.slug)
   const extensionName = nameKey ? t(nameKey) : definition.name
-  const extensionDescription = descriptionKey ? t(descriptionKey) : definition.description
-  const extensionLongDescription = longDescriptionKey ? t(longDescriptionKey) : definition.longDescription
+  const extensionDescription = descriptionKey ? t(descriptionKey, { appName }) : definition.description
+  const extensionLongDescription = longDescriptionKey ? t(longDescriptionKey, { appName }) : definition.longDescription
 
   const sectorLabel = (() => {
     if (!sector) return sectorSlug
@@ -72,8 +76,8 @@ export default async function ExtensionDetailPage({
       {/* Header */}
       <div className="flex items-start justify-between gap-4 mb-8">
         <div className="flex items-start gap-4">
-          <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-primary/10 flex-shrink-0">
-            <Icon className="h-7 w-7 text-primary" />
+          <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-secondary flex-shrink-0">
+            <Icon className="h-6 w-6 text-foreground" />
           </div>
           <div>
             <h1 className="font-display text-2xl leading-8 tracking-tight">{extensionName}</h1>
@@ -95,14 +99,14 @@ export default async function ExtensionDetailPage({
       {/* Details */}
       <div className="space-y-6">
         <div>
-          <h2 className="text-sm font-semibold mb-2">{t('description_heading')}</h2>
+          <h2 className="text-sm uppercase tracking-wider text-muted-foreground mb-2">{t('description_heading')}</h2>
           <p className="text-sm text-muted-foreground leading-relaxed">
             {extensionLongDescription}
           </p>
         </div>
 
         <div>
-          <h2 className="text-sm font-semibold mb-2">{t('data_source_heading')}</h2>
+          <h2 className="text-sm uppercase tracking-wider text-muted-foreground mb-2">{t('data_source_heading')}</h2>
           <p className="text-sm text-muted-foreground">
             {dataPatternLabels[definition.dataPattern]}
           </p>

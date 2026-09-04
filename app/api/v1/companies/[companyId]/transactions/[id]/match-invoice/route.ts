@@ -26,7 +26,8 @@ import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { MatchInvoiceSchema } from '@/lib/api/schemas'
 import { createInvoiceCashEntry } from '@/lib/bookkeeping/invoice-entries'
 import { buildInvoicePaymentClearingLines } from '@/lib/bookkeeping/invoice-payment-lines'
@@ -40,7 +41,10 @@ import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
+import { recordInvoicePaymentRow } from '@/lib/invoices/invoice-payment-row'
 import { detectDuplicatePaymentVoucher } from '@/lib/invoices/duplicate-payment-detection'
+import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { paidAtFromDate } from '@/lib/invoices/paid-at'
 import { eventBus } from '@/lib/events/bus'
 import type { Currency, EntityType, Invoice, Transaction } from '@/types'
 
@@ -112,27 +116,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     }
     const txId = idParse.data
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
     const parsed = MatchInvoiceSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const { invoice_id, force, expected_journal_entry_id, lines: customLines } = parsed.data
     const txLog = ctx.log.child({ transactionId: txId, invoiceId: invoice_id })
 
@@ -408,8 +396,23 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
     const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = payment.plan
+    const paidAt = isFullyPaid ? paidAtFromDate(transaction.date) : null
 
-    if (transaction.journal_entry_id) {
+    // A RECONCILIATION link (reconciliation_method set) is not a conflicting
+    // booking: the entry is an independent verifikat that may evidence OTHER
+    // affärshändelser; reversing it wholesale would be an over-broad rättelse
+    // (BFL 5 kap 5 §). Nothing is detached here: the final transaction update
+    // overwrites the pointer and clears reconciliation_method in the same
+    // write, so a failure in between leaves the existing link intact.
+    const priorReconciliationLink =
+      transaction.journal_entry_id && transaction.reconciliation_method
+        ? {
+            journalEntryId: transaction.journal_entry_id as string,
+            method: transaction.reconciliation_method as string,
+          }
+        : null
+
+    if (transaction.journal_entry_id && !priorReconciliationLink) {
       try {
         await reverseEntry(ctx.supabase, ctx.companyId!, ctx.userId, transaction.journal_entry_id)
         const { error: clearErr } = await ctx.supabase
@@ -420,7 +423,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         if (clearErr) {
           txLog.warn('failed to clear journal_entry_id after storno', clearErr)
         }
-        logMatchEvent(ctx.supabase, ctx.userId, txId, 'storno_conflict_resolved', {
+        await logMatchEvent(ctx.supabase, ctx.userId, txId, 'storno_conflict_resolved', {
           invoiceId: invoice_id,
           previousState: { journal_entry_id: transaction.journal_entry_id },
           newState: { journal_entry_id: null },
@@ -430,8 +433,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
       }
     }
-
-    const now = new Date().toISOString()
 
     const { data: settings } = await ctx.supabase
       .from('company_settings')
@@ -464,7 +465,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
 
     // Reject cash-method partial payments ONLY for pure kontantmetoden
     // invoices (no prior JE). Under kontantmetoden utgående moms must be
-    // reported in the period of actual receipt (ML 13 kap 8 §); the
+    // reported in the period of actual receipt (bokslutsmetoden); the
     // partial-payment branch uses the accrual-style clearing entry which
     // doesn't model the per-installment moms event. When the invoice was
     // already booked under accrual, the clearing entry IS the correct
@@ -674,7 +675,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       .from('invoices')
       .update({
         status: newStatus,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         paid_amount: newPaidAmount,
         remaining_amount: newRemaining,
       })
@@ -709,35 +710,49 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
 
     const paymentNotes = [cashMethodNote, manualRateNote].filter(Boolean).join(' · ') || null
 
-    // amount and currency must agree: the row stores the payment in INVOICE
-    // currency (the column's unit), never a SEK magnitude wearing the invoice's
-    // foreign currency code. exchange_rate is the rate ACTUALLY USED for this
-    // payment (Riksbanken or the caller's override on the payment date, per
-    // ML 8 kap 21-23§), falling back to the invoice's booking rate only when no
-    // conversion was needed.
-    const { error: paymentInsertErr } = await ctx.supabase
-      .from('invoice_payments')
-      .insert({
-        user_id: ctx.userId,
-        company_id: ctx.companyId!,
-        invoice_id,
-        payment_date: transaction.date,
-        amount: paidAmount,
+    // The AR sub-ledger row goes through the single writer
+    // (lib/invoices/invoice-payment-row.ts): amount = the amount APPLIED to
+    // the invoice (new paid_amount minus the prior one) in INVOICE currency,
+    // never a SEK magnitude wearing the invoice's foreign currency code and
+    // never the cash received (a whole-krona overshoot absorbed on 3740 is
+    // part of the voucher, not of the receivable, #2250). exchange_rate is
+    // the rate ACTUALLY USED for this payment (Riksbanken or the caller's
+    // override on the payment date, per ML 8 kap 21-23§), falling back to the
+    // invoice's booking rate only when no conversion was needed.
+    const recorded = await recordInvoicePaymentRow(ctx.supabase, {
+      userId: ctx.userId,
+      companyId: ctx.companyId!,
+      invoice: {
+        id: invoice_id,
         currency: invoice.currency,
-        exchange_rate: fx.required ? fx.rate : invoice.exchange_rate,
-        journal_entry_id: journalEntryId,
-        transaction_id: txId,
-        notes: paymentNotes,
-      })
-    if (paymentInsertErr) {
-      if (paymentInsertErr.code === '23505') {
+        exchange_rate: invoice.exchange_rate,
+        paid_amount: invoice.paid_amount,
+      },
+      paymentDate: transaction.date,
+      newPaidAmount,
+      journalEntryId,
+      transactionId: txId,
+      exchangeRate: fx.required ? fx.rate : invoice.exchange_rate,
+      notes: paymentNotes,
+    })
+    if (!recorded.ok) {
+      if (recorded.code === '23505') {
         return v1ErrorResponseFromCode('MATCH_INVOICE_DUPLICATE_PAYMENT', txLog, {
           requestId: ctx.requestId,
         })
       }
-      txLog.error('failed to record payment', paymentInsertErr)
+      txLog.error('failed to record payment', undefined, { error: recorded.error })
       return v1ErrorResponseFromCode('MATCH_INVOICE_RECORD_PAYMENT_FAILED', txLog, {
         requestId: ctx.requestId,
+      })
+    }
+
+    // The invoice is now settled, so every OTHER transaction still carrying a
+    // suggestion pointer at it is dead: retire them (issue #1259). This
+    // request's own row is cleared by the update just below.
+    if (isFullyPaid) {
+      await clearSettledInvoiceSuggestions(ctx.supabase, ctx.companyId!, 'invoice', invoice_id, {
+        exceptTransactionId: txId,
       })
     }
 
@@ -752,6 +767,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       potential_invoice_id: null,
       journal_entry_id: journalEntryId,
       is_business: true,
+      // The invoice match supersedes any prior reconciliation link (deferred
+      // detach, see the priorReconciliationLink block above). Unconditional:
+      // null is already the value on every non-reconciliation-linked row.
+      reconciliation_method: null,
     }
     if (existingTxCategory) txUpdate.category = existingTxCategory
 
@@ -767,7 +786,20 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
-    logMatchEvent(ctx.supabase, ctx.userId, txId, 'matched', {
+    // Record the release of the prior reconciliation link now that the
+    // re-point has committed (behandlingshistorik, BFNAR 2013:2 kap 8).
+    if (priorReconciliationLink) {
+      await logMatchEvent(ctx.supabase, ctx.userId, txId, 'unmatched', {
+        invoiceId: invoice_id,
+        previousState: {
+          journal_entry_id: priorReconciliationLink.journalEntryId,
+          reconciliation_method: priorReconciliationLink.method,
+        },
+        newState: { journal_entry_id: journalEntryId, reconciliation_method: null },
+      })
+    }
+
+    await logMatchEvent(ctx.supabase, ctx.userId, txId, 'matched', {
       invoiceId: invoice_id,
       matchConfidence: 1.0,
       matchMethod: 'manual_confirm',
@@ -788,8 +820,21 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       eventBus.emit({
         type: 'invoice.match_confirmed',
         payload: {
-          invoice: invoice as Invoice,
-          transaction: transaction as Transaction,
+          invoice: {
+            ...invoice,
+            status: newStatus,
+            paid_at: paidAt,
+            paid_amount: newPaidAmount,
+            remaining_amount: newRemaining,
+          } as Invoice,
+          transaction: {
+            ...transaction,
+            invoice_id,
+            potential_invoice_id: null,
+            journal_entry_id: journalEntryId,
+            is_business: true,
+            ...(existingTxCategory ? { category: existingTxCategory } : {}),
+          } as Transaction,
           userId: ctx.userId,
           companyId: ctx.companyId!,
         },
@@ -802,7 +847,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       {
         success: true,
         invoice_status: newStatus,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         paid_amount: newPaidAmount,
         remaining_amount: newRemaining,
         journal_entry_id: journalEntryId,

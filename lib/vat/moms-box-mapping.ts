@@ -82,6 +82,11 @@ export const ACCOUNT_TO_BOX: Record<string, MomsBox> = {
   // Non-EU services → Box 40
   '3305': '40',  // Försäljning tjänster export utanför EU
 
+  // Domestic reverse-charge sales (buyer liable for VAT) → Box 41
+  '3231': '41',  // Försäljning byggsektorn, omvänd betalningsskyldighet
+  '3232': '41',  // Omvänd betalningsskyldighet, övriga (skrot m.m.)
+  '3233': '41',  // Omvänd betalningsskyldighet, övriga
+
   // VAT-exempt sales → Box 42
   '3004': '42',  // Momsfri försäljning (AB)
   '3100': '42',  // Momsfria intäkter (EF)
@@ -128,6 +133,7 @@ export const ACCOUNT_TO_BOX: Record<string, MomsBox> = {
   '2645': '48',  // Beräknad ingående moms (EU/non-EU förvärv)
   '2646': '48',  // Uthyrning
   '2647': '48',  // Omvänd skattskyldighet i Sverige
+  '2648': '48',  // Vilande ingående moms vid bokslut
   '2649': '48',  // Blandad verksamhet
 
   // Reverse-charge purchase bases (debit on cost accounts) → Boxes 20-24
@@ -195,15 +201,3 @@ export function getBoxForAccount(accountNumber: string): MomsBox | undefined {
 export function getBoxLabel(box: MomsBox): string {
   return BOX_LABELS[box]
 }
-
-/** Boxes that represent VAT-exempt export/EU sales (no output VAT) */
-export const EXPORT_BOXES: MomsBox[] = ['35', '36', '38', '39', '40']
-
-/** Boxes that represent taxable domestic sales (have output VAT) */
-export const DOMESTIC_BOXES: MomsBox[] = ['05', '06', '07', '08']
-
-/** Boxes that represent output VAT */
-export const OUTPUT_VAT_BOXES: MomsBox[] = ['10', '11', '12']
-
-/** Boxes that represent input VAT */
-export const INPUT_VAT_BOXES: MomsBox[] = ['48']

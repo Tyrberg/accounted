@@ -9,6 +9,7 @@ import { Sun, Moon, Monitor, LogOut, ExternalLink } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { createClient } from '@/lib/supabase/client'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { EmailDigestToggle } from '@/components/settings/EmailDigestToggle'
 import { InstallAppSection } from '@/components/settings/InstallAppSection'
 import { CalendarFeedSettings } from '@/components/settings/CalendarFeedSettings'
 import { AccountDangerZone } from '@/components/settings/AccountDangerZone'
@@ -23,13 +24,18 @@ import {
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import { useSettings } from '@/components/settings/useSettings'
 import { resetAnalyticsIdentity } from '@/lib/analytics/reset'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { useToast } from '@/components/ui/use-toast'
 import { SUPPORTED_LOCALES, type Locale } from '@/i18n/config'
+import { PalettePicker } from '@/components/settings/PalettePicker'
+import { usePalette } from '@/components/providers/PaletteProvider'
+import type { Palette } from '@/lib/theme/palettes'
 
 export function AccountSettingsContent() {
   const router = useRouter()
   const supabase = createClient()
   const { theme, setTheme } = useTheme()
+  const { palette, setPalette } = usePalette()
   const [mounted, setMounted] = useState(false)
   const hasCalendarExtension = ENABLED_EXTENSION_IDS.has('calendar')
   const { settings } = useSettings()
@@ -44,6 +50,10 @@ export function AccountSettingsContent() {
   const [initialName, setInitialName] = useState('')
   const [nameLoading, setNameLoading] = useState(true)
   const [savingName, setSavingName] = useState(false)
+  const [email, setEmail] = useState('')
+  const [currentEmail, setCurrentEmail] = useState('')
+  const [savingEmail, setSavingEmail] = useState(false)
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null)
 
   useEffect(() => { setMounted(true) }, [])
 
@@ -54,6 +64,12 @@ export function AccountSettingsContent() {
     ;(async () => {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) { if (active) setNameLoading(false); return }
+      if (active && user.email) {
+        setEmail(user.email)
+        setCurrentEmail(user.email)
+      }
+      // A change already awaiting confirmation survives a page reload.
+      if (active && user.new_email) setPendingEmail(user.new_email.toLowerCase())
       const { data } = await supabase
         .from('profiles')
         .select('full_name')
@@ -90,6 +106,48 @@ export function AccountSettingsContent() {
     }
   }
 
+  async function handleSaveEmail() {
+    const trimmed = email.trim().toLowerCase()
+    if (!trimmed || trimmed === currentEmail.toLowerCase() || savingEmail) return
+    setSavingEmail(true)
+    try {
+      const res = await fetch('/api/account/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmed }),
+      })
+      const json = await res.json().catch(() => null)
+      if (!res.ok) {
+        toast({
+          title: tSettings('email_change_failed'),
+          description: getErrorMessage(json, {
+            statusCode: res.status,
+            locale: activeLocale,
+          }),
+          variant: 'destructive',
+        })
+        return
+      }
+      setPendingEmail(trimmed)
+      const resent = (json as { data?: { resent?: boolean } } | null)?.data?.resent
+      toast({
+        title:
+          resent === false
+            ? tSettings('email_change_already_pending')
+            : tSettings('email_change_requested'),
+        description: tSettings('email_change_requested_help'),
+      })
+    } catch (err) {
+      toast({
+        title: tSettings('email_change_failed'),
+        description: getErrorMessage(err, { locale: activeLocale }),
+        variant: 'destructive',
+      })
+    } finally {
+      setSavingEmail(false)
+    }
+  }
+
   async function handleLogout() {
     resetAnalyticsIdentity()
     await supabase.auth.signOut()
@@ -123,6 +181,13 @@ export function AccountSettingsContent() {
     en: tCommon('language_english'),
   }
 
+  const paletteLabels: Record<Palette, string> = {
+    neutral: tSettings('palette_neutral'),
+    indigo: tSettings('palette_indigo'),
+    forest: tSettings('palette_forest'),
+    sand: tSettings('palette_sand'),
+  }
+
   const nameUnchanged = !fullName.trim() || fullName.trim() === initialName
 
   return (
@@ -152,6 +217,44 @@ export function AccountSettingsContent() {
               disabled={nameLoading || savingName || nameUnchanged}
             >
               {savingName ? tCommon('saving') : tCommon('save')}
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
+
+        <SettingsRow
+          label={tSettings('email_label')}
+          htmlFor="account_email"
+          help={
+            pendingEmail
+              ? tSettings('email_change_pending', { email: pendingEmail })
+              : tSettings('email_description')
+          }
+          align="baseline"
+        >
+          <SettingsInput
+            id="account_email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            disabled={!currentEmail || savingEmail}
+            maxLength={320}
+          />
+          <SettingsRowEnd>
+            <Button
+              size="sm"
+              onClick={handleSaveEmail}
+              disabled={
+                !currentEmail ||
+                savingEmail ||
+                !email.trim() ||
+                email.trim().toLowerCase() === currentEmail.toLowerCase()
+              }
+            >
+              {savingEmail
+                ? tCommon('saving')
+                : email.trim().toLowerCase() === pendingEmail
+                  ? tSettings('email_resend')
+                  : tCommon('save')}
             </Button>
           </SettingsRowEnd>
         </SettingsRow>
@@ -196,6 +299,21 @@ export function AccountSettingsContent() {
         </SettingsRow>
 
         <SettingsRow
+          label={tSettings('palette_label')}
+          help={tSettings('palette_description')}
+          align="baseline"
+        >
+          {mounted && (
+            <PalettePicker
+              value={palette}
+              onChange={setPalette}
+              labels={paletteLabels}
+              aria-label={tSettings('palette_label')}
+            />
+          )}
+        </SettingsRow>
+
+        <SettingsRow
           label={tSettings('section_language')}
           help={tSettings('language_description')}
         >
@@ -217,6 +335,9 @@ export function AccountSettingsContent() {
 
       {/* Security: BankID, password, 2FA (renders its own group) */}
       <SecuritySettings />
+
+      {/* Notifications: daily "nytt att bokfora" email digest opt-in */}
+      <EmailDigestToggle />
 
       {/* Calendar feed (extension-gated) */}
       {hasCalendarExtension && <CalendarFeedSettings />}

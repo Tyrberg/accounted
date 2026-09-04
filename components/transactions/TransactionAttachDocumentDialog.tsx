@@ -25,6 +25,9 @@ interface TransactionAttachDocumentDialogProps {
   onOpenChange: (open: boolean) => void
   transaction: TransactionWithInvoice | null
   onAttached: (transactionId: string, documentId: string) => void
+  /** Detach the current pin (#2132). The page owns confirm + DELETE; the
+   *  dialog only offers the entry point next to the already-attached hint. */
+  onDetach?: (transaction: TransactionWithInvoice) => void
 }
 
 /**
@@ -40,8 +43,10 @@ export default function TransactionAttachDocumentDialog({
   onOpenChange,
   transaction,
   onAttached,
+  onDetach,
 }: TransactionAttachDocumentDialogProps) {
   const t = useTranslations('tx_attach_dialog')
+  const tDetach = useTranslations('tx_detach')
   const { toast } = useToast()
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [pickedDoc, setPickedDoc] = useState<AvailableInboxDoc | null>(null)
@@ -144,7 +149,24 @@ export default function TransactionAttachDocumentDialog({
         </div>
 
         {transaction.document_id && (
-          <p className="text-xs text-muted-foreground">{t('already_attached_hint')}</p>
+          <p className="text-xs text-muted-foreground">
+            {t('already_attached_hint')}
+            {onDetach && !transaction.journal_entry_id && (
+              <>
+                {' '}
+                <Button
+                  type="button"
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-xs"
+                  disabled={isAttaching}
+                  onClick={() => onDetach(transaction)}
+                >
+                  {tDetach('menu_item')}
+                </Button>
+              </>
+            )}
+          </p>
         )}
 
         <div className="space-y-2">
@@ -159,7 +181,7 @@ export default function TransactionAttachDocumentDialog({
             disabled={isAttaching}
           />
           {pickedDoc && (
-            <div className="flex items-center gap-2 text-sm py-1.5 px-2 rounded bg-muted/50">
+            <div className="flex items-center gap-2 text-sm py-1.5 px-2 rounded-sm bg-muted/50">
               <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
               <span className="truncate flex-1">
                 {pickedDoc.supplier_name ?? pickedDoc.file_name}

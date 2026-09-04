@@ -5,13 +5,14 @@ import { CalendarClock } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { AccountNumber } from '@/components/ui/account-number'
-import { formatCurrency, formatDate } from '@/lib/utils'
+import { formatAmount, formatCurrency, formatDate } from '@/lib/utils'
 import {
   resolveReverseChargeRate,
   isReverseChargeBasisAccount,
   generateReverseChargeBasisLines,
   generateReverseChargeLines,
 } from '@/lib/bookkeeping/vat-entries'
+import { generateSlpLines, isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
 import { buildSupplierDescription } from '@/lib/bookkeeping/supplier-invoice-description'
 import { resolveBookingAccount, itemHasAccrual } from '@/lib/bookkeeping/accruals/account-suggestions'
 import type { Supplier } from '@/types'
@@ -27,6 +28,9 @@ interface ReviewLineItem {
   // Self-assessed VAT rate for omvänd skattskyldighet (0.06/0.12/0.25). The
   // supplier charges no VAT (vat_rate = 0); this drives the fiktiv-moms preview.
   reverse_charge_rate?: number
+  // Särskild löneskatt på pensionskostnader: previews the self-balancing
+  // 7533 D / 2514 K pair the engine injects for flagged 741x lines.
+  apply_slp?: boolean
   // Periodisering: when both dates are set, the registration entry books the
   // net to the 17xx interim account instead of account_number (mirrored via
   // resolveBookingAccount so this preview matches the saved verifikat).
@@ -51,10 +55,6 @@ interface SupplierInvoiceReviewContentProps {
   subtotal: number
   totalVat: number
   total: number
-}
-
-function formatAmount(amount: number): string {
-  return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 interface JournalPreviewLine {
@@ -114,6 +114,24 @@ function buildJournalPreview(
       ? Math.round(item.vat_amount * 100) / 100
       : Math.round(item.amount * item.vat_rate * 100) / 100
 
+  // Särskild löneskatt på pensionskostnader: same self-balancing pair the
+  // engine injects (7533 D / 2514 K at 24.26 % of flagged 741x lines), via
+  // the same generator, so this preview matches the saved verifikat. The
+  // pair nets to zero and never moves the 2440 credit below.
+  const slpBase = items.reduce(
+    (sum, item) =>
+      item.apply_slp && isSlpPensionAccount(item.account_number)
+        ? sum + toSek(item.amount)
+        : sum,
+    0,
+  )
+  const slpPreviewLines: JournalPreviewLine[] = generateSlpLines(slpBase).map((sl) => ({
+    account_number: sl.account_number,
+    description: sl.line_description ?? sl.account_number,
+    debit: sl.debit_amount,
+    credit: sl.credit_amount,
+  }))
+
   if (reverseCharge) {
     // Reverse charge: the supplier charges no VAT, so the buyer self-assesses at
     // the Swedish statutory rate (resolveReverseChargeRate: 25% huvudregel
@@ -170,6 +188,8 @@ function buildJournalPreview(
       }
     }
 
+    lines.push(...slpPreviewLines)
+
     // Credit: 2440 at subtotal (no real VAT for reverse charge)
     lines.push({
       account_number: '2440',
@@ -197,6 +217,8 @@ function buildJournalPreview(
         })
       }
     }
+    lines.push(...slpPreviewLines)
+
     // Credit: 2440 at total incl. VAT
     lines.push({
       account_number: '2440',

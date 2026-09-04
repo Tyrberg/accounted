@@ -1,49 +1,15 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { shouldEnforceMfa } from './mfa'
-import type { User, SupabaseClient, JwtPayload } from '@supabase/supabase-js'
+import type { JwtPayload, User, SupabaseClient } from '@supabase/supabase-js'
+import { claimsPinned, userFromClaims } from './claims'
 
 type AuthResult =
   | { user: User; supabase: SupabaseClient; error: null }
   | { user: null; supabase: SupabaseClient; error: NextResponse }
 
-/**
- * Maps verified JWT claims onto the User subset routes actually consume
- * (id, email, is_anonymous, app_metadata, user_metadata, role, phone).
- *
- * Server-only fields (identities, factors, created_at timestamps) are absent
- * from the token and verified unused by any route (2026-07-23 audit);
- * created_at is set to '' only to satisfy the type.
- */
-/**
- * Defense-in-depth pinning on top of getClaims' signature/expiry verification:
- * the token must come from THIS project's auth server (iss) and be an
- * end-user access token (aud 'authenticated'; anonymous sign-ins share it).
- * A mismatch is not treated as unauthenticated: we fall back to the
- * server-side getUser() check, which is authoritative.
- */
-function claimsPinned(claims: JwtPayload): boolean {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.replace(/\/+$/, '')
-  // Without a configured URL (unit tests) there is nothing to pin against.
-  const issOk = !supabaseUrl || claims.iss === `${supabaseUrl}/auth/v1`
-  const aud = claims.aud
-  const audOk = Array.isArray(aud) ? aud.includes('authenticated') : aud === 'authenticated'
-  return issOk && audOk
-}
-
-function userFromClaims(claims: JwtPayload): User {
-  return {
-    id: claims.sub,
-    aud: Array.isArray(claims.aud) ? (claims.aud[0] ?? 'authenticated') : (claims.aud ?? 'authenticated'),
-    role: claims.role,
-    email: claims.email,
-    phone: claims.phone,
-    app_metadata: claims.app_metadata ?? {},
-    user_metadata: claims.user_metadata ?? {},
-    is_anonymous: claims.is_anonymous ?? false,
-    created_at: '',
-  }
-}
+// claimsPinned / userFromClaims live in ./claims so the dashboard request
+// context (and later the auth proxy) share the exact same pinning + mapping.
 
 /**
  * Auth + MFA guard for API routes.
@@ -66,19 +32,23 @@ export async function requireAuth(): Promise<AuthResult> {
   const supabase = await createClient()
 
   let user: User | null = null
+  // The signature-verified claims, kept for the MFA gate below: null on the
+  // getUser fallback path, where no locally verified claims exist.
+  let claims: JwtPayload | null = null
   try {
     // The typeof guard keeps legacy test mocks (auth object with only
     // getUser) on the old path.
     if (typeof supabase.auth.getClaims === 'function') {
       const { data } = await supabase.auth.getClaims()
-      const claims = data?.claims
-      if (claims?.sub) {
-        if (claimsPinned(claims)) {
-          user = userFromClaims(claims)
+      const verified = data?.claims
+      if (verified?.sub) {
+        if (claimsPinned(verified)) {
+          claims = verified
+          user = userFromClaims(verified)
         } else {
           console.error('requireAuth: getClaims iss/aud pinning failed; falling back to getUser', {
-            iss: claims.iss,
-            aud: claims.aud,
+            iss: verified.iss,
+            aud: verified.aud,
           })
         }
       }
@@ -102,16 +72,73 @@ export async function requireAuth(): Promise<AuthResult> {
     }
   }
 
-  if (shouldEnforceMfa(user)) {
-    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-    if (aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2') {
-      return {
-        user: null,
-        supabase,
-        error: NextResponse.json({ error: 'MFA verification required' }, { status: 403 }),
-      }
+  if (shouldEnforceMfa(user) && !(await sessionIsMfaAssured(supabase, claims))) {
+    return {
+      user: null,
+      supabase,
+      error: NextResponse.json({ error: 'MFA verification required' }, { status: 403 }),
     }
   }
 
   return { user, supabase, error: null }
+}
+
+/**
+ * Whether the session may pass the MFA gate.
+ *
+ * An AAL2 session, per the signature-verified claims, passes with no extra
+ * round trip. Anything else (AAL1, no `aal` claim, or the getUser fallback
+ * path where no verified claims exist) asks the auth server through
+ * listFactors() (a getUser() call under the hood) whether a verified factor
+ * exists: if one does, the session is stuck below the level it could reach
+ * and is refused. A failed or throwing lookup is refused too (fail closed):
+ * the alternative lets a transient auth error switch MFA off.
+ *
+ * Never `mfa.getAuthenticatorAssuranceLevel()` without a JWT: its `nextLevel`
+ * is computed from `session.user.factors`, i.e. from the unsigned
+ * sb-*-auth-token cookie, which whoever holds the password can edit to hide
+ * the factor and turn an enrolled account into a "no MFA needed" one
+ * (security audit 2026-09). The cost of the honest check is one listFactors
+ * round trip per API request for AAL1 sessions of users without a factor.
+ */
+async function sessionIsMfaAssured(
+  supabase: SupabaseClient,
+  claims: JwtPayload | null,
+): Promise<boolean> {
+  if (claims?.aal === 'aal2') return true
+
+  try {
+    const { data, error } = await supabase.auth.mfa.listFactors()
+    if (error || !data) {
+      console.error('requireAuth: listFactors failed; treating session as not MFA-assured', error)
+      return false
+    }
+    return !factorsIncludeVerified(data)
+  } catch (err) {
+    console.error('requireAuth: listFactors threw; treating session as not MFA-assured', err)
+    return false
+  }
+}
+
+type FactorList = ReadonlyArray<{ status: string }> | undefined
+
+/**
+ * Whether a listFactors() payload contains a verified factor of any type.
+ * `all` carries every factor; the typed arrays carry only the verified ones.
+ * Both are consulted so a payload missing either shape still reads right.
+ */
+function factorsIncludeVerified(data: {
+  all?: FactorList
+  totp?: FactorList
+  phone?: FactorList
+  webauthn?: FactorList
+}): boolean {
+  const verified = (list: FactorList) =>
+    list?.some((factor) => factor.status === 'verified') ?? false
+  return (
+    verified(data.all) ||
+    verified(data.totp) ||
+    verified(data.phone) ||
+    verified(data.webauthn)
+  )
 }

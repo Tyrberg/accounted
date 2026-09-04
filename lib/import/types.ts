@@ -185,14 +185,11 @@ export interface AccountMapping {
   confidence: number               // 0-1
   matchType: AccountMatchType
   isOverride: boolean              // User manually set this
-}
-
-/**
- * Account mapping context for the mapper
- */
-export interface MappingContext {
-  sourceAccounts: SIEAccount[]
-  existingMappings?: Map<string, AccountMapping>
+  defaultVatTreatment?: import('@/lib/vat/account-vat-treatment').AccountVatTreatment | null
+  defaultVatRate?: number | null
+  vatTreatmentSuggested?: boolean
+  vatTreatmentReviewed?: boolean
+  requiresVatTreatmentReview?: boolean
 }
 
 /**
@@ -236,33 +233,6 @@ export interface SIEAccountMappingRecord {
   match_type: AccountMatchType
   created_at: string
   updated_at: string
-}
-
-/**
- * Options for executing an import
- */
-export interface ImportOptions {
-  // The parsed SIE data
-  parsed: ParsedSIEFile
-
-  // Account mappings to use
-  mappings: AccountMapping[]
-
-  // Whether to create a new fiscal period
-  createFiscalPeriod: boolean
-
-  // Whether to import opening balances as a journal entry
-  importOpeningBalances: boolean
-
-  // Whether to import transactions (SIE4 only)
-  importTransactions: boolean
-
-  // Voucher series to use for imported entries
-  voucherSeries?: string
-
-  // Opt-in: mark imported verifikat as "Inget underlag krävs" so a migration
-  // doesn't flood "Att hantera: saknade underlag". OFF by default.
-  markImportedNoDocRequired?: boolean
 }
 
 /**
@@ -408,6 +378,12 @@ export interface ImportPreview {
   // Source-system accounts excluded from import (e.g. Fortnox 0099)
   excludedSystemAccounts: { number: string; name: string }[]
 
+  // Distinct voucher series used by the file's #VER records. Lets the
+  // wizard default the IB-voucher series to one that does not collide
+  // with the file's own numbering (issue #1882). Optional: previews built
+  // before this field existed lack it; consumers must treat absence as [].
+  voucherSeriesInFile?: string[]
+
   // Issues to review
   issues: ParseIssue[]
 }
@@ -478,17 +454,3 @@ export interface MigrationDocumentation {
  * Wizard step state
  */
 export type ImportWizardStep = 'upload' | 'preview' | 'mapping' | 'review' | 'result'
-
-/**
- * Full wizard state
- */
-export interface ImportWizardState {
-  step: ImportWizardStep
-  file: File | null
-  parsed: ParsedSIEFile | null
-  mappings: AccountMapping[]
-  preview: ImportPreview | null
-  importResult: ImportResult | null
-  isLoading: boolean
-  error: string | null
-}

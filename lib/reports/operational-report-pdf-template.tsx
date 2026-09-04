@@ -1,3 +1,4 @@
+import { formatOrgNumber } from '@/lib/utils'
 import {
   Document,
   Page,
@@ -5,6 +6,7 @@ import {
   View,
   StyleSheet,
 } from '@react-pdf/renderer'
+import { pdfNumberText, formatDateSv } from '@/lib/pdf/number-text'
 import type {
   CompanySettings,
   LatestVoucherPerSeries,
@@ -226,28 +228,14 @@ const styles = StyleSheet.create({
 })
 
 function formatAmount(amount: number): string {
-  // Intl emits U+2212 (true minus). The bundled @react-pdf/renderer
-  // Helvetica/Courier fonts lack that glyph and silently drop it, so
-  // negatives would render as positives. Map to ASCII hyphen.
-  return new Intl.NumberFormat('sv-SE', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })
-    .format(amount)
-    .replace(/\u2212/g, '-')
-}
-
-function formatOrgNumber(orgNumber: string): string {
-  const cleaned = orgNumber.replace(/\D/g, '')
-  if (cleaned.length === 10) {
-    return `${cleaned.slice(0, 6)}-${cleaned.slice(6)}`
-  }
-  return orgNumber
-}
-
-function formatDateSv(iso: string): string {
-  if (!iso) return ''
-  return new Date(iso).toLocaleDateString('sv-SE')
+  // pdfNumberText: Intl emits U+2212 (true minus), which the bundled
+  // Helvetica/Courier fonts lack, so negatives would render as positives.
+  return pdfNumberText(
+    new Intl.NumberFormat('sv-SE', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(amount),
+  )
 }
 
 interface CommonHeaderProps {

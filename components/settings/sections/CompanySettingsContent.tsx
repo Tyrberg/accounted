@@ -1,17 +1,19 @@
 'use client'
 
+import { useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import { CompanyDangerZone } from '@/components/settings/CompanyDangerZone'
 import { CompanyInfoForm } from '@/components/settings/CompanyInfoForm'
 import { CompanyMembersSection } from '@/components/settings/CompanyMembersSection'
 import { CompanyProfileSection } from '@/components/settings/CompanyProfileSection'
+import { DataAnalysisToggle } from '@/components/settings/DataAnalysisToggle'
 import { FiscalPeriodEditor } from '@/components/settings/FiscalPeriodEditor'
 import { LogoUpload } from '@/components/settings/LogoUpload'
 import { SettingsFormWrapper } from '@/components/settings/SettingsFormWrapper'
 import { SettingsLoadError } from '@/components/settings/SettingsLoadError'
 import { SettingsLoadingSkeleton } from '@/components/settings/SettingsLoadingSkeleton'
-import { SettingsSectionHeader } from '@/components/settings/SettingsRows'
+import { SettingsGroup, SettingsSectionHeader } from '@/components/settings/SettingsRows'
 import { ShareCapitalForm } from '@/components/settings/ShareCapitalForm'
 import { useSettings } from '@/components/settings/useSettings'
 import type { CompanySettings } from '@/types'
@@ -20,7 +22,19 @@ export function CompanySettingsContent() {
   const router = useRouter()
   const tNav = useTranslations('settings_nav')
   const tIntro = useTranslations('settings_intro')
+  const tData = useTranslations('data_analysis')
   const { settings, isLoading, updateSettings, refetch } = useSettings()
+
+  // Deep-link target for "Medlemmar och roller" (/settings/company#members):
+  // a ref callback rather than an effect because this content mounts late
+  // (settings fetch + dynamic import); the callback fires exactly when the
+  // section exists. The hash is cleared after scrolling so switching tabs
+  // and returning to Företag doesn't scroll again.
+  const scrollToMembers = useCallback((node: HTMLDivElement | null) => {
+    if (!node || window.location.hash !== '#members') return
+    node.scrollIntoView({ block: 'start' })
+    history.replaceState(null, '', window.location.pathname + window.location.search)
+  }, [])
 
   if (isLoading) return <SettingsLoadingSkeleton />
   if (!settings) return <SettingsLoadError onRetry={refetch} />
@@ -77,11 +91,17 @@ export function CompanySettingsContent() {
         onUpdate={(url) => updateSettings({ logo_url: url })}
       />
 
-      <CompanyMembersSection />
+      <div id="members" ref={scrollToMembers} className="scroll-mt-6">
+        <CompanyMembersSection />
+      </div>
 
       <FiscalPeriodEditor />
 
       <CompanyProfileSection />
+
+      <SettingsGroup label={tData('group_label')}>
+        <DataAnalysisToggle />
+      </SettingsGroup>
 
       <CompanyDangerZone />
     </div>

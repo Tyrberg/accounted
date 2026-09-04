@@ -40,6 +40,7 @@ vi.mock('@/lib/vat/vies-client', () => ({
 }))
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
+import { decryptPersonnummer } from '@/lib/salary/personnummer'
 import { GET as listCustomers, POST as createCustomer } from '../route'
 import {
   GET as getCustomer,
@@ -945,5 +946,516 @@ describe('DELETE /api/v1/companies/:companyId/customers/:id', () => {
     )
 
     expect(res.status).toBe(400)
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────
+// personal_number handling + company payment-terms default (#1707, #1708)
+// ──────────────────────────────────────────────────────────────────
+
+// Synthetic personnummer, never a real one.
+const TEST_PERSONAL_NUMBER = '19900101-1234'
+const MASKED_PERSONAL_NUMBER = '********-1234'
+// Ciphertext shape enforced by customers_personal_number_check (20260726110000).
+const CIPHERTEXT_SHAPE = /^[0-9a-f]{76,255}$/
+
+describe('personal_number on the v1 customer surface', () => {
+  it('POST rejects a personnummer-shaped org_number on a business customer', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Enskild Firma X',
+        customer_type: 'swedish_business',
+        org_number: TEST_PERSONAL_NUMBER,
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(JSON.stringify(body.error.details)).toContain('org_number')
+    // The customers table was never touched (idempotency bookkeeping may be).
+    expect(supabaseMock.from.mock.calls.some((c) => c[0] === 'customers')).toBe(false)
+  })
+
+  it('POST stores personal_number encrypted and returns it masked', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: {
+          ...SAMPLE_CUSTOMER,
+          customer_type: 'individual',
+          org_number: null,
+          vat_number: null,
+          personal_number: TEST_PERSONAL_NUMBER,
+        },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Anna Andersson',
+        customer_type: 'individual',
+        personal_number: TEST_PERSONAL_NUMBER,
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    const inserted = supabaseMock.captured.insert[0] as { personal_number?: string | null }
+    expect(inserted.personal_number).toMatch(CIPHERTEXT_SHAPE)
+    expect(decryptPersonnummer(inserted.personal_number!)).toBe(TEST_PERSONAL_NUMBER)
+    const body = await res.json()
+    expect(body.data.personal_number).toBe(MASKED_PERSONAL_NUMBER)
+  })
+
+  it('GET returns personal_number masked, never the stored value', async () => {
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'individual', personal_number: TEST_PERSONAL_NUMBER },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await getCustomer(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.personal_number).toBe(MASKED_PERSONAL_NUMBER)
+  })
+
+  it('PATCH stores a plaintext personal_number encrypted and returns it masked', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'individual', personal_number: TEST_PERSONAL_NUMBER },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        personal_number: TEST_PERSONAL_NUMBER,
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const updated = supabaseMock.captured.update[0] as { personal_number?: string | null }
+    expect(updated.personal_number).toMatch(CIPHERTEXT_SHAPE)
+    expect(decryptPersonnummer(updated.personal_number!)).toBe(TEST_PERSONAL_NUMBER)
+    const body = await res.json()
+    expect(body.data.personal_number).toBe(MASKED_PERSONAL_NUMBER)
+  })
+
+  it('PATCH treats the masked form as "leave unchanged"', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'individual', personal_number: TEST_PERSONAL_NUMBER },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        personal_number: MASKED_PERSONAL_NUMBER,
+        notes: 'still here',
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const updated = supabaseMock.captured.update[0] as Record<string, unknown>
+    expect('personal_number' in updated).toBe(false)
+    expect(updated.notes).toBe('still here')
+  })
+
+  it('PATCH rejects a personnummer-shaped org_number on a stored business customer', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: { data: SAMPLE_CUSTOMER, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        org_number: TEST_PERSONAL_NUMBER,
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('CUSTOMER_ORG_NUMBER_IS_PERSONAL')
+    expect(supabaseMock.captured.update).toHaveLength(0)
+  })
+})
+
+describe('company payment-terms default on create', () => {
+  it('falls back to company_settings.invoice_default_days when default_payment_terms is omitted', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      company_settings: { data: { invoice_default_days: 10 }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, default_payment_terms: 10 }, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Terms AB',
+        customer_type: 'swedish_business',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    const inserted = supabaseMock.captured.insert[0] as { default_payment_terms?: number }
+    expect(inserted.default_payment_terms).toBe(10)
+  })
+
+  it('an explicit default_payment_terms wins over the company setting', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      company_settings: { data: { invoice_default_days: 10 }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, default_payment_terms: 45 }, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Terms AB',
+        customer_type: 'swedish_business',
+        default_payment_terms: 45,
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    const inserted = supabaseMock.captured.insert[0] as { default_payment_terms?: number }
+    expect(inserted.default_payment_terms).toBe(45)
+  })
+
+  it('dry-run previews the company default without inserting', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      company_settings: { data: { invoice_default_days: 10 }, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers?dry_run=true`, {
+        name: 'Preview AB',
+        customer_type: 'swedish_business',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.dry_run).toBe(true)
+    expect(body.data.preview.default_payment_terms).toBe(10)
+    expect(supabaseMock.from.mock.calls.some((c) => c[0] === 'customers')).toBe(false)
+  })
+})
+
+// A personnummer submitted as org_number on an individual is the personnummer
+// in the wrong field: stored encrypted in personal_number, org_number left
+// empty, on create and on update alike. (The pre-2026-08-21 docs told callers
+// org_number was accepted for individuals; it still is, it just lands right.)
+describe('personnummer submitted as org_number on an individual (v1)', () => {
+  it('POST stores it encrypted as personal_number and returns org_number empty', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: {
+          ...SAMPLE_CUSTOMER,
+          customer_type: 'individual',
+          org_number: null,
+          vat_number: null,
+          personal_number: TEST_PERSONAL_NUMBER,
+        },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Bertil Bengtsson',
+        customer_type: 'individual',
+        org_number: TEST_PERSONAL_NUMBER,
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    const inserted = supabaseMock.captured.insert[0] as { org_number?: string | null; personal_number?: string | null }
+    expect(inserted.org_number ?? null).toBeNull()
+    expect(inserted.personal_number).toMatch(CIPHERTEXT_SHAPE)
+    expect(decryptPersonnummer(inserted.personal_number!)).toBe(TEST_PERSONAL_NUMBER)
+    expect(JSON.stringify(inserted)).not.toContain(TEST_PERSONAL_NUMBER)
+    const body = await res.json()
+    expect(body.data.personal_number).toBe(MASKED_PERSONAL_NUMBER)
+    expect(body.data.org_number).toBeNull()
+  })
+
+  it('PATCH stores it encrypted as personal_number and clears org_number', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'individual', org_number: null, personal_number: TEST_PERSONAL_NUMBER },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        org_number: TEST_PERSONAL_NUMBER,
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const updated = supabaseMock.captured.update[0] as { org_number?: string | null; personal_number?: string | null }
+    expect(updated.org_number).toBeNull()
+    expect(updated.personal_number).toMatch(CIPHERTEXT_SHAPE)
+    expect(decryptPersonnummer(updated.personal_number!)).toBe(TEST_PERSONAL_NUMBER)
+  })
+
+  it('PATCH refuses an org_number that is a different personnummer than personal_number', async () => {
+    withWriteScope()
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'individual' },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        org_number: '19850505-5555',
+        personal_number: TEST_PERSONAL_NUMBER,
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('CUSTOMER_PERSONAL_NUMBER_CONFLICT')
+    expect(supabaseMock.captured.update).toHaveLength(0)
+  })
+})
+
+// ------------------------------------------------------------------
+// country: ISO 3166-1 alpha-2, consistent with customer_type (#2025, #2028)
+// ------------------------------------------------------------------
+
+describe('country on POST /api/v1/companies/:companyId/customers', () => {
+  it('stores a country name as its ISO code (#2028)', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, customer_type: 'eu_business', country: 'DE' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Muster Handels GmbH',
+        customer_type: 'eu_business',
+        country: 'Germany',
+        vat_number: 'DE811234567',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    expect((client.captured.insert[0] as { country: string }).country).toBe('DE')
+  })
+
+  it('derives the EU country from the VAT prefix when none is given', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, customer_type: 'eu_business', country: 'DE' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Muster Handels GmbH',
+        customer_type: 'eu_business',
+        vat_number: 'DE811234567',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    expect((client.captured.insert[0] as { country: string }).country).toBe('DE')
+  })
+
+  it('previews SE for a Swedish business in dry-run, never the name Sweden', async () => {
+    withWriteScope()
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers?dry_run=true`, {
+        name: 'Acme AB',
+        customer_type: 'swedish_business',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.dry_run).toBe(true)
+    expect(body.data.preview.country).toBe('SE')
+  })
+
+  it('rejects an EU business with land Sverige (#2025)', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Muster Handels GmbH',
+        customer_type: 'eu_business',
+        country: 'SE',
+        vat_number: 'DE811234567',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(JSON.stringify(body.error)).toMatch(/country/)
+    // Only the idempotency-key row may have been written, never the customer.
+    expect(client.captured.insert.filter((row) => 'customer_type' in (row as object))).toHaveLength(0)
+  })
+
+  it('rejects a country it cannot read as a code', async () => {
+    withWriteScope()
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+
+    const res = await createCustomer(
+      makePostRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers`, {
+        name: 'Acme AB',
+        customer_type: 'swedish_business',
+        country: 'Atlantis',
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+  })
+})
+
+describe('country on PATCH /api/v1/companies/:companyId/customers/:id', () => {
+  it('normalises a country name before writing it', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, country: 'SE' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        country: 'Sverige',
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(200)
+    expect((client.captured.update[0] as { country: string }).country).toBe('SE')
+  })
+
+  it('refuses a type change that contradicts the stored country', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: { data: { ...SAMPLE_CUSTOMER, country: 'SE' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        customer_type: 'eu_business',
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('CUSTOMER_COUNTRY_MISMATCH')
+    expect(body.error.details.issue).toBe('EU_BUSINESS_COUNTRY_IS_SE')
+    expect(client.captured.update).toHaveLength(0)
+  })
+
+  it('refuses a country change that contradicts the stored VAT prefix', async () => {
+    withWriteScope()
+    const client = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      customers: {
+        data: { ...SAMPLE_CUSTOMER, customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567' },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(client)
+
+    const res = await updateCustomer(
+      makePatchRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/customers/${CUSTOMER_ID}`, {
+        country: 'FR',
+      }),
+      detailParams(COMPANY_ID, CUSTOMER_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('CUSTOMER_COUNTRY_MISMATCH')
+    expect(body.error.details.issue).toBe('VAT_PREFIX_COUNTRY_MISMATCH')
+    expect(client.captured.update).toHaveLength(0)
   })
 })

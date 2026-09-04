@@ -23,7 +23,7 @@ import {
   CheckCircle2,
   Loader2,
 } from 'lucide-react'
-import { formatDate } from '@/lib/utils'
+import { formatAmount, formatDate } from '@/lib/utils'
 import { downloadFile } from '@/lib/browser/download-file'
 import { failureDescription } from '@/lib/browser/action-failure'
 import type { KassaflodesanalysReport } from '@/lib/reports/kassaflodesanalys'
@@ -31,13 +31,6 @@ import {
   getErrorMessage as getUserErrorMessage,
   type ErrorLocale,
 } from '@/lib/errors/get-error-message'
-
-function formatAmount(n: number): string {
-  return n.toLocaleString('sv-SE', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })
-}
 
 interface CashRowProps {
   label: string
@@ -241,7 +234,7 @@ export function KassaflodesanalysClient() {
           {/* Section 1: Löpande verksamhet */}
           <Card>
             <CardHeader>
-              <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm uppercase tracking-wider text-muted-foreground">
                 Den löpande verksamheten
               </h2>
               <CardTitle className="text-base">
@@ -281,7 +274,7 @@ export function KassaflodesanalysClient() {
           {/* Section 2: Investeringsverksamhet */}
           <Card>
             <CardHeader>
-              <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm uppercase tracking-wider text-muted-foreground">
                 Investeringsverksamheten
               </h2>
               <CardTitle className="text-base">
@@ -307,7 +300,7 @@ export function KassaflodesanalysClient() {
           {/* Section 3: Finansieringsverksamhet */}
           <Card>
             <CardHeader>
-              <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm uppercase tracking-wider text-muted-foreground">
                 Finansieringsverksamheten
               </h2>
               <CardTitle className="text-base">

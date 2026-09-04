@@ -1,14 +1,24 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { roundOre } from '@/lib/money'
 import type { Transaction, ReconciliationMethod } from '@/types'
 import { eventBus } from '@/lib/events/bus'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
+import { hasBankLineJunctionRow } from '@/lib/transactions/is-booked'
 import {
   ledgerLineAmountIn,
   type LedgerLineAmount,
 } from '@/lib/bookkeeping/ledger-line-amount'
+import {
+  describeCashAccountSiblings,
+  shouldRepointToSibling,
+  type CashAccountSiblings,
+} from '@/lib/cash-accounts/service'
+import { createLogger } from '@/lib/logger'
+
+const log = createLogger('reconciliation.bank')
 
 // `ledgerLineAmountIn` moved to lib/bookkeeping/ledger-line-amount.ts verbatim
 // so the invoice / supplier-invoice voucher matchers share the one rule instead
@@ -64,6 +74,19 @@ export interface ReconciliationRunResult {
    * for human review. Always 0 on dry runs and when no threshold was given.
    */
   skippedBelowThreshold: number
+  /**
+   * Below-threshold matches persisted as suggestions on the transaction
+   * (potential_journal_entry_id + method + confidence) for the review surface.
+   * Always 0 unless persistSuggestions was set on a non-dry apply run with a
+   * confidence threshold.
+   */
+  suggested: number
+  /**
+   * Unmatched, non-ignored transactions the run considered (the candidate pool
+   * on the bank side). Lets callers report "X av Y matchade" without a second
+   * count query.
+   */
+  candidates: number
 }
 
 /**
@@ -84,7 +107,26 @@ export interface ReconciliationStatus {
    * this is a no-op and every figure below is exactly what it always was.
    */
   currency: string
+  /**
+   * Sum of the window's bank-feed transactions EXCLUDING ignored rows: the
+   * bank side of the reconciliation. Ignored rows (feed duplicates from a
+   * PSD2 reconnect, non-business noise) never get a ledger counterpart, so
+   * counting them here manufactured a permanent unfixable difference; they are
+   * surfaced separately below instead, mirroring how the opening balance is
+   * excluded-but-shown.
+   */
   bank_transaction_total: number
+  /** Gross inflow (sum of positive amounts) behind bank_transaction_total; informational, for the page's "in · ut · antal" line. */
+  bank_transaction_inflow: number
+  /** Gross outflow (sum of negative amounts, itself negative) behind bank_transaction_total. */
+  bank_transaction_outflow: number
+  /** Number of non-ignored bank transactions in the window. */
+  bank_transaction_count: number
+  /** Sum of ignored bank transactions in the window. NOT part of
+   *  bank_transaction_total or difference; informational, like the IB. */
+  ignored_transaction_total: number
+  /** Number of ignored bank transactions in the window. */
+  ignored_transaction_count: number
   /**
    * The real ledger balance on the bank account, incl. IB: computed from the
    * SAME `['posted','reversed']` lines the trial balance and balance sheet sum.
@@ -128,7 +170,52 @@ export interface ReconciliationStatus {
   is_reconciled: boolean
   matched_count: number
   unmatched_transaction_count: number
+  /**
+   * Sum of the unmatched bank transactions behind `unmatched_transaction_count`,
+   * in `currency`. Together with {@link unmatched_gl_line_total} this decomposes
+   * `difference` into the two work lists the user can actually open, instead of
+   * leaving it an unexplained scalar.
+   */
+  unmatched_transaction_total: number
   unmatched_gl_line_count: number
+  /**
+   * Sum of the unmatched ledger lines behind `unmatched_gl_line_count`, in
+   * `currency`, signed like a bank movement (+ in, - out).
+   *
+   * `null` when at least one of those lines carries no amount in `currency`:
+   * the two candidate RPCs project neither `currency` nor `amount_in_currency`,
+   * so on a foreign account every line is unconvertible and there is no honest
+   * sum to report. Reporting 0 there would claim the vouchers net to nothing.
+   * Always a number on a SEK account (see {@link ledgerLineAmountIn}).
+   */
+  unmatched_gl_line_total: number | null
+  /**
+   * What is left of `difference` once both work lists are accounted for:
+   * `difference - unmatched_transaction_total + unmatched_gl_line_total`.
+   *
+   * `difference` is merely how far apart the two sides currently stand; mid-year
+   * it is expected to be large and it is fully explained as long as every krona
+   * of it sits in one of the two lists. The residual is what does NOT.
+   *
+   * It reduces to (sum of matched transactions - sum of the ledger lines they
+   * settle), so it is non-zero when a matched pair disagrees in amount, when one
+   * voucher carries several lines on this account, or when a ledger line the
+   * candidate RPC hides has no bank counterpart. That last cause dominates:
+   * `get_account_gl_lines_for_matching` returns only `status='posted'` entries
+   * and excludes storno / correction outright, so an unlinked storno moves this
+   * account's movement while staying invisible in "Omatchade verifikationer".
+   * Measured on prod 2026-08-20 over the 206 single-1930-account companies with
+   * >=10 transactions: 136 reconcile to exactly 0,00, 63 land >=100 kr out, and
+   * the unlinked-hidden-line buckets behind that are posted/storno (127
+   * companies), reversed/bank_transaction (66) and posted/correction (49).
+   *
+   * A non-zero residual is therefore a real finding but usually NOT user error,
+   * so the UI states it factually rather than in destructive red.
+   *
+   * `null` whenever `unmatched_gl_line_total` is null: no honest residual
+   * exists then either.
+   */
+  unexplained_difference: number | null
   /** Counted ledger lines on the account that carry no amount in `currency`
    *  (see {@link ledgerLineAmountIn}). Always 0 on a SEK account. */
   unconvertible_gl_line_count: number
@@ -195,6 +282,18 @@ export interface ReconciliationOptions {
    * committed without human review.
    */
   confidenceThreshold?: number
+  /**
+   * Persist below-threshold matches (the 0.75-0.89 band: auto_fuzzy,
+   * auto_date_range) onto the transaction's potential_journal_entry_id /
+   * potential_match_method / potential_match_confidence columns instead of
+   * dropping them, so the review surface can offer them for confirmation.
+   * Only meaningful together with confidenceThreshold on a non-dry apply run;
+   * ignored otherwise. Suggestions are soft data: the same optimistic
+   * `.is('journal_entry_id', null)` guard as the apply path, plus DB triggers
+   * that clear them when the row is booked/ignored or the entry is consumed
+   * or reversed.
+   */
+  persistSuggestions?: boolean
 }
 
 /**
@@ -219,6 +318,21 @@ export interface ReconciliationOptions {
  * pass `includeUnassigned = <this account is_primary>`. When cashAccountId is
  * omitted (single-account companies with no row, the '1930' fallback) the pure
  * currency filter is used and includeUnassigned is moot.
+ *
+ * Account-scoped callers must resolve the row FIRST (see resolveCashAccountScope
+ * in lib/reconciliation/cash-account-scope.ts). Omitting cashAccountId is the
+ * legacy fallback for a company with no cash_accounts row at all; doing it on a
+ * company that HAS several is issue #1290: the transaction side pools every
+ * same-currency account while the GL side stays on one account, producing a
+ * difference with nothing unmatched to point at.
+ *
+ * Not every remaining unscoped caller is intentional. The post-sync sweeps in
+ * app/api/extensions/enable-banking/sync/cron/route.ts and
+ * extensions/general/enable-banking/index.ts call runReconciliation without a
+ * scope, which is a known open defect rather than a supported mode: they need
+ * one run per cash account, not one pooled run. Tracked as issue #1298;
+ * warnIfUnscopedAcrossCashAccounts below makes both visible in the logs until
+ * that is fixed.
  *
  * The earlier nested `or(cash_account_id.eq.X,and(cash_account_id.is.null,currency.eq.cur))`
  * form is intentionally avoided: it silently returned ZERO rows mid-backfill.
@@ -248,6 +362,50 @@ export function scopeTransactionsToAccount<Q extends {
     return query.eq('currency', currency).eq('cash_account_id', cashAccountId)
   }
   return query.eq('currency', currency)
+}
+
+/**
+ * Emit a warning when a run left cashAccountId undefined AND the rows it
+ * fetched really do span more than one cash account.
+ *
+ * That combination is the #1290 shape: the transaction side pools every
+ * same-currency account while the GL side stays on a single accountNumber. On a
+ * read (getReconciliationStatus) it manufactures a difference with nothing
+ * unmatched behind it; on a WRITE (runReconciliation, which applies matches
+ * unless dryRun) it can auto-link a savings-account transaction to an unlinked
+ * 1930 voucher, i.e. persist a wrong journal_entry_id.
+ *
+ * It warns rather than throwing because single-account companies with no
+ * cash_accounts row still legitimately take the currency-only path, and they
+ * never trip this condition (0 or 1 distinct id). The fix for anything this
+ * logs is always at the CALL SITE: resolve the row with resolveCashAccountScope
+ * (lib/reconciliation/cash-account-scope.ts) and pass the scope through.
+ */
+function warnIfUnscopedAcrossCashAccounts(
+  operation: string,
+  rows: { cash_account_id?: string | null }[],
+  ctx: {
+    cashAccountId: string | undefined
+    companyId: string
+    accountNumber: string
+    currency: string
+  },
+): void {
+  if (ctx.cashAccountId) return
+  const distinct = new Set(
+    rows.map((r) => r.cash_account_id).filter((id): id is string => Boolean(id)),
+  )
+  if (distinct.size <= 1) return
+  log.warn(`${operation} ran unscoped across several cash accounts`, {
+    companyId: ctx.companyId,
+    operation,
+    entityType: 'cash_account',
+    details: {
+      accountNumber: ctx.accountNumber,
+      currency: ctx.currency,
+      distinctCashAccounts: distinct.size,
+    },
+  })
 }
 
 // ============================================================
@@ -355,6 +513,7 @@ export async function runReconciliation(
     includeUnassigned = true,
     applyOnly,
     confidenceThreshold,
+    persistSuggestions = false,
   } = options
 
   // Fetch unlinked GL lines via RPC
@@ -377,15 +536,40 @@ export async function runReconciliation(
     return query.order('id').range(from, to)
   })
 
+  // Same diagnostic as the read path, and it matters MORE here: an unscoped run
+  // matches transactions from every same-currency account against unlinked GL
+  // lines on accountNumber alone, and (dryRun aside) writes the resulting
+  // journal_entry_id onto the transaction.
+  warnIfUnscopedAcrossCashAccounts('runReconciliation', transactions, {
+    cashAccountId,
+    companyId,
+    accountNumber,
+    currency,
+  })
+
   if (transactions.length === 0 || glLines.length === 0) {
-    return { matches: [], applied: 0, errors: 0, skippedBelowThreshold: 0 }
+    return {
+      matches: [],
+      applied: 0,
+      errors: 0,
+      skippedBelowThreshold: 0,
+      suggested: 0,
+      candidates: transactions.length,
+    }
   }
 
   // Run greedy matching, highest confidence first
   let matches = greedyMatch(transactions, glLines, currency)
 
   if (dryRun) {
-    return { matches, applied: 0, errors: 0, skippedBelowThreshold: 0 }
+    return {
+      matches,
+      applied: 0,
+      errors: 0,
+      skippedBelowThreshold: 0,
+      suggested: 0,
+      candidates: transactions.length,
+    }
   }
 
   // When the caller reviewed a dry-run and ticked a subset, apply ONLY pairs
@@ -404,12 +588,13 @@ export async function runReconciliation(
   // counted separately. This is the server-side guardrail for unattended
   // callers (nightly sync / cron), where nobody reviews a dry-run first.
   let toApply = matches
-  let skippedBelowThreshold = 0
+  let belowThresholdMatches: ReconciliationMatch[] = []
   if (confidenceThreshold !== undefined) {
     const floor = Math.max(0, Math.min(1, confidenceThreshold))
     toApply = matches.filter((m) => m.confidence >= floor)
-    skippedBelowThreshold = matches.length - toApply.length
+    belowThresholdMatches = matches.filter((m) => m.confidence < floor)
   }
+  const skippedBelowThreshold = belowThresholdMatches.length
 
   // Apply matches
   let applied = 0
@@ -438,6 +623,18 @@ export async function runReconciliation(
         errors++
       } else {
         applied++
+        // Behandlingshistorik (BFNAR 2013:2 kap 8, BFL 7:1): every auto-applied
+        // link is a match event and must land in the append-only log, exactly
+        // like the invoice-match and confirm-suggestion paths. The bus event
+        // below goes to event_log (30-day TTL) and is NOT an audit record.
+        await logMatchEvent(supabase, userId, match.transaction.id, 'matched', {
+          matchConfidence: match.confidence,
+          matchMethod: match.method,
+          newState: {
+            journal_entry_id: match.glLine.journal_entry_id,
+            reconciliation_method: match.method,
+          },
+        })
         try {
           eventBus.emit({
             type: 'transaction.reconciled',
@@ -458,7 +655,51 @@ export async function runReconciliation(
     }
   }
 
-  return { matches, applied, errors, skippedBelowThreshold }
+  // Persist the below-threshold band as reviewable suggestions instead of
+  // dropping it. Same optimistic-lock guard as the apply loop: a row that got
+  // booked or linked between the read and this write matches zero rows, and
+  // the DB trigger clears any suggestion the moment a link lands, so a stale
+  // suggestion can never shadow a real link.
+  let suggested = 0
+  if (persistSuggestions) {
+    for (const match of belowThresholdMatches) {
+      try {
+        const { data: suggestedRows, error } = await supabase
+          .from('transactions')
+          .update({
+            potential_journal_entry_id: match.glLine.journal_entry_id,
+            potential_match_method: match.method,
+            potential_match_confidence: match.confidence,
+          })
+          .eq('id', match.transaction.id)
+          .eq('company_id', companyId)
+          .is('journal_entry_id', null)
+          .select('id')
+
+        if (!error && suggestedRows && suggestedRows.length > 0) {
+          suggested++
+          // Awaited: an unawaited promise can be frozen on serverless when the
+          // response returns, silently dropping the audit row.
+          await logMatchEvent(supabase, userId, match.transaction.id, 'auto_suggested', {
+            matchConfidence: match.confidence,
+            matchMethod: match.method,
+            newState: { potential_journal_entry_id: match.glLine.journal_entry_id },
+          })
+        }
+      } catch {
+        // Suggestions are best-effort: never fail the run over one row.
+      }
+    }
+  }
+
+  return {
+    matches,
+    applied,
+    errors,
+    skippedBelowThreshold,
+    suggested,
+    candidates: transactions.length,
+  }
 }
 
 // ============================================================
@@ -485,32 +726,52 @@ export async function getReconciliationStatus(
   includeUnassigned: boolean = true,
 ): Promise<ReconciliationStatus> {
   // Get all transactions in range, scoped to the selected cash account. Ignored
-  // rows are pulled too so the totals card still reflects what the bank
-  // actually moved, but they're excluded from the "unmatched" count below: the
-  // user has explicitly said they don't want them surfacing as something to
-  // reconcile. Scoping by cash account (not just currency) is what stops a
+  // rows are pulled too, but only to be COUNTED AND SUMMED separately: they are
+  // excluded from the bank total, the difference and the matched/unmatched
+  // counts below, because the user has explicitly said they are not something
+  // to reconcile (duplicates, non-business noise). Scoping by cash account
+  // (not just currency) is what stops a
   // second same-currency account from inflating bankTotal here.
   // Paginated (fetchAllRows): PostgREST silently caps un-ranged selects at 1000
   // rows, which would undercount bank_transaction_total for a busy company and
   // manufacture a phantom, unexplainable difference. Ordered on id (unique) so
   // pages never duplicate or skip rows across boundaries.
   type StatusTxRow = {
+    id?: string | null
     date: string | null
     amount: number | string | null
     journal_entry_id: string | null
     reconciliation_method: string | null
     is_ignored: boolean | null
+    cash_account_id: string | null
   }
   const transactions = await fetchAllRows<StatusTxRow>(({ from, to }) => {
     let txQuery = supabase
       .from('transactions')
-      .select('date, amount, journal_entry_id, reconciliation_method, is_ignored')
+      .select('id, date, amount, journal_entry_id, reconciliation_method, is_ignored, cash_account_id')
       .eq('company_id', companyId)
     txQuery = scopeTransactionsToAccount(txQuery, cashAccountId, currency, includeUnassigned)
     if (dateFrom) txQuery = txQuery.gte('date', dateFrom)
     if (dateTo) txQuery = txQuery.lte('date', dateTo)
     return txQuery.order('id').range(from, to)
   })
+
+  warnIfUnscopedAcrossCashAccounts('getReconciliationStatus', transactions, {
+    cashAccountId,
+    companyId,
+    accountNumber: bankAccount,
+    currency,
+  })
+
+  // Transactions anchored through transaction_voucher_links (bulk-booked
+  // samlingsverifikat, residual bookings) carry journal_entry_id = NULL on the
+  // row itself. They are settled all the same, so the matched/unmatched split
+  // below must see them; is_transaction_booked() is the SQL twin of this.
+  const junctionLinkedTxIds = await fetchJunctionLinkedTxIds(
+    supabase,
+    companyId,
+    transactions.map((tx) => tx.id).filter((id): id is string => typeof id === 'string'),
+  )
 
   // Get GL bank-account lines. We fetch posted AND reversed entries and count
   // them TOGETHER: the exact inclusion rule the trial balance and balance sheet
@@ -583,8 +844,21 @@ export async function getReconciliationStatus(
   // dateFrom and that IB date; it only ever RAISES the lower bound, so the
   // dateFrom SQL pre-filter on both queries above stays valid. In normal use the
   // UI passes dateFrom = period_start = the IB date, so this is a no-op there.
+  //
+  // Only a POSTED opening balance is an IB. A stornerad IB (status 'reversed')
+  // has been economically nulled by its storno: both lines still sit in
+  // countedLines and cancel inside glBalance, exactly as on the balansräkning,
+  // but neither may be treated as the period's IB. Counting the reversed one
+  // here (and in glOpeningBalance below) re-added the cancelled amount once
+  // more and manufactured a phantom difference equal to the IB after a
+  // perfectly correct rättelse. Same rule the canonical opening-balance RPC
+  // applies (compute_prior_opening_balances, 20260421180000).
+  const isLiveOpeningBalanceLine = (l: GlLineRow): boolean => {
+    const entry = entryOf(l)
+    return entry?.source_type === 'opening_balance' && entry?.status === 'posted'
+  }
   const ibDates = fetchedLines
-    .filter((l) => entryOf(l)?.source_type === 'opening_balance')
+    .filter(isLiveOpeningBalanceLine)
     .map((l) => entryOf(l)?.entry_date)
     .filter((d): d is string => typeof d === 'string' && d.length > 0)
   // Take the LATEST IB date. The invariant is one opening_balance entry per
@@ -608,7 +882,7 @@ export async function getReconciliationStatus(
     onOrAfterFloor((tx as { date?: string | null }).date),
   )
 
-  // Bank side: every feed transaction in the (floored) window, full stop. We
+  // Bank side: every NON-IGNORED feed transaction in the (floored) window. We
   // deliberately do NOT special-case rows linked to a reversed entry any more.
   // Because the GL side now counts the reversed original, its storno AND the
   // correction together (just like the balance sheet), a corrected bank line nets
@@ -618,7 +892,20 @@ export async function getReconciliationStatus(
   // transactions.amount is denominated in transactions.currency, and
   // scopeTransactionsToAccount pinned that to `currency`, so this total is
   // already in the account's own currency: the unit lineAmount() resolves to.
-  const bankTotal = countedTx.reduce((sum, tx) => sum + (Number(tx.amount) || 0), 0)
+  //
+  // Ignored rows are EXCLUDED from the total, exactly as they are excluded from
+  // the unmatched count: ignoring is the sanctioned handling for feed
+  // duplicates (a reconnect re-importing history) and non-business noise, and
+  // by definition an ignored row will never get a ledger counterpart. Counting
+  // it in the bank total manufactured a permanent difference the user could
+  // never book away: after a correct duplicate cleanup the card showed a
+  // six-figure differens over a fully booked account, and is_reconciled was
+  // unreachable forever. They are surfaced separately (count + sum) instead,
+  // the same pattern as the opening balance, so nothing is silently hidden.
+  const reconcilableTx = countedTx.filter((tx) => tx.is_ignored !== true)
+  const ignoredTx = countedTx.filter((tx) => tx.is_ignored === true)
+  const bankTotal = reconcilableTx.reduce((sum, tx) => sum + (Number(tx.amount) || 0), 0)
+  const ignoredTotal = ignoredTx.reduce((sum, tx) => sum + (Number(tx.amount) || 0), 0)
 
   // Ledger lines the account's currency cannot express: a foreign account whose
   // lines hold only SEK figures with no per-row rate (SIE imports, pre-FX
@@ -633,8 +920,10 @@ export async function getReconciliationStatus(
   const glBalance = countedLines.reduce((sum, line) => sum + lineAmount(line), 0)
   // IB is last year's closing position, not a movement with a bank-feed
   // counterpart, surfaced separately and excluded from the period movement.
+  // Posted IB lines only (see isLiveOpeningBalanceLine): a reversed IB and its
+  // storno stay in glBalance where they net to zero.
   const glOpeningBalance = countedLines
-    .filter((l) => entryOf(l)?.source_type === 'opening_balance')
+    .filter(isLiveOpeningBalanceLine)
     .reduce((sum, line) => sum + lineAmount(line), 0)
   // Net storno/correction activity on the account this period. Surfaced for
   // transparency ONLY: it is part of the ledger balance and is INCLUDED in the
@@ -651,21 +940,69 @@ export async function getReconciliationStatus(
   // a bank-feed counterpart, so it stays in.
   const glPeriodMovement = glBalance - glOpeningBalance
 
-  const matchedCount = countedTx.filter((tx) => tx.journal_entry_id !== null).length
+  // Matched/unmatched partition the RECONCILABLE (non-ignored) set, so
+  // matched_count + unmatched_transaction_count always equals the number of
+  // rows behind bank_transaction_total.
+  const isLinked = (tx: StatusTxRow): boolean =>
+    tx.journal_entry_id !== null || (typeof tx.id === 'string' && junctionLinkedTxIds.has(tx.id))
+  const matchedCount = reconcilableTx.filter(isLinked).length
+  // The gross split behind the net: what the user actually recognises as
+  // "what moved on the bank", so the page never has to explain "netto".
+  const bankInflow = reconcilableTx.reduce((sum, tx) => sum + Math.max(Number(tx.amount) || 0, 0), 0)
+  const bankOutflow = reconcilableTx.reduce((sum, tx) => sum + Math.min(Number(tx.amount) || 0, 0), 0)
 
-  const unmatchedTransactionCount = countedTx.filter(
-    (tx) => tx.journal_entry_id === null && tx.is_ignored !== true
-  ).length
+  const unmatchedTx = reconcilableTx.filter((tx) => !isLinked(tx))
+  const unmatchedTransactionCount = unmatchedTx.length
+  const unmatchedTransactionTotal = unmatchedTx.reduce(
+    (sum, tx) => sum + (Number(tx.amount) || 0),
+    0
+  )
 
   // Unmatched GL lines count (RPC excludes opening_balance, storno and correction
   // since 20260601120000_unlinked_gl_lines_exclude_storno_correction.sql).
   // Account-scoped since 20260723160000: a voucher whose links all sit on another
   // cash account (a transfer's other leg) counts as unmatched HERE, keeping this
   // number in agreement with the "Omatchade verifikationer" table the
-  // reconciliation view derives from the same RPC.
-  const unlinkedLines = await fetchGLLinesForMatching(supabase, companyId, bankAccount, dateFrom, dateTo)
+  // reconciliation view derives from the same RPC. Direction-aware since
+  // 20260828220000: on a NON-primary account, an own-account-transfer voucher
+  // whose only link is a NULL-cash_account transaction with a contradicting
+  // sign counts as unmatched here too (that row is the transfer's OTHER leg),
+  // so both legs of a transfer land in this list symmetrically instead of one
+  // leg polluting unexplained_difference.
+  // effectiveFrom, NOT the caller's dateFrom: countedLines and countedTx are both
+  // clamped to the IB floor above, and this list has to describe the SAME window
+  // or the card contradicts itself. With the raw dateFrom, a window that opens
+  // before the account's opening balance (the v1 endpoint's "company history"
+  // default, or any multi-year range) counted vouchers from a period whose
+  // movements the reconciliation deliberately drops: unmatched_gl_line_count was
+  // inflated by prior-period history, and the bridge below could never close.
+  const unlinkedLines = await fetchGLLinesForMatching(
+    supabase,
+    companyId,
+    bankAccount,
+    effectiveFrom ?? undefined,
+    dateTo
+  )
 
   const difference = Math.round((bankTotal - glPeriodMovement) * 100) / 100
+
+  // The candidate RPCs project neither `currency` nor `amount_in_currency`, so
+  // on a foreign account every line resolves to null and there is no sum to
+  // report. Deliberately all-or-nothing: a partial sum silently understates the
+  // side it is meant to explain. On SEK, ledgerLineAmountIn never returns null,
+  // so this is always a number for the 95% case.
+  const unmatchedGlAmounts = unlinkedLines.map((line) => ledgerLineAmountIn(line, currency))
+  const unmatchedGlLineTotal = unmatchedGlAmounts.some((a) => a === null)
+    ? null
+    : roundOre(unmatchedGlAmounts.reduce((sum: number, a) => sum + (a ?? 0), 0))
+
+  // difference - unmatched transactions + unmatched vouchers. See the field doc:
+  // zero means every krona of the difference is identified and sitting in a list
+  // the user can open.
+  const unexplainedDifference =
+    unmatchedGlLineTotal === null
+      ? null
+      : roundOre(difference - roundOre(unmatchedTransactionTotal) + unmatchedGlLineTotal)
 
   const notReconcilableReason =
     unconvertibleLines.length > 0 ? 'gl_lines_missing_currency_amount' : null
@@ -673,6 +1010,11 @@ export async function getReconciliationStatus(
   return {
     currency,
     bank_transaction_total: Math.round(bankTotal * 100) / 100,
+    bank_transaction_inflow: roundOre(bankInflow),
+    bank_transaction_outflow: roundOre(bankOutflow),
+    bank_transaction_count: reconcilableTx.length,
+    ignored_transaction_total: roundOre(ignoredTotal),
+    ignored_transaction_count: ignoredTx.length,
     gl_1930_balance: Math.round(glBalance * 100) / 100,
     gl_1930_period_movement: Math.round(glPeriodMovement * 100) / 100,
     gl_1930_opening_balance: Math.round(glOpeningBalance * 100) / 100,
@@ -693,7 +1035,10 @@ export async function getReconciliationStatus(
       unmatchedTransactionCount === 0,
     matched_count: matchedCount,
     unmatched_transaction_count: unmatchedTransactionCount,
+    unmatched_transaction_total: roundOre(unmatchedTransactionTotal),
     unmatched_gl_line_count: unlinkedLines.length,
+    unmatched_gl_line_total: unmatchedGlLineTotal,
+    unexplained_difference: unexplainedDifference,
     unconvertible_gl_line_count: unconvertibleLines.length,
     not_reconcilable_reason: notReconcilableReason,
   }
@@ -715,23 +1060,38 @@ export async function manualLink(
   userId: string,
   accountNumber: string = '1930',
 ): Promise<{ success: boolean; error?: string }> {
-  // Fetch transaction
-  const { data: tx, error: txError } = await supabase
+  // Fetch transaction. The junction rows ride along on the same read: a row
+  // split over several verifikat (linkTransactionToVouchers) or bulk-booked
+  // into a samlingsverifikat carries journal_entry_id = NULL, and the pointer
+  // alone would let it be linked a second time. Only 'bank_line' rows count:
+  // they are the slices that explain the row's bank amount. A residual
+  // booking's row (role 'other') is supplementary and must not strand the
+  // row after a storno of its main verifikat nulls the pointer.
+  const { data: txRow, error: txError } = await supabase
     .from('transactions')
-    .select('*')
+    .select('*, transaction_voucher_links(journal_entry_id, role)')
     .eq('id', transactionId)
     .eq('company_id', companyId)
     .single()
 
-  if (txError || !tx) {
+  if (txError || !txRow) {
     return { success: false, error: 'Transaktionen kunde inte hittas.' }
+  }
+  const { transaction_voucher_links: junctionRows, ...tx } = txRow as Record<string, unknown> & {
+    transaction_voucher_links?: Array<{ journal_entry_id: string; role?: string | null }> | null
+  }
+  if (hasBankLineJunctionRow(junctionRows)) {
+    return { success: false, error: 'Transaktionen är redan kopplad till en verifikation.' }
   }
 
   // Only a LIVE (posted) pointer blocks re-linking. A transaction still pointing
   // at a 'reversed' entry (storno/correction left the link behind) reads as
   // "utan koppling" in the UI, so it must be re-linkable to another verifikat
   // (issue #988). The stale pointer is overwritten by the locked UPDATE below.
-  if (tx.journal_entry_id && (await hasLiveJournalEntryLink(supabase, companyId, tx.journal_entry_id))) {
+  if (
+    typeof tx.journal_entry_id === 'string' &&
+    (await hasLiveJournalEntryLink(supabase, companyId, tx.journal_entry_id))
+  ) {
     return { success: false, error: 'Transaktionen är redan kopplad till en verifikation.' }
   }
 
@@ -755,7 +1115,17 @@ export async function manualLink(
   // reconciled. A transaction bound to 1930 must not be linked against a 1931
   // voucher even if the caller passes accountNumber=1931. Legacy rows with no
   // cash_account_id fall through (the UI list already gates them by currency).
-  if (tx.cash_account_id) {
+  //
+  // Sibling ledgers of the SAME physical account (rows sharing the IBAN, in
+  // the same currency) are additionally accepted for the voucher-line check
+  // below: a transaction stranded on an orphaned reconnect row (e.g. 1931)
+  // must be linkable to the verifikat booked on the live ledger of that same
+  // account (e.g. 1940), issue #1643 problem 1. Unrelated accounts, and the
+  // other currency pockets of a multi-currency account (same IBAN, other
+  // currency), stay rejected.
+  let allowedLineAccounts: string[] = [accountNumber]
+  let siblingInfo: CashAccountSiblings | null = null
+  if (typeof tx.cash_account_id === 'string') {
     const { data: txCa } = await supabase
       .from('cash_accounts')
       .select('ledger_account')
@@ -768,19 +1138,76 @@ export async function manualLink(
         error: `Transaktionen hör till ${txCa.ledger_account}, inte ${accountNumber}`,
       }
     }
+    siblingInfo = await describeCashAccountSiblings(supabase, companyId, tx.cash_account_id)
+    if (siblingInfo && siblingInfo.siblings.length > 0) {
+      allowedLineAccounts = [
+        ...new Set([accountNumber, ...siblingInfo.siblings.map((row) => row.ledger_account)]),
+      ]
+    }
   }
 
-  // Check for a bank account line on the SELECTED settlement account. The old
+  // Check for a bank account line on the SELECTED settlement account (or a
+  // sibling ledger of the same physical account, see above). The old
   // "any 19xx line" check let a 1930 transaction link to a voucher that only
   // touched 1931: a cross-account link that silently hides a real imbalance.
   const { data: lines } = await supabase
     .from('journal_entry_lines')
     .select('debit_amount, credit_amount, account_number')
     .eq('journal_entry_id', journalEntryId)
-    .eq('account_number', accountNumber)
+    .in('account_number', allowedLineAccounts)
 
   if (!lines || lines.length === 0) {
-    return { success: false, error: `Verifikationen saknar rad på ${accountNumber}` }
+    return { success: false, error: `Verifikationen saknar rad på ${allowedLineAccounts.join(' eller ')}` }
+  }
+
+  // When the voucher's bank leg sits on a SIBLING ledger only, the row moves
+  // to that sibling in the same write that links it: siblings are the same
+  // physical account in the same currency, and the voucher is the source of
+  // truth for where the money was booked. A cross-account link would leave
+  // the money on one ledger while the voucher settles on the other, and the
+  // account-keyed reconciliation would count it as an imbalance on BOTH
+  // accounts. Same gate as PATCH /api/transactions/[id]/cash-account: the row
+  // is unbooked by construction (the locked UPDATE below asserts that). This
+  // covers the stranded row linking to the live ledger, two live twins of one
+  // connection, and two demoted rows after a full disconnect. The decision
+  // is about the DESTINATION: the row moves when the sibling is live, or
+  // when its own holder is definitively gone (demoted to manual or revoked)
+  // and no other sibling is live either. A row whose connection is merely
+  // expired/error/pending is still the syncing account (re-auth renews it in
+  // place), so a voucher booked ONLY on a dead sibling is REFUSED (round 4):
+  // the voucher is what is wrong, moving the row would strand it on the
+  // orphan the moment consent is renewed, and writing the link anyway would
+  // be the cross-account link the line check above exists to refuse (the
+  // REST and MCP callers reach this directly, without the unmatched-entries
+  // filter that hides such vouchers from the dialog). The same rule keeps a
+  // live row from being parked on a row no connection can sync again.
+  // A voucher touching several sibling ledgers (an old "transfer" between
+  // two rows of one physical account) is judged on the best of them, never
+  // on whichever line the query happened to return first: a live sibling
+  // wins, else the first sibling the row may move to.
+  const typedLines = lines as Array<{ account_number: string }>
+  let repointCashAccountId: string | null = null
+  if (!typedLines.some((line) => line.account_number === accountNumber)) {
+    const siblingLedgers = [...new Set(typedLines.map((line) => line.account_number))]
+    const candidates = siblingLedgers
+      .map((ledger) => siblingInfo?.siblings.find((row) => row.ledger_account === ledger) ?? null)
+      .filter((row): row is NonNullable<typeof row> => row !== null)
+      .filter((row) => siblingInfo !== null && shouldRepointToSibling(siblingInfo, row))
+    const destination = candidates.find((row) => row.live) ?? candidates[0] ?? null
+    if (destination) {
+      repointCashAccountId = destination.id
+    } else {
+      log.warn('manualLink: refused a link to a voucher booked only on a dead sibling ledger', {
+        companyId,
+        transactionId,
+        accountNumber,
+        siblingLedgers,
+      })
+      return {
+        success: false,
+        error: `Verifikationen är bokförd på ${siblingLedgers.join(' och ')}, som inte är transaktionens konto (${accountNumber}). Rätta verifikationen eller flytta transaktionen först.`,
+      }
+    }
   }
 
   // N:1 is intentionally allowed: several bank transactions may settle ONE
@@ -802,13 +1229,15 @@ export async function manualLink(
   // lets the stale-pointer overwrite through while a concurrent re-link becomes
   // a no-op (0 rows → the "redan kopplad" branch below). Same optimistic-lock
   // pattern as lib/transactions/link-journal-entry.ts.
-  const previousJournalEntryId = (tx.journal_entry_id as string | null) ?? null
+  const previousJournalEntryId =
+    typeof tx.journal_entry_id === 'string' ? tx.journal_entry_id : null
   const linkUpdate = supabase
     .from('transactions')
     .update({
       journal_entry_id: journalEntryId,
       reconciliation_method: 'manual' as ReconciliationMethod,
       is_business: true,
+      ...(repointCashAccountId ? { cash_account_id: repointCashAccountId } : {}),
     })
     .eq('id', transactionId)
     .eq('company_id', companyId)
@@ -828,7 +1257,7 @@ export async function manualLink(
     eventBus.emit({
       type: 'transaction.reconciled',
       payload: {
-        transaction: tx as Transaction,
+        transaction: tx as unknown as Transaction,
         journalEntryId,
         method: 'manual' as ReconciliationMethod,
         userId,
@@ -842,16 +1271,340 @@ export async function manualLink(
   return { success: true }
 }
 
+/** One slice of a bank transaction settled on one verifikat (1:N link). */
+export interface VoucherAllocation {
+  journal_entry_id: string
+  /** Signed, in the transaction's currency: the transaction's sign convention
+   *  (negative = money out), the same one bulk_book_transactions writes. */
+  amount: number
+}
+
+/** Input slice: an omitted amount defaults to the voucher's net line on the account. */
+export interface VoucherAllocationInput {
+  journal_entry_id: string
+  amount?: number
+}
+
+export interface LinkTransactionToVouchersResult {
+  success: boolean
+  error?: string
+  /** The slices as validated, defaults resolved. Present on success and on dry runs. */
+  allocations?: VoucherAllocation[]
+}
+
+/**
+ * Link ONE bank transaction to SEVERAL posted verifikat (1:N): a lump payout
+ * covering utlägg booked per receipt, a Bankgirot deposit aggregating two
+ * customer payments, a Spiris-era salary voucher per employee paid in one
+ * transfer (issue #1553). The mirror image of the N:1 shape manualLink
+ * documents, and the counterpart of the invoice split in match-batch.
+ *
+ * Storage: transactions.journal_entry_id stays NULL and one
+ * transaction_voucher_links row per verifikat carries the signed slice
+ * (role 'bank_line'), exactly how bulk_book_transactions anchors a
+ * samlingsverifikat. Every reader that asks "is this row booked?" through
+ * isTransactionBooked / is_transaction_booked() therefore already sees it;
+ * the pointer column is never the answer for a split row.
+ *
+ * Invariants (all refused, nothing written):
+ *   - the transaction exists in the company, is not ignored and is not booked
+ *     (live pointer, junction row or payment row);
+ *   - at least two distinct verifikat, each posted, in the company, with a
+ *     line on the settlement account;
+ *   - every slice is non-zero, has the sign of that voucher's net line on the
+ *     account and is not larger than it (a voucher cannot absorb more of the
+ *     bank row than it books on the account);
+ *   - the slices sum to the transaction amount within the öre tolerance: the
+ *     same rule match-batch enforces, and the one the reconciliation
+ *     difference depends on (a split that does not close would hide a real
+ *     imbalance behind a "matched" row).
+ *
+ * Write order: the optimistic-locked transactions UPDATE first (it is the
+ * race guard: a concurrent linker makes it match zero rows), then the
+ * junction rows in one insert; a failed insert rolls the UPDATE back.
+ */
+export async function linkTransactionToVouchers(
+  supabase: SupabaseClient,
+  companyId: string,
+  transactionId: string,
+  allocations: VoucherAllocationInput[],
+  userId: string,
+  accountNumber: string = '1930',
+  options: { dryRun?: boolean } = {},
+): Promise<LinkTransactionToVouchersResult> {
+  const journalEntryIds = allocations.map((a) => a.journal_entry_id)
+  if (new Set(journalEntryIds).size !== journalEntryIds.length) {
+    return { success: false, error: 'Samma verifikat förekommer flera gånger i fördelningen.' }
+  }
+  if (journalEntryIds.length < 2) {
+    return { success: false, error: 'En delning kräver minst två verifikat.' }
+  }
+  if (journalEntryIds.length > 50) {
+    return { success: false, error: 'En delning kan omfatta högst 50 verifikat.' }
+  }
+
+  const { data: txRow, error: txError } = await supabase
+    .from('transactions')
+    .select('*, transaction_voucher_links(journal_entry_id, role)')
+    .eq('id', transactionId)
+    .eq('company_id', companyId)
+    .single()
+  if (txError || !txRow) {
+    return { success: false, error: 'Transaktionen kunde inte hittas.' }
+  }
+  const { transaction_voucher_links: junctionRows, ...tx } = txRow as Record<string, unknown> & {
+    transaction_voucher_links?: Array<{ journal_entry_id: string; role?: string | null }> | null
+  }
+  if (tx.is_ignored === true) {
+    return { success: false, error: 'Transaktionen är ignorerad. Återställ den innan du kopplar.' }
+  }
+  // Stricter than manualLink on purpose: a split is the whole explanation of
+  // the row, so ANY junction row (a residual's 'other' row included) makes it
+  // ineligible; the UNIQUE (transaction_id, journal_entry_id) key would refuse
+  // a re-anchor of that voucher anyway.
+  if (Array.isArray(junctionRows) && junctionRows.length > 0) {
+    return { success: false, error: 'Transaktionen är redan kopplad till en verifikation.' }
+  }
+  if (
+    typeof tx.journal_entry_id === 'string' &&
+    (await hasLiveJournalEntryLink(supabase, companyId, tx.journal_entry_id))
+  ) {
+    return { success: false, error: 'Transaktionen är redan kopplad till en verifikation.' }
+  }
+  // Third anchor of isTransactionBooked: a payment row (match-invoice,
+  // match-batch) settles the row through invoice_payments /
+  // supplier_invoice_payments with the pointer left NULL.
+  const [{ data: invoicePayments }, { data: supplierPayments }] = await Promise.all([
+    supabase
+      .from('invoice_payments')
+      .select('id')
+      .eq('transaction_id', transactionId)
+      .limit(1),
+    supabase
+      .from('supplier_invoice_payments')
+      .select('id')
+      .eq('transaction_id', transactionId)
+      .limit(1),
+  ])
+  if ((invoicePayments?.length ?? 0) > 0 || (supplierPayments?.length ?? 0) > 0) {
+    return { success: false, error: 'Transaktionen är redan matchad mot en faktura.' }
+  }
+
+  // The transaction must belong to the account being reconciled (same guard
+  // as manualLink). Sibling-ledger re-pointing is deliberately not offered on
+  // the split path: every verifikat must carry its line on this account.
+  if (typeof tx.cash_account_id === 'string') {
+    const { data: txCa } = await supabase
+      .from('cash_accounts')
+      .select('ledger_account')
+      .eq('id', tx.cash_account_id)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (txCa?.ledger_account && txCa.ledger_account !== accountNumber) {
+      return {
+        success: false,
+        error: `Transaktionen hör till ${txCa.ledger_account}, inte ${accountNumber}`,
+      }
+    }
+  }
+
+  const { data: entries } = await supabase
+    .from('journal_entries')
+    .select('id, status, voucher_series, voucher_number')
+    .eq('company_id', companyId)
+    .in('id', journalEntryIds)
+  const entryById = new Map(
+    ((entries ?? []) as Array<{
+      id: string
+      status: string
+      voucher_series: string | null
+      voucher_number: number | null
+    }>).map((e) => [e.id, e]),
+  )
+  const labelOf = (id: string): string => {
+    const e = entryById.get(id)
+    return e && e.voucher_number != null ? `${e.voucher_series ?? 'A'}-${e.voucher_number}` : id.slice(0, 8)
+  }
+  for (const id of journalEntryIds) {
+    const entry = entryById.get(id)
+    if (!entry) return { success: false, error: 'Verifikationen kunde inte hittas.' }
+    if (entry.status !== 'posted') {
+      return { success: false, error: `Verifikat ${labelOf(id)} är inte bokförd ännu.` }
+    }
+  }
+
+  // Each voucher's net movement on the account, in the transaction's currency
+  // (the split persists a reconciliation link, so it must compare in the
+  // account's own unit; see ledgerLineAmountIn).
+  const currency = typeof tx.currency === 'string' && tx.currency ? tx.currency : 'SEK'
+  const { data: lines } = await supabase
+    .from('journal_entry_lines')
+    .select('journal_entry_id, debit_amount, credit_amount, currency, amount_in_currency')
+    .in('journal_entry_id', journalEntryIds)
+    .eq('account_number', accountNumber)
+  const netByEntry = new Map<string, number | null>()
+  for (const line of (lines ?? []) as Array<LedgerLineAmount & { journal_entry_id: string }>) {
+    const amount = ledgerLineAmountIn(line, currency)
+    const prev = netByEntry.has(line.journal_entry_id) ? netByEntry.get(line.journal_entry_id) : 0
+    netByEntry.set(line.journal_entry_id, prev === null || amount === null ? null : roundOre((prev ?? 0) + amount))
+  }
+
+  const txAmount = roundOre(Number(tx.amount))
+  const resolved: VoucherAllocation[] = []
+  for (const input of allocations) {
+    const label = labelOf(input.journal_entry_id)
+    if (!netByEntry.has(input.journal_entry_id)) {
+      return { success: false, error: `Verifikat ${label} saknar rad på ${accountNumber}` }
+    }
+    const net = netByEntry.get(input.journal_entry_id) ?? null
+    if (net === null) {
+      return { success: false, error: `Verifikat ${label} saknar belopp i ${currency} på ${accountNumber}` }
+    }
+    const slice = roundOre(input.amount ?? net)
+    if (Math.abs(slice) < VOUCHER_LINK_AMOUNT_TOLERANCE) {
+      return { success: false, error: `Beloppet för verifikat ${label} får inte vara 0.` }
+    }
+    if (Math.sign(slice) !== Math.sign(net)) {
+      return {
+        success: false,
+        error: `Beloppet för verifikat ${label} har fel riktning: verifikatet bokför ${net} på ${accountNumber}.`,
+      }
+    }
+    if (Math.abs(slice) > Math.abs(net) + VOUCHER_LINK_AMOUNT_TOLERANCE) {
+      return {
+        success: false,
+        error: `Beloppet för verifikat ${label} (${slice}) är större än verifikatets rad på ${accountNumber} (${net}).`,
+      }
+    }
+    resolved.push({ journal_entry_id: input.journal_entry_id, amount: slice })
+  }
+  const sliceSum = roundOre(resolved.reduce((sum, a) => sum + a.amount, 0))
+  if (Math.abs(sliceSum - txAmount) > VOUCHER_LINK_AMOUNT_TOLERANCE) {
+    return {
+      success: false,
+      error: `Fördelningen (${sliceSum}) stämmer inte med transaktionens belopp (${txAmount}).`,
+    }
+  }
+
+  if (options.dryRun) {
+    return { success: true, allocations: resolved }
+  }
+
+  // Race guard first: the pointer is re-checked inside the write. A stale
+  // pointer at a reversed entry (#988) is cleared by locking on its known
+  // value; a free row locks on NULL. Zero rows means someone else linked the
+  // row between our read and this write.
+  const previousJournalEntryId =
+    typeof tx.journal_entry_id === 'string' ? tx.journal_entry_id : null
+  const lockUpdate = supabase
+    .from('transactions')
+    .update({
+      journal_entry_id: null,
+      reconciliation_method: 'manual' as ReconciliationMethod,
+      is_business: true,
+      potential_journal_entry_id: null,
+      potential_match_method: null,
+      potential_match_confidence: null,
+    })
+    .eq('id', transactionId)
+    .eq('company_id', companyId)
+  const { data: lockedRows, error: lockError } = await (previousJournalEntryId === null
+    ? lockUpdate.is('journal_entry_id', null)
+    : lockUpdate.eq('journal_entry_id', previousJournalEntryId)
+  ).select('id')
+  if (lockError) {
+    return { success: false, error: 'Kunde inte koppla transaktionen. Försök igen.' }
+  }
+  if (!lockedRows || lockedRows.length === 0) {
+    return { success: false, error: 'Transaktionen är redan kopplad till en verifikation.' }
+  }
+
+  const { error: insertError } = await supabase.from('transaction_voucher_links').insert(
+    resolved.map((a) => ({
+      user_id: userId,
+      company_id: companyId,
+      transaction_id: transactionId,
+      journal_entry_id: a.journal_entry_id,
+      allocated_amount: a.amount,
+      role: 'bank_line',
+    })),
+  )
+  if (insertError) {
+    // Roll the lock back so the row is exactly where it was; the junction had
+    // no rows for this transaction (checked above), so a blanket delete only
+    // removes what a partial insert may have left.
+    await supabase
+      .from('transaction_voucher_links')
+      .delete()
+      .eq('company_id', companyId)
+      .eq('transaction_id', transactionId)
+    await supabase
+      .from('transactions')
+      .update({
+        journal_entry_id: previousJournalEntryId,
+        reconciliation_method:
+          typeof tx.reconciliation_method === 'string'
+            ? (tx.reconciliation_method as ReconciliationMethod)
+            : null,
+        is_business: typeof tx.is_business === 'boolean' ? tx.is_business : null,
+      })
+      .eq('id', transactionId)
+      .eq('company_id', companyId)
+    log.error('linkTransactionToVouchers: junction insert failed, lock rolled back', insertError, {
+      companyId,
+      transactionId,
+    })
+    return { success: false, error: 'Kunde inte koppla transaktionen. Försök igen.' }
+  }
+
+  // Behandlingshistorik (BFNAR 2013:2 kap 8): one match event for the row,
+  // carrying every slice, mirroring the auto-apply loop in runReconciliation.
+  await logMatchEvent(supabase, userId, transactionId, 'matched', {
+    matchMethod: 'manual',
+    newState: {
+      journal_entry_ids: resolved.map((a) => a.journal_entry_id),
+      allocations: resolved,
+      reconciliation_method: 'manual',
+    },
+  })
+  for (const a of resolved) {
+    try {
+      eventBus.emit({
+        type: 'transaction.reconciled',
+        payload: {
+          transaction: tx as unknown as Transaction,
+          journalEntryId: a.journal_entry_id,
+          method: 'manual' as ReconciliationMethod,
+          userId,
+          companyId,
+        },
+      })
+    } catch {
+      // Non-critical
+    }
+  }
+
+  return { success: true, allocations: resolved }
+}
+
+export interface UnlinkReconciliationResult {
+  success: boolean
+  error?: string
+  /** Verifikat the row was anchored to before the unlink (pointer first, then junction rows). */
+  previousJournalEntryIds?: string[]
+}
+
 /**
  * Remove a reconciliation link.
  * Only allowed when reconciliation_method IS NOT NULL (prevents unlinking categorization-created entries).
+ * A row with no pointer but junction rows (a 1:N split) is unlinkable too.
  */
 export async function unlinkReconciliation(
   supabase: SupabaseClient,
   companyId: string,
   transactionId: string,
   userId: string,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<UnlinkReconciliationResult> {
   // Fetch transaction
   const { data: tx, error: txError } = await supabase
     .from('transactions')
@@ -864,8 +1617,21 @@ export async function unlinkReconciliation(
     return { success: false, error: 'Transaction not found' }
   }
 
+  // Collected BEFORE the delete so the audit row and the caller's
+  // previous_journal_entry_id are never null for a split row.
+  const previousJournalEntryIds: string[] = tx.journal_entry_id ? [tx.journal_entry_id as string] : []
   if (!tx.journal_entry_id) {
-    return { success: false, error: 'Transaction is not linked to any journal entry' }
+    const { data: junctionRows } = await supabase
+      .from('transaction_voucher_links')
+      .select('journal_entry_id')
+      .eq('company_id', companyId)
+      .eq('transaction_id', transactionId)
+    for (const row of (junctionRows ?? []) as Array<{ journal_entry_id: string }>) {
+      previousJournalEntryIds.push(row.journal_entry_id)
+    }
+    if (previousJournalEntryIds.length === 0) {
+      return { success: false, error: 'Transaction is not linked to any journal entry' }
+    }
   }
 
   if (!tx.reconciliation_method) {
@@ -886,14 +1652,24 @@ export async function unlinkReconciliation(
     return { success: false, error: 'Failed to unlink transaction' }
   }
 
+  // A residual booking, a bulk-book or a 1:N split anchors the same
+  // transaction through transaction_voucher_links as well; "koppla bort"
+  // means every anchor goes.
+  await supabase
+    .from('transaction_voucher_links')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('transaction_id', transactionId)
+
   logMatchEvent(supabase, userId, transactionId, 'unmatched', {
     previousState: {
-      journal_entry_id: tx.journal_entry_id,
+      journal_entry_id: previousJournalEntryIds[0] ?? null,
+      journal_entry_ids: previousJournalEntryIds,
       reconciliation_method: tx.reconciliation_method,
     },
   })
 
-  return { success: true }
+  return { success: true, previousJournalEntryIds }
 }
 
 /** Float tolerance for matching a bank line to a verifikat (0.5 öre). */
@@ -1076,13 +1852,18 @@ export async function autoReconcileTransactionForLinkedVoucher(
   // Tag the transaction with the (supplier) invoice for traceability + parity
   // with the transactions-side match. is_business is already set by manualLink,
   // so the row has already dropped out of the inbox regardless of this update.
-  const tag: Record<string, unknown> = { potential_invoice_id: null }
+  const tag: Record<string, unknown> = {
+    potential_invoice_id: null,
+    potential_rot_rut_payout_request_id: null,
+  }
   if (options.invoiceId) tag.invoice_id = options.invoiceId
   if (options.supplierInvoiceId) {
     tag.supplier_invoice_id = options.supplierInvoiceId
     tag.potential_supplier_invoice_id = null
   }
-  if (Object.keys(tag).length > 1) {
+  // Two hint clears are always present; only an actual invoice tag warrants
+  // the extra write (the row already left the inbox via is_business).
+  if (Object.keys(tag).length > 2) {
     await supabase
       .from('transactions')
       .update(tag)
@@ -1111,7 +1892,8 @@ export async function autoReconcileTransactionForLinkedVoucher(
  * Fetch unlinked GL lines for a settlement account. `accountNumber` defaults to
  * '1930' for back-compat; multi-account customers (Plusgiro 1920, kreditkort
  * 1940, EUR-konto 1932, etc.) pass the BAS code of the account they're
- * reconciling. The CashAccountSelector populates this from cash_accounts.
+ * reconciling. The reconciliation UI populates this from cash_accounts.
+
  */
 export async function fetchUnlinkedGLLines(
   supabase: SupabaseClient,
@@ -1146,11 +1928,40 @@ export async function fetchUnlinkedGLLines(
   }
 }
 
+/**
+ * Ids of the given transactions that are anchored to a verifikat through
+ * transaction_voucher_links (journal_entry_id NULL on the row itself). Chunked
+ * on the id list so a busy window never pushes the .in() past URL limits;
+ * a failed read returns the empty set rather than throwing, mirroring
+ * fetchUnlinkedGLLines' legacy contract.
+ */
+export async function fetchJunctionLinkedTxIds(
+  supabase: SupabaseClient,
+  companyId: string,
+  transactionIds: string[],
+): Promise<Set<string>> {
+  const out = new Set<string>()
+  const CHUNK = 150
+  for (let i = 0; i < transactionIds.length; i += CHUNK) {
+    const chunk = transactionIds.slice(i, i + CHUNK)
+    const { data, error } = await supabase
+      .from('transaction_voucher_links')
+      .select('transaction_id')
+      .eq('company_id', companyId)
+      .in('transaction_id', chunk)
+    if (error) return out
+    for (const row of (data ?? []) as Array<{ transaction_id: string }>) out.add(row.transaction_id)
+  }
+  return out
+}
+
 /** A match candidate that carries how many transactions already point at it. */
 export interface GLLineForMatching extends UnlinkedGLLine {
   /** Transactions settling this entry ON THE REQUESTED ACCOUNT (plus legacy
-   *  rows with no cash_account_id, which count everywhere). A transaction on
-   *  another cash account, e.g. the outgoing leg of an own-account transfer,
+   *  rows with no cash_account_id, which count everywhere EXCEPT on a
+   *  non-primary account when the voucher is an own-account transfer and the
+   *  row's sign contradicts this account's leg; 20260828220000). A transaction
+   *  on another cash account, e.g. the outgoing leg of an own-account transfer,
    *  does not mark the voucher as matched here (issue #1026). */
   linked_transaction_count: number
 }

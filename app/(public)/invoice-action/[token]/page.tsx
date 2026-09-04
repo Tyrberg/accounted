@@ -38,6 +38,33 @@ interface InvoiceData {
   reminderFeeCurrency?: string
   totalDue: number
   feeDueSeparately?: number
+  // White-label brand of the invoice's COMPANY (WL-13), resolved server-side
+  // by the action API regardless of host. Null/absent = today's page.
+  brand?: {
+    appName: string
+    logoUrl: string | null
+    brandColor: string
+  } | null
+}
+
+// Discreet brand mark shown when the invoice's company has a white-label
+// brand: logo when one exists, else the brand name in the brand color.
+function BrandMark({ brand }: { brand: NonNullable<InvoiceData['brand']> }) {
+  return (
+    <div className="flex justify-center mb-6">
+      {brand.logoUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={brand.logoUrl} alt={brand.appName} className="h-8 w-auto" />
+      ) : (
+        <span
+          className="text-sm font-semibold tracking-wide"
+          style={{ color: brand.brandColor }}
+        >
+          {brand.appName}
+        </span>
+      )}
+    </div>
+  )
 }
 
 export default function InvoiceActionPage({ params }: { params: Promise<{ token: string }> }) {
@@ -102,7 +129,7 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white flex items-center justify-center">
+      <div className="min-h-dvh bg-gradient-to-b from-slate-50 to-white flex items-center justify-center">
         <div className="text-center">
           <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto mb-4" />
           <p className="text-muted-foreground">Laddar...</p>
@@ -113,11 +140,11 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
 
   if (error && !invoice) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white flex items-center justify-center p-4">
+      <div className="min-h-dvh bg-gradient-to-b from-slate-50 to-white flex items-center justify-center p-4">
         <Card className="max-w-md w-full">
           <CardContent className="pt-6 text-center">
             <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
-            <h2 className="text-lg font-semibold mb-2">Ogiltig länk</h2>
+            <h2 className="text-lg mb-2">Ogiltig länk</h2>
             <p className="text-muted-foreground">{error}</p>
           </CardContent>
         </Card>
@@ -132,11 +159,13 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
   // Already responded view
   if (invoice.alreadyResponded || successMessage) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white flex items-center justify-center p-4">
-        <Card className="max-w-md w-full">
+      <div className="min-h-dvh bg-gradient-to-b from-slate-50 to-white flex items-center justify-center p-4">
+        <div className="max-w-md w-full">
+          {invoice.brand && <BrandMark brand={invoice.brand} />}
+          <Card className="w-full">
           <CardContent className="pt-6 text-center">
             <CheckCircle className="h-12 w-12 text-success mx-auto mb-4" />
-            <h2 className="text-lg font-semibold mb-2">Tack för ditt svar!</h2>
+            <h2 className="text-lg mb-2">Tack för ditt svar!</h2>
             <p className="text-muted-foreground mb-4">
               {successMessage || (
                 invoice.previousResponse === 'marked_paid'
@@ -149,7 +178,8 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
               <p className="font-medium">{invoice.invoiceNumber}</p>
             </div>
           </CardContent>
-        </Card>
+          </Card>
+        </div>
       </div>
     )
   }
@@ -166,11 +196,13 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
   const feeDueSeparately = invoice.feeDueSeparately ?? 0
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white py-12 px-4">
+    <div className="min-h-dvh bg-gradient-to-b from-slate-50 to-white py-12 px-4">
       <div className="max-w-lg mx-auto">
+        {/* Brand chrome (WL-13): only when the invoice's company has a brand */}
+        {invoice.brand && <BrandMark brand={invoice.brand} />}
         {/* Header */}
         <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-foreground mb-2">
+          <h1 className="text-2xl text-foreground mb-2">
             Betalningspåminnelse
           </h1>
           <p className="text-muted-foreground">
@@ -186,7 +218,8 @@ export default function InvoiceActionPage({ params }: { params: Promise<{ token:
               Fakturainformation
             </CardTitle>
             <CardDescription>
-              Till: {invoice.customerName}
+              {/* data-ph-mask: the customer name is user data */}
+              Till: <span data-ph-mask="">{invoice.customerName}</span>
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

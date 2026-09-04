@@ -1,15 +1,40 @@
 import type { Transaction, TransactionCategory, Invoice, Customer, SupplierInvoice, VatTreatment } from '@/types'
+import type { RotRutPayoutRequestCandidate } from '@/lib/invoices/rot-rut-payout-matching'
+
+/** Open ROT/RUT begäran hung onto an income row as a match suggestion, with
+ *  the invoices it covers (so the user sees which fakturor the payout settles). */
+export interface PotentialRotRutPayout extends RotRutPayoutRequestCandidate {
+  invoices: Array<{ invoice_number: string | null; requested_amount: number | string }>
+}
+
+/** Revalidated journal-entry match suggestion hung onto a row (mirrors
+ *  potential_invoice): present only when the suggested entry is still posted. */
+export interface PotentialVoucher {
+  journal_entry_id: string
+  voucher_series: string
+  voucher_number: number
+  entry_date: string
+  description: string | null
+}
 
 // Shared transaction type with potential invoice data
 export interface TransactionWithInvoice extends Transaction {
   potential_invoice?: Invoice & { customer?: Customer }
   potential_supplier_invoice?: SupplierInvoice
+  potential_rot_rut_payout?: PotentialRotRutPayout
+  potential_voucher?: PotentialVoucher
 }
 
-// Page view modes
-export type ViewMode = 'inbox' | 'history'
+// Page view modes. 'review' is the migrator surface: rows whose sweep
+// suggestion awaits confirmation ("Granska migrerad historik"); the tab only
+// renders while such rows exist.
+export type ViewMode = 'inbox' | 'history' | 'review'
 export type HistoryFilter = 'all' | 'business' | 'private'
-export type SourceFilter = 'all' | 'bank' | 'skatteverket'
+// Source filter (concept scene 10 account chooser), shared by both view modes:
+// everything, one cash account ('acct:<id>'), bank rows not yet tied to a
+// registered cash account ('bank:other'), all bank rows ('bank': the fallback
+// split when no cash accounts are registered), or the skattekonto side.
+export type SourceFilter = 'all' | 'bank' | 'bank:other' | 'skatteverket' | `acct:${string}`
 
 // Handler types
 // Returns the journal_entry_id on success, null on failure
@@ -24,11 +49,6 @@ export type CategorizeHandler = (
   // Dimensions bag {sie_dim_no: code} for the business lines of the booking.
   dimensions?: Record<string, string>
 ) => Promise<string | null>
-
-export type MatchInvoiceHandler = (
-  transactionId: string,
-  invoiceId: string
-) => Promise<boolean>
 
 // Category option type. `label` retains the Swedish text for back-compat and
 // non-React consumers; `labelKey` is the next-intl key under the `tx_categories`

@@ -5,8 +5,15 @@ import { validateVatNumber } from '@/lib/vat/vies-client'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { encryptCustomerPersonalNumber, maskCustomerRow } from '@/lib/customers/protect-personal-number'
+import {
+  looksLikeSwedishPersonalNumber,
+  normalizeReroutedPersonalNumber,
+  orgNumberHoldsPersonalNumber,
+  personalNumberDigits,
+} from '@/lib/customers/personal-number-shape'
 import { isMaskedPersonalNumber } from '@/lib/customers/mask-personal-number'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { COUNTRY_CONSISTENCY_MESSAGES, checkCountryConsistency } from '@/lib/vat/country-codes'
 
 export const GET = withRouteContext(
   'customer.get',
@@ -60,7 +67,7 @@ export const PATCH = withRouteContext(
 
     const { data: existing, error: existingError } = await supabase
       .from('customers')
-      .select('id, customer_type')
+      .select('id, customer_type, country, vat_number')
       .eq('id', id)
       .eq('company_id', companyId)
       .single()
@@ -95,21 +102,83 @@ export const PATCH = withRouteContext(
       return errorResponseFromCode('CUSTOMER_PERSONAL_NUMBER_NOT_ALLOWED', opLog, { requestId })
     }
 
+    // GDPR art. 5.1 c: only customer_type='individual' rows get their
+    // identifiers masked, so a personnummer accepted as a business
+    // org_number would be displayed unmasked everywhere.
+    if (
+      body.org_number &&
+      effectiveType !== 'individual' &&
+      looksLikeSwedishPersonalNumber(body.org_number)
+    ) {
+      return errorResponseFromCode('CUSTOMER_ORG_NUMBER_IS_PERSONAL', opLog, { requestId })
+    }
+
+    // The mirror image for individuals: a personnummer submitted as
+    // org_number is the personnummer in the wrong field. It is stored
+    // encrypted in personal_number and org_number is cleared, same as
+    // CreateCustomerSchema does on create. Next to a DIFFERENT plaintext
+    // personal_number in the same body the two conflict.
+    const reroutedPersonalNumber = orgNumberHoldsPersonalNumber(effectiveType, body.org_number)
+      ? normalizeReroutedPersonalNumber(body.org_number!)
+      : null
+    if (
+      reroutedPersonalNumber
+      && personalNumberSubmitted
+      && body.personal_number
+      && personalNumberDigits(body.personal_number) !== personalNumberDigits(reroutedPersonalNumber)
+    ) {
+      return errorResponseFromCode('CUSTOMER_PERSONAL_NUMBER_CONFLICT', opLog, { requestId })
+    }
+
+    // Country vs type vs VAT prefix on the row as it will END UP (#2025): a
+    // type change alone can make the stored country wrong, and a country
+    // change alone can contradict the stored VAT number. Judged only when
+    // one of the three is in the body: a legacy row that is already
+    // contradictory must still be able to change its email.
+    const countryRuleTouched =
+      body.customer_type !== undefined || body.country !== undefined || body.vat_number !== undefined
+    const countryIssue = countryRuleTouched
+      ? checkCountryConsistency({
+          partyType: effectiveType,
+          country: body.country ?? existing.country,
+          vatNumber: body.vat_number ?? existing.vat_number,
+        })
+      : null
+    if (countryIssue) {
+      return errorResponseFromCode('CUSTOMER_COUNTRY_MISMATCH', opLog, {
+        requestId,
+        messageSv: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].sv,
+        messageEn: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].en,
+        details: { issue: countryIssue, field: 'country' },
+      })
+    }
+
     const updateData: Record<string, unknown> = {}
     if (body.name !== undefined) updateData.name = body.name
     if (body.customer_type !== undefined) updateData.customer_type = body.customer_type
     // Empty string clears the customer number, same as an explicit null.
     if (body.customer_number !== undefined) updateData.customer_number = body.customer_number || null
+    if (body.contact_person !== undefined) updateData.contact_person = body.contact_person
     if (body.email !== undefined) updateData.email = body.email
     if (body.phone !== undefined) updateData.phone = body.phone
+    if (body.invoice_email_cc_addresses !== undefined) {
+      updateData.invoice_email_cc_addresses = body.invoice_email_cc_addresses
+    }
+    if (body.invoice_email_bcc_addresses !== undefined) {
+      updateData.invoice_email_bcc_addresses = body.invoice_email_bcc_addresses
+    }
     if (body.address_line1 !== undefined) updateData.address_line1 = body.address_line1
     if (body.address_line2 !== undefined) updateData.address_line2 = body.address_line2
     if (body.postal_code !== undefined) updateData.postal_code = body.postal_code
     if (body.city !== undefined) updateData.city = body.city
     if (body.country !== undefined) updateData.country = body.country
-    if (body.org_number !== undefined) updateData.org_number = body.org_number
+    if (body.org_number !== undefined) {
+      updateData.org_number = reroutedPersonalNumber ? null : body.org_number
+    }
     if (body.vat_number !== undefined) updateData.vat_number = body.vat_number
-    if (personalNumberSubmitted) {
+    if (reroutedPersonalNumber && !(personalNumberSubmitted && body.personal_number)) {
+      updateData.personal_number = encryptCustomerPersonalNumber(reroutedPersonalNumber)
+    } else if (personalNumberSubmitted) {
       // Stored as ciphertext; customers_personal_number_check accepts that
       // shape only (20260726110000).
       updateData.personal_number = encryptCustomerPersonalNumber(body.personal_number)

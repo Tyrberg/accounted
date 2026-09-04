@@ -22,142 +22,35 @@ import { useToast } from '@/components/ui/use-toast'
 import {
   SettingsGroup,
   SettingsReveal,
-  SettingsRow,
-  SettingsRowNote,
 } from '@/components/settings/SettingsRows'
 import { AttnLine } from '@/components/ui/attn-line'
-import { Loader2, Plus, Copy, Check, Trash2, Key, ChevronDown, AlertTriangle } from 'lucide-react'
+import { Loader2, Plus, Copy, Check, Trash2, Key, ChevronDown, AlertTriangle, ArrowUpRight } from 'lucide-react'
 import { cn, formatDateLong } from '@/lib/utils'
 import { copyToClipboard } from '@/lib/browser/copy-to-clipboard'
 import { getBranding } from '@/lib/branding/service'
 import { ILLUSTRATIONS, illustrationSrc } from '@/components/onboarding/onboarding-illustrations'
-import { STAGING_SCOPES } from '@/lib/auth/api-keys'
-import type { ApiKeyScope } from '@/lib/auth/api-keys'
+import {
+  ALL_SCOPES,
+  SCOPE_GROUPS,
+  STAGING_SCOPES,
+  TOOL_COUNT_BY_SCOPE,
+  scopeKind,
+  type ApiKeyScope,
+  type ScopeGroup,
+} from '@/lib/auth/scope-catalog'
 
 const branding = getBranding()
 const connectorName = branding.appName.toLowerCase()
 
-type ScopeEntry = {
-  scope: ApiKeyScope
-  labelKey: string
-  /** Number of MCP tools gated by this scope. 0 = REST-API-only scope. */
-  tools: number
-}
-
-type ScopeGroup = {
-  domain: string
-  labelKey: string
-  read: ScopeEntry | null
-  write: ScopeEntry | null
-}
-
-const SCOPE_GROUPS: ScopeGroup[] = [
-  {
-    domain: 'transactions',
-    labelKey: 'group_transactions',
-    read: { scope: 'transactions:read', labelKey: 'scope_transactions_read', tools: 8 },
-    write: { scope: 'transactions:write', labelKey: 'scope_transactions_write', tools: 8 },
-  },
-  {
-    domain: 'customers',
-    labelKey: 'group_customers',
-    read: { scope: 'customers:read', labelKey: 'scope_customers_read', tools: 1 },
-    write: { scope: 'customers:write', labelKey: 'scope_customers_write', tools: 1 },
-  },
-  {
-    domain: 'invoices',
-    labelKey: 'group_invoices',
-    read: { scope: 'invoices:read', labelKey: 'scope_invoices_read', tools: 1 },
-    write: { scope: 'invoices:write', labelKey: 'scope_invoices_write', tools: 6 },
-  },
-  {
-    domain: 'suppliers',
-    labelKey: 'group_suppliers',
-    read: { scope: 'suppliers:read', labelKey: 'scope_suppliers_read', tools: 2 },
-    write: { scope: 'suppliers:write', labelKey: 'scope_suppliers_write', tools: 3 },
-  },
-  {
-    domain: 'reports',
-    labelKey: 'group_reports',
-    read: { scope: 'reports:read', labelKey: 'scope_reports_read', tools: 18 },
-    write: null,
-  },
-  {
-    domain: 'bookkeeping',
-    labelKey: 'group_bookkeeping',
-    read: null,
-    write: { scope: 'bookkeeping:write', labelKey: 'scope_bookkeeping_write', tools: 11 },
-  },
-  {
-    domain: 'payroll',
-    labelKey: 'group_payroll',
-    read: { scope: 'payroll:read', labelKey: 'scope_payroll_read', tools: 3 },
-    write: { scope: 'payroll:write', labelKey: 'scope_payroll_write', tools: 3 },
-  },
-  {
-    domain: 'pending_operations',
-    labelKey: 'group_pending_operations',
-    read: { scope: 'pending_operations:read', labelKey: 'scope_pending_operations_read', tools: 1 },
-    write: { scope: 'pending_operations:approve', labelKey: 'scope_pending_operations_approve', tools: 2 },
-  },
-  {
-    domain: 'agent',
-    labelKey: 'group_agent',
-    read: { scope: 'agent:read', labelKey: 'scope_agent_read', tools: 1 },
-    write: { scope: 'agent:write', labelKey: 'scope_agent_write', tools: 2 },
-  },
-  {
-    domain: 'documents',
-    labelKey: 'group_documents',
-    read: { scope: 'documents:read', labelKey: 'scope_documents_read', tools: 0 },
-    write: { scope: 'documents:write', labelKey: 'scope_documents_write', tools: 0 },
-  },
-  {
-    domain: 'companies',
-    labelKey: 'group_companies',
-    read: { scope: 'companies:read', labelKey: 'scope_companies_read', tools: 1 },
-    write: null,
-  },
-  {
-    domain: 'events',
-    labelKey: 'group_events',
-    read: { scope: 'events:read', labelKey: 'scope_events_read', tools: 0 },
-    write: null,
-  },
-  {
-    domain: 'webhooks',
-    labelKey: 'group_webhooks',
-    read: null,
-    write: { scope: 'webhooks:manage', labelKey: 'scope_webhooks_manage', tools: 0 },
-  },
-  {
-    domain: 'operations',
-    labelKey: 'group_operations',
-    read: { scope: 'operations:read', labelKey: 'scope_operations_read', tools: 0 },
-    write: null,
-  },
-  {
-    domain: 'compliance',
-    labelKey: 'group_compliance',
-    read: { scope: 'compliance:read', labelKey: 'scope_compliance_read', tools: 3 },
-    write: null,
-  },
-  {
-    domain: 'skatteverket',
-    labelKey: 'group_skatteverket',
-    read: null,
-    write: { scope: 'skatteverket:write', labelKey: 'scope_skatteverket_write', tools: 2 },
-  },
-]
-
 type Scope = ApiKeyScope
 
-const ALL_SCOPES: Scope[] = SCOPE_GROUPS.flatMap((g) => {
-  const out: Scope[] = []
-  if (g.read) out.push(g.read.scope)
-  if (g.write) out.push(g.write.scope)
-  return out
-})
+/** i18n key for a scope card: `scope_<domain>_<verb>`. */
+const scopeLabelKey = (scope: Scope) => `scope_${scope.replace(':', '_')}`
+/** i18n key for a group heading: `group_<domain>`. */
+const groupLabelKey = (group: ScopeGroup) => `group_${group.domain}`
+/** A group with no MCP tool behind any of its scopes only gates REST endpoints. */
+const isRestOnlyGroup = (group: ScopeGroup) =>
+  group.scopes.every((scope) => TOOL_COUNT_BY_SCOPE[scope] === 0)
 
 interface ApiKey {
   id: string
@@ -192,7 +85,7 @@ function CopyBlock({ text, copyAriaLabel }: { text: string; copyAriaLabel: strin
 
   return (
     <div className="relative group">
-      <pre className="select-all rounded-md bg-muted p-4 pr-12 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all">
+      <pre className="select-all rounded-lg bg-muted p-4 pr-12 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all">
         {text}
       </pre>
       <Button
@@ -223,16 +116,17 @@ function CopyBlock({ text, copyAriaLabel }: { text: string; copyAriaLabel: strin
 }
 
 function ScopeCard({
-  entry,
+  scope,
   checked,
   onCheckedChange,
 }: {
-  entry: ScopeEntry
+  scope: Scope
   checked: boolean
   onCheckedChange: (checked: boolean) => void
 }) {
   const t = useTranslations('settings_api_keys')
-  const label = t(entry.labelKey)
+  const label = t(scopeLabelKey(scope))
+  const tools = TOOL_COUNT_BY_SCOPE[scope]
   const sepIdx = label.indexOf(': ')
   const verb = sepIdx > 0 ? label.slice(0, sepIdx) : label
   const description = sepIdx > 0 ? label.slice(sepIdx + 2) : ''
@@ -240,7 +134,7 @@ function ScopeCard({
   return (
     <label
       className={cn(
-        'flex min-h-[68px] cursor-pointer flex-col gap-1 rounded-md border p-2 transition-colors',
+        'flex min-h-[68px] cursor-pointer flex-col gap-1 rounded-lg border p-2 transition-colors',
         checked
           ? 'border-border bg-secondary'
           : 'border-border hover:bg-secondary/60'
@@ -254,7 +148,7 @@ function ScopeCard({
         />
         <span className="flex-1 text-xs font-medium text-foreground">{verb}</span>
         <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-          {entry.tools > 0 ? t('tools_count', { count: entry.tools }) : t('rest_badge')}
+          {tools > 0 ? t('tools_count', { count: tools }) : t('rest_badge')}
         </span>
       </div>
       {description && (
@@ -279,6 +173,7 @@ export function ApiKeysPanel() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [showKeyDialog, setShowKeyDialog] = useState(false)
   const [showApiKeyMethods, setShowApiKeyMethods] = useState(false)
+  const [showOtherClients, setShowOtherClients] = useState(false)
   const [newKeyName, setNewKeyName] = useState('')
   // 'live' by default: this is the general MCP-key surface and the dominant case
   // is a key for the user's real company. 'test' is an explicit opt-in: a
@@ -296,6 +191,24 @@ export function ApiKeysPanel() {
   const sodConflictScope = STAGING_SCOPES.find((s) => newKeyScopes.has(s)) ?? null
   const hasSodConflict =
     newKeyScopes.has('pending_operations:approve') && sodConflictScope !== null
+
+  // Elevated scopes (write/approve/signoff) imply the group's read scope:
+  // ticking one ticks read, and unticking read clears the whole group.
+  function toggleScope(group: ScopeGroup, scope: Scope, checked: boolean) {
+    setNewKeyScopes((prev) => {
+      const next = new Set(prev)
+      const readScope = group.scopes.find((s) => scopeKind(s) === 'read')
+      if (checked) {
+        next.add(scope)
+        if (readScope) next.add(readScope)
+      } else if (scope === readScope) {
+        for (const s of group.scopes) next.delete(s)
+      } else {
+        next.delete(scope)
+      }
+      return next
+    })
+  }
 
   const fetchKeys = useCallback(async () => {
     try {
@@ -385,15 +298,239 @@ export function ApiKeysPanel() {
     }
   }
 
-  const mcpBase = typeof window !== 'undefined'
-    ? `${window.location.origin}/api/extensions/ext/mcp-server/mcp`
-    : '/api/extensions/ext/mcp-server/mcp'
-  // Telemetry-only distribution-channel marker (server reads the `client` query
-  // param; never used for auth). Lets us measure which Claude surface connected.
-  const mcpUrl = (client: string) => `${mcpBase}?client=${client}`
+  // This panel is server-rendered before it hydrates, and window.location has
+  // no server equivalent. Reading the origin at render time therefore yields a
+  // relative URL in the first paint, and a click on the install link in that
+  // window would hand claude.ai a connectorUrl it cannot resolve. Resolve the
+  // origin after mount and withhold the link's href until it is known.
+  const [origin, setOrigin] = useState('')
+  useEffect(() => setOrigin(window.location.origin), [])
+  const mcpBase = `${origin}/api/extensions/ext/mcp-server/mcp`
+  // `tool_namespace=accounted` is load-bearing: resolveMcpToolNamespace()
+  // falls back to the legacy `gnubok_` tool prefix when the param is absent,
+  // so a URL without it hands the client tool names that none of our docs,
+  // skills, or the Claude Code plugin reference. `client` is a telemetry-only
+  // distribution marker (server reads it; never used for auth).
+  const mcpUrl = (client: string) =>
+    `${mcpBase}?tool_namespace=accounted&client=${client}`
+  // claude.ai's Add-custom-connector dialog probes the URL without credentials
+  // and pre-fills Authentication "None" when the lazy handshake answers 200,
+  // which blocks the sign-in later. `auth=required` makes every tokenless
+  // request answer the 401 challenge so the dialog detects OAuth instead
+  // (extensions/general/mcp-server/auth-mode.ts). Claude Code, Cursor and the
+  // stdio bridge keep the lazy URL.
+  const claudeConnectorUrl = `${mcpUrl('claude-connector')}&auth=required`
+  // Grok's custom-connector dialog does the same probe: on the lazy URL it
+  // lists every tool and never opens the sign-in (observed 2026-09-02).
+  const grokConnectorUrl = `${mcpUrl('grok')}&auth=required`
+
+  // claude.ai install link: opens Add-custom-connector with name and URL
+  // prefilled. It only prefills the dialog, so the user still reviews and
+  // confirms, and Anthropic's cloud must be able to reach the URL: on
+  // localhost or a firewalled self-host the manual paste below is the path.
+  // https://claude.com/docs/connectors/building/directory-vs-custom
+  const claudeInstallUrl =
+    'https://claude.ai/customize/connectors?modal=add-custom-connector' +
+    `&connectorName=${encodeURIComponent(branding.appName)}` +
+    `&connectorUrl=${encodeURIComponent(claudeConnectorUrl)}`
 
   return (
     <>
+      <SettingsGroup label={t('connect_mcp_title')}>
+        {/* The marketing site's halftone AI marks (Claude, OpenAI): a quiet
+            "works with" cue, not chrome. Text carries the meaning; the marks
+            are decorative. */}
+        <div className="flex items-center gap-3 px-1 pb-1 pt-3">
+          <div aria-hidden className="flex shrink-0 items-center gap-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={illustrationSrc('logo-claude')}
+              width={ILLUSTRATIONS['logo-claude'].w}
+              height={ILLUSTRATIONS['logo-claude'].h}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              className="h-5 w-auto"
+            />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={illustrationSrc('logo-openai')}
+              width={ILLUSTRATIONS['logo-openai'].w}
+              height={ILLUSTRATIONS['logo-openai'].h}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              className="h-5 w-auto"
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">{t('works_with_ai')}</p>
+        </div>
+        {/* claude.ai is the path for nearly everyone, and the install link
+            makes it one click, so it is the only thing above the fold. Every
+            other client needs a config file or a terminal, which is a
+            different job: it lives behind one disclosure instead of four
+            code blocks competing with the button. */}
+        <div className="px-1 pb-4 pt-2">
+          <Button asChild size="lg">
+            <a
+              href={origin ? claudeInstallUrl : undefined}
+              aria-disabled={!origin}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {t('connect_to_claude')}
+              <ArrowUpRight className="ml-1.5 h-4 w-4" />
+            </a>
+          </Button>
+          <p className="mt-2 max-w-prose text-xs text-muted-foreground">
+            {t('connect_to_claude_help')}
+          </p>
+          {/* The step-by-step guide is canonical on the docs site, in one
+              language per URL (the docs site has no locale routing). Root-relative
+              so the /docs/api/* 308 in next.config.ts forwards to docs.gnubok.se.
+              It sits right under the button: the steps on Claude's side after
+              the click (consent, first-call sign-in) live there, and a reader
+              who has just clicked should not have to open two disclosures to
+              find them (issue #2133). */}
+          <a
+            href={locale === 'sv' ? '/docs/api/anslut-claude' : '/docs/api/connect-claude'}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-2 inline-flex items-center gap-1.5 text-xs text-muted-foreground underline-offset-4 transition-colors duration-150 hover:text-foreground hover:underline"
+          >
+            {t('full_guide_link')}
+            <ArrowUpRight className="h-3 w-3" />
+          </a>
+        </div>
+
+        <button
+          type="button"
+          aria-expanded={showOtherClients}
+          onClick={() => setShowOtherClients(!showOtherClients)}
+          className="flex w-full items-center gap-2 border-t border-border px-1 py-3 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground"
+        >
+          <ChevronDown
+            className={cn(
+              'h-3.5 w-3.5 transition-transform duration-150',
+              !showOtherClients && '-rotate-90',
+            )}
+          />
+          {t('other_clients')}
+        </button>
+        <SettingsReveal open={showOtherClients}>
+          <div className="space-y-6 pb-3 pt-1">
+            <div>
+              <p className="mb-1 text-sm">{t('claude_ai_manual')}</p>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {t.rich('claude_ai_instructions', {
+                  // Prose gets the brand's real casing; `connectorName` is the
+                  // lowercased config key and reads wrong in a sentence.
+                  connectorName: branding.appName,
+                  path: (chunks) => <strong>{chunks}</strong>,
+                })}
+              </p>
+              <CopyBlock text={claudeConnectorUrl} copyAriaLabel={t('copy_aria')} />
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm">Grok</p>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {t.rich('grok_instructions', {
+                  path: (chunks) => <strong>{chunks}</strong>,
+                })}
+              </p>
+              <CopyBlock text={grokConnectorUrl} copyAriaLabel={t('copy_aria')} />
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm">{t('claude_plugin_label')}</p>
+              <p className="mb-2 text-xs text-muted-foreground">{t('claude_plugin_instructions')}</p>
+              <CopyBlock
+                text={`/plugin marketplace add erp-mafia/accounted\n/plugin install accounted@accounted`}
+                copyAriaLabel={t('copy_aria')}
+              />
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm">Claude Code</p>
+              <p className="mb-2 text-xs text-muted-foreground">{t('terminal_runs_browser_login')}</p>
+              {/* URL is quoted: unquoted `?` in the query string trips zsh globbing. */}
+              <CopyBlock text={`claude mcp add --transport http ${connectorName} "${mcpUrl('claude-code')}"`} copyAriaLabel={t('copy_aria')} />
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm">Cursor</p>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {t.rich('cursor_instructions', {
+                  code: (chunks) => <code className="text-xs">{chunks}</code>,
+                })}
+              </p>
+              <CopyBlock text={`{
+  "mcpServers": {
+    "${connectorName}": {
+      "url": "${mcpUrl('cursor')}"
+    }
+  }
+}`} copyAriaLabel={t('copy_aria')} />
+            </div>
+          </div>
+        </SettingsReveal>
+
+        <button
+          type="button"
+          aria-expanded={showApiKeyMethods}
+          onClick={() => setShowApiKeyMethods(!showApiKeyMethods)}
+          className="flex w-full items-center gap-2 border-t border-border px-1 py-3 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground"
+        >
+          <ChevronDown
+            className={cn(
+              'h-3.5 w-3.5 transition-transform duration-150',
+              !showApiKeyMethods && '-rotate-90',
+            )}
+          />
+          {t('connect_with_api_key')}
+        </button>
+        <SettingsReveal open={showApiKeyMethods}>
+          <div className="space-y-6 pb-3 pt-1">
+            <div>
+              <p className="mb-1 text-sm">Claude Desktop</p>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {t.rich('claude_desktop_instructions', {
+                  code: (chunks) => <code className="text-xs">{chunks}</code>,
+                })}
+              </p>
+              {/* ACCOUNTED_URL is emitted so self-hosted and white-label
+                  instances get a config that points at their own host: the
+                  bridge otherwise defaults to the hosted endpoint. The key
+                  value keeps the `gnubok_sk_` wire prefix on purpose. */}
+              <CopyBlock text={`{
+  "mcpServers": {
+    "${connectorName}": {
+      "command": "npx",
+      "args": ["-y", "accounted-mcp"],
+      "env": {
+        "ACCOUNTED_API_KEY": "gnubok_sk_...",
+        "ACCOUNTED_URL": "${mcpUrl('claude-desktop')}",
+        "ACCOUNTED_CLIENT": "claude-desktop"
+      }
+    }
+  }
+}`} copyAriaLabel={t('copy_aria')} />
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm">Claude Code</p>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {t('terminal_with_api_key')}
+              </p>
+              <CopyBlock text={`claude mcp add --transport http ${connectorName} \\
+  "${mcpUrl('claude-code')}" \\
+  --header "Authorization: Bearer gnubok_sk_..."`} copyAriaLabel={t('copy_aria')} />
+            </div>
+          </div>
+        </SettingsReveal>
+      </SettingsGroup>
+
       <SettingsGroup>
         {/* Group eyebrow with the group's primary action on the right. Styling
             mirrors SettingsGroup's label line; the "?" holds the old panel
@@ -474,113 +611,9 @@ export function ApiKeysPanel() {
         )}
       </SettingsGroup>
 
-      <SettingsGroup label={t('connect_mcp_title')}>
-        {/* The marketing site's halftone AI marks (Claude, OpenAI): a quiet
-            "works with" cue, not chrome. Text carries the meaning; the marks
-            are decorative. */}
-        <div className="flex items-center gap-3 px-1 pb-1 pt-3">
-          <div aria-hidden className="flex shrink-0 items-center gap-2">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={illustrationSrc('logo-claude')}
-              width={ILLUSTRATIONS['logo-claude'].w}
-              height={ILLUSTRATIONS['logo-claude'].h}
-              alt=""
-              loading="lazy"
-              decoding="async"
-              className="h-5 w-auto"
-            />
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={illustrationSrc('logo-openai')}
-              width={ILLUSTRATIONS['logo-openai'].w}
-              height={ILLUSTRATIONS['logo-openai'].h}
-              alt=""
-              loading="lazy"
-              decoding="async"
-              className="h-5 w-auto"
-            />
-          </div>
-          <p className="text-xs text-muted-foreground">{t('works_with_ai')}</p>
-        </div>
-        <SettingsRow
-          label="Claude.ai"
-          align="baseline"
-          help={t.rich('claude_ai_instructions', {
-            connectorName,
-            path: (chunks) => <strong>{chunks}</strong>,
-          })}
-        >
-          <SettingsRowNote>{t('recommended_badge')}</SettingsRowNote>
-          <div className="w-full min-w-0">
-            <CopyBlock text={mcpUrl('claude-connector')} copyAriaLabel={t('copy_aria')} />
-          </div>
-        </SettingsRow>
-
-        <SettingsRow
-          label={t('claude_code_cursor')}
-          align="baseline"
-          help={t('terminal_runs_browser_login')}
-        >
-          {/* URL is quoted: unquoted `?` in the query string trips zsh globbing. */}
-          <div className="w-full min-w-0">
-            <CopyBlock text={`claude mcp add ${connectorName} --transport http "${mcpUrl('claude-code')}"`} copyAriaLabel={t('copy_aria')} />
-          </div>
-        </SettingsRow>
-
-        <button
-          type="button"
-          aria-expanded={showApiKeyMethods}
-          onClick={() => setShowApiKeyMethods(!showApiKeyMethods)}
-          className="flex items-center gap-2 px-1 py-3 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground"
-        >
-          <ChevronDown
-            className={cn(
-              'h-3.5 w-3.5 transition-transform duration-150',
-              !showApiKeyMethods && '-rotate-90',
-            )}
-          />
-          {t('connect_with_api_key')}
-        </button>
-        <SettingsReveal open={showApiKeyMethods}>
-          <div className="space-y-6 pb-3 pt-1">
-            <div>
-              <p className="mb-1 text-sm">Claude Desktop</p>
-              <p className="mb-2 text-xs text-muted-foreground">
-                {t.rich('claude_desktop_instructions', {
-                  code: (chunks) => <code className="text-xs">{chunks}</code>,
-                })}
-              </p>
-              <CopyBlock text={`{
-  "mcpServers": {
-    "${connectorName}": {
-      "command": "npx",
-      "args": ["gnubok-mcp"],
-      "env": {
-        "GNUBOK_API_KEY": "gnubok_sk_...",
-        "GNUBOK_CLIENT": "claude-desktop"
-      }
-    }
-  }
-}`} copyAriaLabel={t('copy_aria')} />
-            </div>
-
-            <div>
-              <p className="mb-1 text-sm">{t('claude_code_cursor')}</p>
-              <p className="mb-2 text-xs text-muted-foreground">
-                {t('terminal_with_api_key')}
-              </p>
-              <CopyBlock text={`claude mcp add ${connectorName} --transport http \\
-  --url "${mcpUrl('claude-code')}" \\
-  --header "Authorization: Bearer gnubok_sk_..."`} copyAriaLabel={t('copy_aria')} />
-            </div>
-          </div>
-        </SettingsReveal>
-      </SettingsGroup>
-
       {/* Create key dialog */}
       <Dialog open={showCreateDialog} onOpenChange={setShowCreateDialog}>
-        <DialogContent className="max-w-[calc(100vw-2rem)] rounded-2xl p-4 sm:max-w-3xl sm:p-6">
+        <DialogContent className="max-w-[calc(100vw-2rem)] rounded-xl p-4 sm:max-w-3xl sm:p-6">
           <DialogHeader>
             <DialogTitle>{t('create_dialog_title')}</DialogTitle>
             <DialogDescription>
@@ -600,7 +633,7 @@ export function ApiKeysPanel() {
             </div>
             <div className="space-y-2">
               <Label>{t('mode_label')}</Label>
-              <div className="inline-flex rounded-md border p-0.5" role="radiogroup" aria-label={t('mode_label')}>
+              <div className="inline-flex rounded-full border p-0.5" role="radiogroup" aria-label={t('mode_label')}>
                 {(['live', 'test'] as const).map((m) => (
                   <button
                     key={m}
@@ -609,7 +642,7 @@ export function ApiKeysPanel() {
                     aria-checked={newKeyMode === m}
                     onClick={() => setNewKeyMode(m)}
                     className={cn(
-                      'rounded-[5px] px-3 py-1.5 text-xs transition-colors',
+                      'rounded-full px-3 py-1.5 text-xs transition-colors',
                       newKeyMode === m
                         ? 'bg-secondary text-foreground'
                         : 'text-muted-foreground hover:text-foreground',
@@ -638,44 +671,20 @@ export function ApiKeysPanel() {
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {SCOPE_GROUPS.map((group) => (
                   <div key={group.domain} className="space-y-2">
-                    <h4 className="text-sm font-medium">{t(group.labelKey)}</h4>
+                    <h4 className="text-sm font-medium">
+                      {isRestOnlyGroup(group)
+                        ? t('group_rest_only', { name: t(groupLabelKey(group)) })
+                        : t(groupLabelKey(group))}
+                    </h4>
                     <div className="space-y-2 px-2">
-                      {group.read && (
+                      {group.scopes.map((scope) => (
                         <ScopeCard
-                          entry={group.read}
-                          checked={newKeyScopes.has(group.read.scope)}
-                          onCheckedChange={(checked) => {
-                            setNewKeyScopes((prev) => {
-                              const next = new Set(prev)
-                              if (checked) {
-                                next.add(group.read!.scope)
-                              } else {
-                                next.delete(group.read!.scope)
-                                if (group.write) next.delete(group.write.scope)
-                              }
-                              return next
-                            })
-                          }}
+                          key={scope}
+                          scope={scope}
+                          checked={newKeyScopes.has(scope)}
+                          onCheckedChange={(checked) => toggleScope(group, scope, checked)}
                         />
-                      )}
-                      {group.write && (
-                        <ScopeCard
-                          entry={group.write}
-                          checked={newKeyScopes.has(group.write.scope)}
-                          onCheckedChange={(checked) => {
-                            setNewKeyScopes((prev) => {
-                              const next = new Set(prev)
-                              if (checked) {
-                                next.add(group.write!.scope)
-                                if (group.read) next.add(group.read.scope)
-                              } else {
-                                next.delete(group.write!.scope)
-                              }
-                              return next
-                            })
-                          }}
-                        />
-                      )}
+                      ))}
                     </div>
                   </div>
                 ))}
@@ -683,7 +692,7 @@ export function ApiKeysPanel() {
               {hasSodConflict && (
                 <div
                   role="alert"
-                  className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs text-foreground"
+                  className="flex items-start gap-2 rounded-lg border border-border bg-muted/30 p-3 text-xs text-foreground"
                 >
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
                   <p className="leading-snug">{t('sod_warning')}</p>

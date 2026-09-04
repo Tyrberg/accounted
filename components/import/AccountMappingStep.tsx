@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useMemo } from 'react'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -23,6 +24,7 @@ import {
 import {
   ArrowRight,
   Search,
+  Check,
   CheckCircle,
   AlertCircle,
   XCircle,
@@ -31,16 +33,35 @@ import {
 import type { AccountMapping } from '@/lib/import/types'
 import type { BASAccount } from '@/types'
 import { getAccountClassName } from '@/lib/bookkeeping/account-descriptions'
+import {
+  defaultRateForVatTreatment,
+  vatTreatmentsForAccountClass,
+  type AccountVatTreatment,
+} from '@/lib/vat/account-vat-treatment'
+import {
+  InfoTooltip,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/info-tooltip'
+import { cn } from '@/lib/utils'
 
 interface AccountMappingStepProps {
   mappings: AccountMapping[]
   basAccounts: BASAccount[]
   onMappingChange: (sourceAccount: string, targetAccount: string, targetName: string) => void
+  onVatTreatmentChange: (
+    sourceAccount: string,
+    treatment: AccountVatTreatment | null,
+    rate: number | null,
+  ) => void
+  /** Accept the suggested VAT treatment for every unreviewed row at once. */
+  onConfirmAllVatTreatments: () => void
   onContinue: () => void
   onBack: () => void
 }
 
-type FilterType = 'all' | 'unmapped' | 'low_confidence' | 'manual'
+type FilterType = 'all' | 'unmapped' | 'vat_review' | 'low_confidence' | 'manual'
 
 const PAGE_SIZE = 50
 
@@ -48,14 +69,18 @@ export default function AccountMappingStep({
   mappings,
   basAccounts,
   onMappingChange,
+  onVatTreatmentChange,
+  onConfirmAllVatTreatments,
   onContinue,
   onBack,
 }: AccountMappingStepProps) {
+  const t = useTranslations('chart_of_accounts')
   const [searchTerm, setSearchTerm] = useState('')
   // Default to showing unmapped accounts first (most actionable)
   const [filter, setFilter] = useState<FilterType>(() => {
     const hasUnmapped = mappings.some((m) => !m.targetAccount)
-    return hasUnmapped ? 'unmapped' : 'all'
+    const hasVatReview = mappings.some((m) => m.requiresVatTreatmentReview && !m.vatTreatmentReviewed)
+    return hasUnmapped ? 'unmapped' : hasVatReview ? 'vat_review' : 'all'
   })
   const [currentPage, setCurrentPage] = useState(1)
 
@@ -70,6 +95,9 @@ export default function AccountMappingStep({
         break
       case 'low_confidence':
         result = result.filter((m) => m.targetAccount && m.confidence < 0.7)
+        break
+      case 'vat_review':
+        result = result.filter((m) => m.requiresVatTreatmentReview && !m.vatTreatmentReviewed)
         break
       case 'manual':
         result = result.filter((m) => m.isOverride)
@@ -114,10 +142,11 @@ export default function AccountMappingStep({
     const unmapped = mappings.filter((m) => !m.targetAccount).length
     const lowConfidence = mappings.filter((m) => m.targetAccount && m.confidence < 0.7).length
     const manual = mappings.filter((m) => m.isOverride).length
-    return { unmapped, lowConfidence, manual }
+    const vatReview = mappings.filter((m) => m.requiresVatTreatmentReview && !m.vatTreatmentReviewed).length
+    return { unmapped, lowConfidence, manual, vatReview }
   }, [mappings])
 
-  const canContinue = stats.unmapped === 0
+  const canContinue = stats.unmapped === 0 && stats.vatReview === 0
 
   // Group BAS accounts by class for the dropdown
   const accountsByClass = useMemo(() => {
@@ -145,6 +174,14 @@ export default function AccountMappingStep({
         <CardContent className="space-y-4">
           {/* Stats */}
           <div className="flex gap-4 flex-wrap">
+            <Badge
+              variant={filter === 'vat_review' ? 'default' : stats.vatReview > 0 ? 'secondary' : 'outline'}
+              className="cursor-pointer"
+              onClick={() => handleFilterChange('vat_review')}
+            >
+              <AlertCircle className="h-3 w-3 mr-1" />
+              {t('vat_review_filter', { count: stats.vatReview })}
+            </Badge>
             <Badge
               variant={filter === 'unmapped' ? 'destructive' : stats.unmapped > 0 ? 'destructive' : 'secondary'}
               className="cursor-pointer"
@@ -197,6 +234,7 @@ export default function AccountMappingStep({
               <SelectContent>
                 <SelectItem value="all">Visa alla</SelectItem>
                 <SelectItem value="unmapped">Ej mappade</SelectItem>
+                <SelectItem value="vat_review">{t('vat_review_filter', { count: stats.vatReview })}</SelectItem>
                 <SelectItem value="low_confidence">Osäkra</SelectItem>
                 <SelectItem value="manual">Manuellt satta</SelectItem>
               </SelectContent>
@@ -204,27 +242,42 @@ export default function AccountMappingStep({
           </div>
 
           {/* Mapping table */}
-          <div className="border rounded-lg overflow-x-auto">
-            <Table>
+          <div className="overflow-hidden rounded-lg border">
+            {/* Under table-fixed the header widths ARE the layout: cells never
+                grow them. The budget is ~990px so the table fits a laptop
+                content column at 100 % zoom (#2125: 1216px overflowed, with
+                144px spent on a four-digit source account); beyond that the
+                wrapper scrolls and the confirm column stays sticky (#1668).
+                13px text and px-3 cells match the page-level list density. */}
+            <Table className="table-fixed text-[13px] [&_td]:px-3 [&_th]:px-3">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="w-36">Källkonto</TableHead>
-                  <TableHead>Källnamn</TableHead>
-                  <TableHead className="w-12"></TableHead>
-                  <TableHead className="w-64">Målkonto</TableHead>
+                  <TableHead className="w-20">Källkonto</TableHead>
+                  <TableHead className="w-40">Källnamn</TableHead>
+                  <TableHead className="w-8 !px-0" aria-hidden="true"></TableHead>
+                  <TableHead className="w-56">Målkonto</TableHead>
+                  <TableHead className="w-72">{t('vat_treatment_column')}</TableHead>
                   <TableHead className="w-24">Konfidens</TableHead>
+                  <TableHead className="sticky right-0 z-20 w-28 min-w-28 border-l border-border bg-background text-right">
+                    <span className="inline-flex items-center gap-1">
+                      {t('vat_treatment_confirm')}
+                      <InfoTooltip content={t('vat_treatment_confirm_help')} side="left" />
+                    </span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {paginatedMappings.map((mapping) => (
                   <TableRow
                     key={mapping.sourceAccount}
-                    className={!mapping.targetAccount ? 'bg-destructive/5' : ''}
+                    className={cn('group', !mapping.targetAccount && 'bg-destructive/5')}
                   >
                     <TableCell className="font-mono">{mapping.sourceAccount}</TableCell>
-                    <TableCell className="text-muted-foreground">{mapping.sourceName}</TableCell>
-                    <TableCell>
-                      <ArrowRight className="h-4 w-4 text-muted-foreground" />
+                    <TableCell className="text-muted-foreground">
+                      <TruncatedSourceName sourceName={mapping.sourceName} />
+                    </TableCell>
+                    <TableCell className="!px-0">
+                      <ArrowRight className="mx-auto h-4 w-4 text-muted-foreground" />
                     </TableCell>
                     <TableCell>
                       <Select
@@ -263,6 +316,70 @@ export default function AccountMappingStep({
                       </Select>
                     </TableCell>
                     <TableCell>
+                      {mapping.sourceAccount === mapping.targetAccount &&
+                      ['3', '4', '5', '6'].includes(mapping.sourceAccount.charAt(0)) ? (
+                        <div className="flex gap-2">
+                          <Select
+                            value={mapping.defaultVatTreatment ?? 'none'}
+                            onValueChange={(value) => {
+                              const treatment = value === 'none'
+                                ? null
+                                : value as AccountVatTreatment
+                              const accountClass = Number(mapping.sourceAccount.charAt(0))
+                              const rate = treatment
+                                ? mapping.defaultVatRate == null || mapping.vatTreatmentSuggested
+                                  ? defaultRateForVatTreatment(treatment, accountClass)
+                                  : mapping.defaultVatRate
+                                : mapping.defaultVatRate ?? null
+                              onVatTreatmentChange(mapping.sourceAccount, treatment, rate)
+                            }}
+                          >
+                            <SelectTrigger
+                              className={cn(
+                                'min-w-0 flex-1',
+                                mapping.requiresVatTreatmentReview && 'border-warning/60',
+                              )}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="none">{t('vat_treatment_none')}</SelectItem>
+                              {vatTreatmentsForAccountClass(
+                                Number(mapping.sourceAccount.charAt(0))
+                              ).map((treatment) => (
+                                <SelectItem key={treatment} value={treatment}>
+                                  {t(`vat_treatment_${treatment}`)}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Select
+                            value={mapping.defaultVatRate === null || mapping.defaultVatRate === undefined
+                              ? 'none'
+                              : String(mapping.defaultVatRate)}
+                            onValueChange={(value) => onVatTreatmentChange(
+                              mapping.sourceAccount,
+                              mapping.defaultVatTreatment ?? null,
+                              value === 'none' ? null : Number(value),
+                            )}
+                          >
+                            <SelectTrigger className="w-24 shrink-0" aria-label={t('vat_rate_label')}>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="none">{t('vat_rate_none')}</SelectItem>
+                              <SelectItem value="0">0 %</SelectItem>
+                              <SelectItem value="0.25">25 %</SelectItem>
+                              <SelectItem value="0.12">12 %</SelectItem>
+                              <SelectItem value="0.06">6 %</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       {mapping.targetAccount && (
                         <ConfidenceBadge
                           confidence={mapping.confidence}
@@ -271,11 +388,43 @@ export default function AccountMappingStep({
                         />
                       )}
                     </TableCell>
+                    <TableCell
+                      className={cn(
+                        'sticky right-0 z-10 w-28 min-w-28 border-l border-border text-right transition-colors',
+                        mapping.targetAccount ? 'bg-background' : 'bg-destructive/5',
+                        'group-hover:bg-muted/50 group-focus-within:bg-muted/50',
+                      )}
+                    >
+                      {mapping.requiresVatTreatmentReview && !mapping.vatTreatmentReviewed && (
+                        /* Icon-only: the column header carries the label and
+                           the tooltip repeats it on hover; the accessible name
+                           also says which row. */
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon"
+                              className="h-11 w-11 sm:h-8 sm:w-8"
+                              aria-label={`${t('vat_treatment_confirm')}: ${mapping.sourceAccount}`}
+                              onClick={() => onVatTreatmentChange(
+                                mapping.sourceAccount,
+                                mapping.defaultVatTreatment ?? null,
+                                mapping.defaultVatRate ?? null,
+                              )}
+                            >
+                              <Check className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="left">{t('vat_treatment_confirm')}</TooltipContent>
+                        </Tooltip>
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))}
                 {paginatedMappings.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
+                    <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
                       Inga konton matchar filtret
                     </TableCell>
                   </TableRow>
@@ -321,12 +470,54 @@ export default function AccountMappingStep({
         <Button variant="outline" className="min-h-11" onClick={onBack}>
           Tillbaka
         </Button>
-        <Button className="min-h-11" onClick={onContinue} disabled={!canContinue}>
-          {canContinue ? 'Fortsätt till granskning' : `${stats.unmapped} konton saknar mappning`}
-          <ArrowRight className="ml-2 h-4 w-4" />
-        </Button>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          {stats.vatReview > 0 && stats.unmapped === 0 && (
+            <Button
+              variant="outline"
+              className="min-h-11"
+              onClick={onConfirmAllVatTreatments}
+            >
+              <CheckCircle className="mr-2 h-4 w-4" />
+              {t('vat_review_confirm_all', { count: stats.vatReview })}
+            </Button>
+          )}
+          <Button className="min-h-11" onClick={onContinue} disabled={!canContinue}>
+            {canContinue
+              ? 'Fortsätt till granskning'
+              : stats.unmapped > 0
+                ? `${stats.unmapped} konton saknar mappning`
+                : `${stats.vatReview} momskoder återstår att bekräfta`}
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </Button>
+        </div>
       </div>
     </div>
+  )
+}
+
+function TruncatedSourceName({ sourceName }: { sourceName: string }) {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-expanded={open}
+          className="flex min-h-10 w-full min-w-0 items-center rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          onClick={() => setOpen(true)}
+        >
+          <span className="block min-w-0 truncate">{sourceName}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        className="max-w-xs break-words"
+        data-ph-mask=""
+      >
+        {sourceName}
+      </TooltipContent>
+    </Tooltip>
   )
 }
 

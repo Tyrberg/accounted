@@ -10,7 +10,6 @@ import { performCompanySwitch } from '@/lib/company/switch-client'
 import { useToast } from '@/components/ui/use-toast'
 import { SupportLink } from '@/components/ui/support-link'
 import {
-  Building2,
   Check,
   ChevronsUpDown,
   ChevronRight,
@@ -26,8 +25,9 @@ import {
 
 // Community invite (Accounted's Discord). Deliberately a constant, not
 // branding config: self-hosted rebrands can hide or swap it when someone
-// actually asks for that.
-const DISCORD_INVITE_URL = 'https://discord.gg/D9SxtTgvx'
+// actually asks for that. Must be a never-expiring invite: the previous one
+// expired and left logged-in users with a dead link.
+const DISCORD_INVITE_URL = 'https://discord.gg/nfE9Uyv69a'
 
 // Lucide ships no brand marks, so the Discord logo is inlined (simple-icons
 // path, CC0). Sized and colored like the surrounding lucide icons.
@@ -44,6 +44,10 @@ interface UserMenuProps {
   userEmail: string | null
   isSandbox: boolean
   collapsed: boolean
+  // Byrå cockpit (lean sidebar): the cockpit is above the companies, so the
+  // widget shows no active company and no company-switcher flyout; entering
+  // a client happens through the Klienter list instead.
+  cockpitMode?: boolean
   onLogout: () => void
 }
 
@@ -58,6 +62,19 @@ function accountInitial(name: string | null, email: string | null): string {
   return '?'
 }
 
+// Company monogram: first letter in a small rounded square. Square = company,
+// circle = person (the avatar above), so the two identity marks stay distinct.
+function CompanyMark({ name }: { name: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm bg-secondary text-[9px] font-semibold uppercase leading-none text-foreground"
+    >
+      {name.trim().charAt(0) || '?'}
+    </span>
+  )
+}
+
 /**
  * Sticky bottom-of-sidebar user block: avatar initials, name, active company,
  * chevron. Opens an upward popover aligned with the nav column holding
@@ -69,9 +86,10 @@ export default function UserMenu({
   userEmail,
   isSandbox,
   collapsed,
+  cockpitMode = false,
   onLogout,
 }: UserMenuProps) {
-  const { company, companies, isSandbox: companyCtxSandbox } = useCompany()
+  const { company, companies, isSandbox: companyCtxSandbox, foreignCompanies = [] } = useCompany()
   const tNav = useTranslations('nav')
   const tCommon = useTranslations('common')
   const tSwitcher = useTranslations('company_switcher')
@@ -159,7 +177,9 @@ export default function UserMenu({
   }, [open, companiesOpen, close])
 
   const handleSwitch = async (companyId: string) => {
-    if (company && companyId === company.id) {
+    // In the cockpit nothing is "current": picking any company, including the
+    // technically-active one, must enter it (full navigation to its start).
+    if (!cockpitMode && company && companyId === company.id) {
       close()
       return
     }
@@ -181,7 +201,7 @@ export default function UserMenu({
   )
 
   const menuRow =
-    'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-[13px] ' +
+    'flex w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-left text-[13px] ' +
     'text-muted-foreground hover:text-foreground hover:bg-secondary/60 ' +
     'transition-colors duration-150 cursor-pointer'
 
@@ -207,7 +227,7 @@ export default function UserMenu({
               <span className="block truncate text-[13px] font-medium text-foreground leading-tight">
                 {userName?.trim() || userEmail || tNav('mitt_konto')}
               </span>
-              {company && (
+              {company && !cockpitMode && (
                 <span className="block truncate text-[11px] text-muted-foreground leading-tight">
                   {company.name}
                 </span>
@@ -238,7 +258,9 @@ export default function UserMenu({
               </div>
             )}
 
-            {/* Company switcher flyout */}
+            {/* Company switcher flyout. In the cockpit no company reads as
+                active (neutral label, no check mark); picking one enters it
+                like the Klienter list does. */}
             <div className="relative px-1 pt-1">
               <button
                 type="button"
@@ -246,9 +268,11 @@ export default function UserMenu({
                 aria-expanded={companiesOpen}
                 className={cn(menuRow, companiesOpen && 'bg-secondary/60 text-foreground')}
               >
-                <Building2 className="h-4 w-4 flex-shrink-0" />
+                <CompanyMark name={company?.name || tSwitcher('default_company_name')} />
                 <span className="flex-1 truncate">
-                  {company?.name || tSwitcher('default_company_name')}
+                  {cockpitMode
+                    ? tSwitcher('choose_company')
+                    : company?.name || tSwitcher('default_company_name')}
                 </span>
                 <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 opacity-50" />
               </button>
@@ -273,40 +297,64 @@ export default function UserMenu({
                         {tSwitcher('no_results')}
                       </p>
                     )}
-                    {filteredCompanies.map(({ company: c, role }) => (
-                      <button
-                        key={c.id}
-                        onClick={() => handleSwitch(c.id)}
-                        disabled={isPending}
-                        role="option"
-                        aria-selected={c.id === company?.id}
-                        className={cn(
-                          'flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[13px] leading-snug transition-colors',
-                          c.id === company?.id
-                            ? 'bg-secondary/60 text-foreground'
-                            : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
-                          isPending && 'opacity-50',
-                        )}
-                      >
-                        <Building2 className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-                        <span className="min-w-0 flex-1 truncate">{c.name}</span>
-                        {role !== 'owner' && (
-                          <span className="flex-shrink-0 text-[10px] text-muted-foreground/60">
-                            {role}
-                          </span>
-                        )}
-                        {c.id === company?.id && (
-                          <Check className="h-3.5 w-3.5 flex-shrink-0 text-primary" />
-                        )}
-                        {isPending && c.id !== company?.id && (
-                          <Loader2 className="h-3 w-3 flex-shrink-0 animate-spin text-muted-foreground" />
-                        )}
-                      </button>
-                    ))}
+                    {filteredCompanies.map(({ company: c, role }) => {
+                      const isCurrent = !cockpitMode && c.id === company?.id
+                      return (
+                        <button
+                          key={c.id}
+                          onClick={() => handleSwitch(c.id)}
+                          disabled={isPending}
+                          role="option"
+                          aria-selected={isCurrent}
+                          className={cn(
+                            'flex w-full items-center gap-2 rounded-sm px-2.5 py-2 text-left text-[13px] leading-snug transition-colors',
+                            isCurrent
+                              ? 'bg-secondary/60 text-foreground'
+                              : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
+                            isPending && 'opacity-50',
+                          )}
+                        >
+                          <CompanyMark name={c.name} />
+                          <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                          {role !== 'owner' && (
+                            <span className="flex-shrink-0 text-[10px] text-muted-foreground/60">
+                              {role}
+                            </span>
+                          )}
+                          {isCurrent && (
+                            <Check className="h-3.5 w-3.5 flex-shrink-0 text-primary" />
+                          )}
+                          {isPending && !isCurrent && (
+                            <Loader2 className="h-3 w-3 flex-shrink-0 animate-spin text-muted-foreground" />
+                          )}
+                        </button>
+                      )
+                    })}
                   </div>
+                  {/* Companies homed on another domain (home-domain rule,
+                      WL-01): subtle, non-clickable signpost entries. */}
+                  {foreignCompanies.length > 0 && (
+                    <div className="border-t border-border/60 px-1 pt-1">
+                      <p className="px-2.5 pt-1 pb-0.5 text-[10px] font-semibold text-muted-foreground/60 uppercase tracking-[0.08em]">
+                        {tSwitcher('managed_elsewhere')}
+                      </p>
+                      {foreignCompanies.map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="px-2.5 py-1.5 text-[12px] leading-snug text-muted-foreground/60"
+                          aria-disabled="true"
+                        >
+                          <span className="block truncate">{entry.name}</span>
+                          <span className="block truncate text-[10px]">
+                            {tSwitcher('managed_via', { domain: entry.domain })}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {!sandbox && (
                     <div className="border-t border-border/60 px-1 pt-1">
-                      <Link href="/select-company" onClick={close} className={menuRow}>
+                      <Link href="/select-company?choose=1" onClick={close} className={menuRow}>
                         <Plus className="h-4 w-4 flex-shrink-0" />
                         {tSwitcher('add_company')}
                       </Link>
@@ -316,20 +364,32 @@ export default function UserMenu({
               )}
             </div>
 
-            {/* Account links */}
+            {/* Account links. From the cockpit, settings open in byrå scope
+                (?ctx=byra): account-level sections only; Abonnemang is
+                company-scoped and hidden there. */}
             <div className="px-1 pb-1">
-              <Link href="/settings" onClick={close} className={menuRow}>
+              <Link
+                href={cockpitMode ? '/settings/account?ctx=byra' : '/settings'}
+                onClick={close}
+                className={menuRow}
+              >
                 <Settings className="h-4 w-4 flex-shrink-0" />
                 {tNav('settings')}
               </Link>
-              <Link href="/settings/team" onClick={close} className={menuRow}>
+              <Link
+                href={cockpitMode ? '/settings/team?ctx=byra' : '/settings/company#members'}
+                onClick={close}
+                className={menuRow}
+              >
                 <Users className="h-4 w-4 flex-shrink-0" />
                 {tNav('members_roles')}
               </Link>
-              <Link href="/settings/billing" onClick={close} className={menuRow}>
-                <CreditCard className="h-4 w-4 flex-shrink-0" />
-                {tNav('subscription')}
-              </Link>
+              {!cockpitMode && (
+                <Link href="/settings/billing" onClick={close} className={menuRow}>
+                  <CreditCard className="h-4 w-4 flex-shrink-0" />
+                  {tNav('subscription')}
+                </Link>
+              )}
               <div className="my-1 border-t border-border/60" />
               <Link href="/help" onClick={close} className={menuRow}>
                 <HelpCircle className="h-4 w-4 flex-shrink-0" />

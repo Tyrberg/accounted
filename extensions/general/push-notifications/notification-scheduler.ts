@@ -12,6 +12,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { NotificationType } from '@/types'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { NEEDS_DOC_SOURCE_TYPES } from '@/lib/worklist/types'
 import { sendNotificationToUser, readNotificationSettings } from './notification-sender'
 import {
   createTaxDeadlinePayload,
@@ -136,6 +137,9 @@ export async function sendInvoiceNotifications(
   const { data: invoices } = await supabase
     .from('invoices')
     .select('id, user_id, invoice_number, total, currency, due_date, customer:customers(name)')
+    // Proformas, delivery notes and quotes are never receivables: nothing is
+    // due on them, so they get no förfallo push.
+    .eq('document_type', 'invoice')
     .in('status', ['sent', 'overdue'])
     .in('due_date', [in3DaysStr, todayStr, daysAgo3Str, daysAgo7Str])
 
@@ -214,16 +218,12 @@ export async function sendInvoiceNotifications(
 }
 
 /**
- * Source types that require supporting documents (underlag).
+ * Source types that require supporting documents (underlag). Shared source
+ * of truth (lib/worklist/types.ts) so this cron can never disagree with the
+ * worklist badge (skeptic finding on #1881: a hardcoded copy here missed
+ * webshop_order).
  */
-const NEEDS_ATTACHMENT_SOURCE_TYPES = [
-  'manual',
-  'bank_transaction',
-  'supplier_invoice_registered',
-  'supplier_invoice_paid',
-  'supplier_invoice_cash_payment',
-  'import',
-]
+const NEEDS_ATTACHMENT_SOURCE_TYPES = [...NEEDS_DOC_SOURCE_TYPES]
 
 /**
  * Send missing underlag notifications.

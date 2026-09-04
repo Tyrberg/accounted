@@ -45,6 +45,21 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   // notes-only diff on committed entries and rejects anything more, so the
   // op cannot touch booking data even if tampered with.
   set_voucher_note: 'low',
+  // Ignoring a bank transaction flips transactions.is_ignored and nothing
+  // else: no verifikat, no ledger impact, reversible with the same op
+  // (ignored: false). The DB CHECK transactions_is_ignored_no_journal_entry
+  // and the executor's isTransactionBooked() refusal keep it off booked rows,
+  // so the op cannot hide a booking even if tampered with (issue #1661).
+  ignore_transaction: 'low',
+  // Kundorder (sales orders) never book: an order is the non-ledger document
+  // between agreement and invoice. Creating one, moving it through its
+  // header state machine (confirm / cancel / reopen) and registering
+  // delivered quantities write only sales_orders / sales_order_items, no
+  // verifikat and no external side-effect, and all three are re-editable
+  // (cancel is refused while invoices exist, reopen undoes it).
+  create_sales_order: 'low',
+  transition_sales_order: 'low',
+  register_sales_order_delivery: 'low',
 
   // ── Medium: reversible booking ─────────────────────────────────────
   categorize_transaction: 'medium',
@@ -64,6 +79,10 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   // create_invoice: the target has no verifikat yet (isEditableInvoiceDraft
   // is re-checked at commit), so the edit is fully reversible by editing again.
   update_invoice: 'medium',
+  // Creates an unnumbered DRAFT kundfaktura from a confirmed order through
+  // the same builder as create_invoice (nothing is booked or sent at commit;
+  // the draft can be deleted). Same tier as create_invoice.
+  create_invoice_from_sales_order: 'medium',
   // Recurring invoice schedules: the commit only creates/edits the monthly
   // template (nothing is booked or sent at commit time), and the schedule is
   // pausable/deletable before the next cron run. Not 'low' because an
@@ -94,6 +113,8 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   // (BFL 5 kap 6 §) and becomes immutable once the JE is posted. Medium so a
   // human confirms the doc-to-verifikat pairing before it locks.
   link_document_to_voucher: 'medium',
+  // Same rationale as link_document_to_voucher, N rows in one staged op.
+  link_documents_to_vouchers: 'medium',
   // Dimension-only diff on posted lines (verifikat stays immutable), fully
   // audited via dimension_retag_log, but it rewrites reporting history, so
   // it crosses a human at medium.
@@ -110,6 +131,7 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   unlock_period: 'high',
   set_opening_balances: 'high',
   run_year_end: 'high',
+  post_kontantmetod_cutoff: 'high',
   run_currency_revaluation: 'high',
   // Planenlig avskrivning: one journal entry per asset, each independently
   // reversible (storno). Mid-stakes bokslut posting: staged and human-reviewed,
@@ -130,6 +152,11 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   create_supplier_invoice_from_inbox: 'medium',
   credit_invoice: 'high',
   convert_invoice: 'medium',
+  // Removes a DRAFT (never a posted invoice): no booking impact, but both
+  // outcomes are irreversible: an unnumbered draft is hard-deleted (row gone)
+  // and a numbered draft is makulerad, permanently consuming its F-series
+  // number. 'high' so a destructive delete is never auto-committed.
+  delete_draft_invoice: 'high',
 
   // ── Phase 4: arbitrary-line bookkeeping primitives ─────────────────
   // Both accept caller-supplied account/amount/period: unlike
@@ -151,6 +178,15 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   // numbers feed a verifikation) and re-editable until then, but they change
   // a pay outcome: human review at medium, never silent.
   update_payslip_line: 'medium',
+  // Draft-only edit of one employee's per-run base salary; no booking impact
+  // until the run is calculated and booked (both separately staged).
+  set_run_salary: 'medium',
+  // Draft-only header edit (payment_date / voucher_series / notes): freely
+  // re-editable while draft and changes no pay outcome, matching the v1
+  // PATCH's risk: 'low'. A payment_date change clears the roster's
+  // calculation_breakdown so a stale calculation cannot be booked, and the
+  // booking that makes payment_date matter is separately staged at 'high'.
+  update_salary_run: 'low',
   // Absence rows drive sjuklön math and the statutory AGI Frånvarouppgift.
   // Reversible via delete, but not audit-free: medium.
   register_absence: 'medium',
@@ -197,6 +233,38 @@ export const OPERATION_RISK_TIERS: Record<string, RiskLevel> = {
   // invoice_payments row: sits next to link_invoice_voucher semantically;
   // both attach an existing booking to a different entity.
   link_transaction_journal_entry: 'medium',
+  // Account-keyed reconciliation (lib/reconciliation/actions.ts). A match
+  // pairs outside rows with existing verifikat across any reconcilable
+  // account (bank or skattekonto); it writes nothing to the ledger and is
+  // undone by reconciliation_unmatch, so 'medium' like its single-bank-tx
+  // sibling above. Unmatch only clears a pointer: 'low'.
+  reconciliation_match: 'medium',
+  reconciliation_unmatch: 'low',
+  // Sign-off writes the attestation row others rely on (overview, Hem, auditor)
+  // but nothing in the ledger, and reopen undoes it: 'medium'.
+  reconciliation_signoff: 'medium',
+  // Residual booking writes one small verifikat (bank fee / interest /
+  // rounding, capped at RESIDUAL_MAX_AMOUNT) against the bank account and
+  // links the selection: a typed, bounded booking like categorize_transaction,
+  // undone by storno + unmatch, so 'medium' rather than create_voucher's 'high'.
+  reconciliation_residual: 'medium',
+  // Book synced skattekonto rows as posted verifikat: 1630 against the
+  // skattekonto_rules-matched counter account, amounts straight from the
+  // synced Skatteverket data. No caller-supplied lines (the agent passes only
+  // row ids), reversible via storno: same bounded-booking tier as
+  // book_mileage_period, not create_voucher's arbitrary-line 'high'.
+  book_skattekonto_row: 'medium',
+  book_skattekonto_rows: 'medium',
+
+  // ── Körjournal (mileage) ───────────────────────────────────────────
+  // A trip row is pure travel documentation: no booking impact until a
+  // separate book operation. Same tier as create_customer.
+  log_mileage_trip: 'low',
+  // Books one verifikat with fixed lines derived from logged trips (7331 +
+  // whitelisted counter account) at the DB-configured schablon rate: not the
+  // arbitrary-line surface that makes create_voucher 'high'. Reversible via
+  // storno: same tier as post_annual_depreciation.
+  book_mileage_period: 'medium',
 
   // ── Skatteverket filing (PR5) ──────────────────────────────────────
   // External + irreversible once signed. Commit sends the declaration for

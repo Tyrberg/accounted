@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
+import { useCashAccounts, useCompanySettings } from '@/lib/reference-data/hooks'
 import { useTranslations } from 'next-intl'
 import { createClient } from '@/lib/supabase/client'
 import { useCompany } from '@/contexts/CompanyContext'
@@ -25,8 +26,10 @@ import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { applyTemplate } from '@/lib/bookkeeping/template-library'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
 import LineDimensionFields from '@/components/dimensions/LineDimensionFields'
+import DuplicateBookingDialog from '@/components/transactions/DuplicateBookingDialog'
 import { Loader2, FileText, AlertTriangle, Check, Plus, Trash2, Paperclip } from 'lucide-react'
 import type { BookingTemplateLibrary, BookingTemplateLibraryLine } from '@/types'
+import type { BookedDuplicateCandidate } from '@/lib/transactions/booking-duplicate-detection'
 import type { TransactionWithInvoice } from './transaction-types'
 
 interface BulkBookDialogProps {
@@ -85,16 +88,26 @@ export default function BulkBookDialog({
   const [loadingTemplates, setLoadingTemplates] = useState(true)
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
   // null = fetch pending; array = loaded (may be empty on error: falls back to '1930')
-  const [cashAccounts, setCashAccounts] = useState<CashAccount[] | null>(null)
+  // Session-cached (lib/reference-data); null only while the list is still
+  // loading, which the pre-fill below reads as "not resolved yet".
+  const { cashAccounts: cachedCashAccounts, isLoading: cashAccountsLoading } = useCashAccounts()
+  const cashAccounts: CashAccount[] | null = cashAccountsLoading ? null : cachedCashAccounts
+  const { settings: companySettings } = useCompanySettings()
   const [mode, setMode] = useState<Mode>('one_line_per_tx')
   const [description, setDescription] = useState('')
   const [manualLines, setManualLines] = useState<ManualLine[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // Booking-time duplicate guard fired for one of the selected txs
+  // (TRANSACTION_BOOK_POSSIBLE_DUPLICATE): surface the candidate for review
+  // with "Bokför ändå" (re-runs the whole batch with force=true) instead of
+  // dead-ending in a toast. Match/ignore are not offered here: resolving one
+  // row differently belongs on the transaction list, outside the batch.
+  const [duplicateCandidate, setDuplicateCandidate] = useState<BookedDuplicateCandidate | null>(null)
   // Dimension tagging (kostnadsställe/projekt): the pair renders only when
   // company_settings.dimensions_enabled, same gate as JournalEntryForm. One
   // header-level default bag applies to both tabs; the server tags the
   // generated voucher's lines with it.
-  const [dimensionsEnabled, setDimensionsEnabled] = useState(false)
+  const dimensionsEnabled = companySettings?.dimensions_enabled === true
   const [defaultDims, setDefaultDims] = useState<Record<string, string>>({})
 
   // Documents that will inherit onto the new verifikat. Computed from
@@ -140,21 +153,34 @@ export default function BulkBookDialog({
   )
 
   // Load templates when the dialog opens. RLS scopes to user's companies +
-  // system templates; no company_id filter needed.
+  // system templates; no company_id filter needed. Templates the company hid
+  // (booking_template_hidden, per-company opt-in) are excluded like in the
+  // other pickers; if that lookup fails we show everything (safe direction).
   useEffect(() => {
     if (!open || !company) return
+    const companyId = company.id
     let cancelled = false
     async function load() {
       setLoadingTemplates(true)
       try {
-        const { data } = await supabase
-          .from('booking_template_library')
-          .select('*')
-          .eq('is_active', true)
-          .order('is_system', { ascending: false })
-          .order('name', { ascending: true })
+        const [templatesRes, hiddenRes] = await Promise.all([
+          supabase
+            .from('booking_template_library')
+            .select('*')
+            .eq('is_active', true)
+            .order('is_system', { ascending: false })
+            .order('name', { ascending: true }),
+          supabase
+            .from('booking_template_hidden')
+            .select('template_id')
+            .eq('company_id', companyId),
+        ])
         if (cancelled) return
-        setTemplates((data ?? []) as BookingTemplateLibrary[])
+        const hiddenIds = new Set(
+          (hiddenRes.error ? [] : hiddenRes.data ?? []).map((r) => r.template_id as string),
+        )
+        const rows = (templatesRes.data ?? []) as BookingTemplateLibrary[]
+        setTemplates(rows.filter((tpl) => !hiddenIds.has(tpl.id)))
       } finally {
         if (!cancelled) setLoadingTemplates(false)
       }
@@ -165,43 +191,6 @@ export default function BulkBookDialog({
     }
   }, [open, company, supabase])
 
-  // Fetch cash accounts once when the dialog opens so the manual bank-leg
-  // pre-fill can resolve the correct ledger account per transaction.
-  useEffect(() => {
-    if (!open) return
-    setCashAccounts(null)
-    let cancelled = false
-    fetch('/api/cash-accounts')
-      .then((r) => {
-        if (!r.ok) throw new Error(`cash-accounts fetch failed: ${r.status}`)
-        return r.json()
-      })
-      .then((json) => {
-        if (cancelled) return
-        setCashAccounts((json.data ?? []) as CashAccount[])
-      })
-      .catch(() => {
-        // Fall back to empty list: resolveAccount will return '1930'
-        if (!cancelled) setCashAccounts([])
-      })
-    return () => { cancelled = true }
-  }, [open])
-
-  // Company settings gate the dimension affordance (dimensions_enabled).
-  // Fetched once per open; on failure the pair simply stays hidden.
-  useEffect(() => {
-    if (!open) return
-    let cancelled = false
-    fetch('/api/settings')
-      .then((r) => r.json())
-      .then(({ data }) => {
-        if (!cancelled) setDimensionsEnabled(data?.dimensions_enabled === true)
-      })
-      .catch(() => {
-        if (!cancelled) setDimensionsEnabled(false)
-      })
-    return () => { cancelled = true }
-  }, [open])
 
   // Reset state when dialog closes so the next open starts clean.
   useEffect(() => {
@@ -211,7 +200,6 @@ export default function BulkBookDialog({
       setMode('one_line_per_tx')
       setDescription('')
       setManualLines([])
-      setCashAccounts(null)
       setDefaultDims({})
     } else if (sharedDate) {
       // Pre-fill description with a sensible default the user can edit.
@@ -384,8 +372,11 @@ export default function BulkBookDialog({
     ])
   }
 
-  async function handleConfirm() {
+  // `opts` is only ever passed by the duplicate-dialog retry; the footer
+  // button's onClick hands over a click event, which carries no `force`.
+  async function handleConfirm(opts?: { force?: boolean }) {
     if (!canConfirm) return
+    const force = opts?.force === true
     setSubmitting(true)
     try {
       // Build the payload per the active tab. Template path uses the
@@ -410,6 +401,7 @@ export default function BulkBookDialog({
                 line_description: l.line_description ?? undefined,
               })),
               ...defaultDimensions,
+              ...(force ? { force: true } : {}),
             }
           : {
               tx_ids: transactions.map((tx) => tx.id),
@@ -417,6 +409,7 @@ export default function BulkBookDialog({
               mode,
               entry_description: description.trim(),
               ...defaultDimensions,
+              ...(force ? { force: true } : {}),
             }
       const response = await fetch('/api/transactions/bulk-book', {
         method: 'POST',
@@ -425,6 +418,14 @@ export default function BulkBookDialog({
       })
       if (!response.ok) {
         const body = await response.json().catch(() => null)
+        const candidate = body?.error?.details?.candidate as BookedDuplicateCandidate | undefined
+        if (body?.error?.code === 'TRANSACTION_BOOK_POSSIBLE_DUPLICATE' && candidate) {
+          // One of the selected txs already looks booked: open the review
+          // dialog instead of a dead-end toast. "Bokför ändå" re-runs the
+          // batch with force=true.
+          setDuplicateCandidate(candidate)
+          return
+        }
         toast({
           title: t('error_title'),
           description: getErrorMessage(body, { statusCode: response.status }),
@@ -777,7 +778,7 @@ export default function BulkBookDialog({
                   {t('preview_label', { count: previewLines.length })}
                 </Label>
                 {dimensionsEnabled && dimsSummary && (
-                  <Badge variant="secondary" className="font-mono tabular-nums">
+                  <Badge data-ph-mask="" variant="secondary" className="font-mono tabular-nums">
                     {dimsSummary}
                   </Badge>
                 )}
@@ -860,12 +861,28 @@ export default function BulkBookDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
             {t('cancel')}
           </Button>
-          <Button onClick={handleConfirm} disabled={!canConfirm}>
+          <Button onClick={() => handleConfirm()} disabled={!canConfirm}>
             {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             {t('confirm')}
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      {/* Booking-time duplicate guard review. Rendered inside the bulk dialog
+          so cancelling it returns to the batch as-is; "Bokför ändå" re-runs
+          the whole batch with force=true (the server re-detects and records
+          the dismissal in behandlingshistorik). */}
+      {duplicateCandidate && (
+        <DuplicateBookingDialog
+          candidate={duplicateCandidate}
+          processing={submitting}
+          onCancel={() => setDuplicateCandidate(null)}
+          onBookAnyway={() => {
+            setDuplicateCandidate(null)
+            void handleConfirm({ force: true })
+          }}
+        />
+      )}
     </Dialog>
   )
 }

@@ -1,13 +1,20 @@
 import { createServerClient } from '@supabase/ssr'
 import { getEmailService } from '@/lib/email/service'
+import { getSenderForCompany, getBaseUrlForBrand } from '@/lib/email/brand-sender'
+import { resolveInvoiceSender, type InvoiceSenderIdentity } from '@/lib/email/invoice-sender'
 import {
   generateReminderEmailHtml,
   generateReminderEmailText,
   generateReminderEmailSubject,
+  reminderPrincipal,
   getReminderDaysConfig,
   type ReminderDaysConfig,
 } from '@/lib/email/reminder-templates'
 import { calculateLatePaymentInterest } from '@/lib/invoices/late-payment-interest'
+import {
+  hasUsableInvoicePaymentAccount,
+  resolveInvoicePaymentAccount,
+} from '@/lib/invoices/payment-accounts'
 import { createReminderFeeEntry } from '@/lib/bookkeeping/reminder-fee-entries'
 import { createLogger } from '@/lib/logger'
 import type { Invoice, Customer, CompanySettings } from '@/types'
@@ -109,6 +116,7 @@ export async function sendReminder(
   reminderLevel: 1 | 2 | 3,
   actionToken: string,
   surcharges: ReminderSurcharges,
+  sender?: InvoiceSenderIdentity,
 ): Promise<{ success: boolean; error?: string }> {
   const customer = invoice.customer
 
@@ -116,10 +124,28 @@ export async function sendReminder(
     return { success: false, error: 'Customer has no email' }
   }
 
+  // Backstop for direct callers: processOverdueReminders applies this same
+  // gate BEFORE booking the fee and inserting the reminder row. A reminder
+  // with no payment account for the invoice currency would print nothing to
+  // pay to, or (before this gate) the SEK account's IBAN on a EUR invoice.
+  const currency = invoice.currency
+  if (!hasUsableInvoicePaymentAccount(resolveInvoicePaymentAccount(company, currency, invoice.payment_details ?? null), currency)) {
+    log.warn('Skipping reminder: no payment account configured for invoice currency', {
+      invoiceId: invoice.id,
+      invoiceNumber: invoice.invoice_number,
+      currency,
+    })
+    return { success: false, error: `INVOICE_PAYMENT_ACCOUNT_MISSING:${currency}` }
+  }
+
   const daysOverdue = calculateDaysOverdue(invoice.due_date)
 
-  // Build action URL (public page for customer response)
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://app.erp-base.se'
+  // Brand mail (WL-13): the action link points at the company's home domain
+  // and the mail rides the brand's verified sender domain, while the COMPANY
+  // stays the displayed sender exactly as today. No brand = canonical URL
+  // and today's From header.
+  const brandSender = await getSenderForCompany(invoice.company_id)
+  const baseUrl = getBaseUrlForBrand(brandSender.brand)
   const actionUrl = `${baseUrl}/invoice-action/${actionToken}`
 
   const emailData = {
@@ -138,7 +164,11 @@ export async function sendReminder(
     html: generateReminderEmailHtml(emailData),
     text: generateReminderEmailText(emailData),
     replyTo: company.email || undefined,
-    fromName: company.company_name || undefined
+    fromName: company.company_name || undefined,
+    ...(brandSender.fromAddress ? { fromAddress: brandSender.fromAddress } : {}),
+    // The company's own verified sender wins over the brand address
+    // (buildFromHeader gives `from` precedence).
+    from: sender,
   })
 
   return result
@@ -168,6 +198,10 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
       credit_notes:invoices!credited_invoice_id(id, status, creation_complete)
     `)
     .in('status', ['sent', 'overdue'])
+    // Only fakturor are payment requests. A sent proforma or quote past its
+    // date is not overdue and must never receive a betalningspåminnelse or
+    // be flipped to 'overdue' below.
+    .eq('document_type', 'invoice')
     .is('credited_invoice_id', null)
     .lte('due_date', cutoffDate.toISOString().split('T')[0])
     .order('due_date', { ascending: true })
@@ -263,6 +297,35 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
       continue
     }
 
+    // Payment-account gate, BEFORE any write: the fee journal entry and the
+    // invoice_reminders row below must not exist for a reminder that never
+    // goes out (that would book a 60 kr fee and burn the level for an email
+    // the customer never got). Same rule as invoice send: no usable account
+    // for the invoice currency means no reminder until the user configures
+    // one under Inställningar; the level stays open and fires next run.
+    const invoiceCurrency = invoice.currency
+    if (
+      !hasUsableInvoicePaymentAccount(
+        resolveInvoicePaymentAccount(company as CompanySettings, invoiceCurrency, invoice.payment_details ?? null),
+        invoiceCurrency,
+      )
+    ) {
+      log.warn('Skipping reminder: no payment account configured for invoice currency', {
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoice_number,
+        currency: invoiceCurrency,
+      })
+      results.push({
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoice_number,
+        customerEmail: customer.email,
+        reminderLevel,
+        success: false,
+        error: `INVOICE_PAYMENT_ACCOUNT_MISSING:${invoiceCurrency}`,
+      })
+      continue
+    }
+
     // Race-window guard: re-check invoice status immediately before sending.
     // The cron runs at 08:00; a payment match arriving during the run shouldn't
     // produce a reminder for an already-paid invoice.
@@ -291,8 +354,11 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
     // Compute statutory late-payment interest (Räntelagen §6) using the
     // company override if set, else Riksbankens referensränta + 8 pp.
     const asOfDate = new Date().toISOString().split('T')[0]
+    // Interest accrues on what the customer actually owes: the invoice's
+    // "Att betala" (öre-rounded total minus any ROT/RUT-avdrag), never on the
+    // Skatteverket share sitting on 1513.
     const interest = calculateLatePaymentInterest({
-      overdueAmount: invoice.total,
+      overdueAmount: reminderPrincipal(invoice as Invoice, company as CompanySettings),
       dueDate: invoice.due_date,
       asOfDate,
       overrideRate: company.reminder_interest_rate_override,
@@ -381,6 +447,7 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
         interestDays: interest.days,
         reminderFee,
       },
+      await resolveInvoiceSender(supabase, invoice.company_id, company.company_name),
     )
 
     if (sendResult.success) {

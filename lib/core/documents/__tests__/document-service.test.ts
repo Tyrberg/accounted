@@ -29,10 +29,16 @@ function makeClient(storageOverrides: Record<string, unknown> = {}) {
       createBucket: vi.fn().mockResolvedValue({ data: { name: 'documents' }, error: null }),
       from: vi.fn().mockReturnValue({
         upload: vi.fn().mockResolvedValue({ data: {}, error: null }),
+        createSignedUploadUrl: vi.fn().mockResolvedValue({
+          data: { signedUrl: 'https://example.com/signed-upload' },
+          error: null,
+        }),
         download: vi.fn().mockResolvedValue({
           data: new Blob(['test content']),
           error: null,
         }),
+        list: vi.fn().mockResolvedValue({ data: [], error: null }),
+        move: vi.fn().mockResolvedValue({ data: {}, error: null }),
         remove: vi.fn().mockResolvedValue({ data: [], error: null }),
         getPublicUrl: vi.fn().mockReturnValue({
           data: { publicUrl: 'https://example.com/file.pdf' },
@@ -57,8 +63,18 @@ import {
   createNewVersion,
   deleteDocument,
   verifyIntegrity,
+  detectFileMagic,
   validateDocumentMagicBytes,
   buildDocumentStoragePath,
+  buildPendingDocumentStoragePath,
+  buildReservedDocumentStoragePath,
+  cleanupExpiredPendingDocumentUploads,
+  createPendingDocumentUpload,
+  completePendingDocumentUpload,
+  computeSHA256,
+  resolveStoredMimeType,
+  PENDING_DOCUMENT_UPLOAD_RETENTION_MS,
+  SIGNED_DOCUMENT_UPLOAD_TTL_MS,
   isCompanyScopedDocumentPath,
   companyScopedDocumentPath,
   legacyDocumentPath,
@@ -127,6 +143,33 @@ describe('validateDocumentMagicBytes: application/xhtml+xml', () => {
     )
     // And a real PDF still passes as PDF.
     expect(validateDocumentMagicBytes(pdfBuffer(), 'application/pdf')).toBeNull()
+  })
+})
+
+describe('validateDocumentMagicBytes: text/html', () => {
+  const toBuffer = (text: string): ArrayBuffer => {
+    const bytes = new TextEncoder().encode(text)
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  }
+
+  it('accepts a full HTML document (mail-body underlag from the invoice inbox)', () => {
+    expect(
+      validateDocumentMagicBytes(toBuffer('<!doctype html>\n<html><body>Faktura 123</body></html>'), 'text/html'),
+    ).toBeNull()
+    expect(
+      validateDocumentMagicBytes(toBuffer('<html><body>x</body></html>'), 'text/html'),
+    ).toBeNull()
+  })
+
+  it('rejects fragment-shaped or plain-text content', () => {
+    // The inbound pipeline wraps fragments before upload: an unwrapped
+    // fragment reaching the document service is a caller bug.
+    expect(validateDocumentMagicBytes(toBuffer('<div>Faktura 123</div>'), 'text/html')).toMatch(
+      /kunde inte verifieras/,
+    )
+    expect(validateDocumentMagicBytes(toBuffer('just some text'), 'text/html')).toMatch(
+      /kunde inte verifieras/,
+    )
   })
 })
 
@@ -232,6 +275,59 @@ describe('validateDocumentMagicBytes: PDF header offset tolerance', () => {
   })
 })
 
+describe('validateDocumentMagicBytes: HEIC/HEIF (ISO-BMFF ftyp brands)', () => {
+  // Minimal ISO-BMFF head: a 16-byte ftyp box whose major brand is `brand`.
+  // Real files carry compatible brands and media data after this, but the
+  // detector only reads the first 12 bytes.
+  const isoBmff = (brand: string): ArrayBuffer => {
+    const bytes = new Uint8Array(16)
+    bytes[3] = 16 // box size (big-endian 0x00000010)
+    bytes.set([0x66, 0x74, 0x79, 0x70], 4) // 'ftyp'
+    bytes.set(new TextEncoder().encode(brand), 8)
+    return bytes.buffer as ArrayBuffer
+  }
+  const jpegBytes = (): ArrayBuffer =>
+    new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46]).buffer as ArrayBuffer
+
+  it('detects HEVC-coded brands as image/heic and MIAF brands as image/heif', () => {
+    for (const brand of ['heic', 'heix', 'heim', 'heis', 'hevc', 'hevx', 'hevm', 'hevs']) {
+      expect(detectFileMagic(new Uint8Array(isoBmff(brand)))).toBe('image/heic')
+    }
+    for (const brand of ['mif1', 'msf1']) {
+      expect(detectFileMagic(new Uint8Array(isoBmff(brand)))).toBe('image/heif')
+    }
+    // Other ISO-BMFF brands (video containers) stay undetected.
+    expect(detectFileMagic(new Uint8Array(isoBmff('isom')))).toBeNull()
+    expect(detectFileMagic(new Uint8Array(isoBmff('qt  ')))).toBeNull()
+  })
+
+  it('accepts a heic-brand file under both declared family members', () => {
+    expect(validateDocumentMagicBytes(isoBmff('heic'), 'image/heic')).toBeNull()
+    expect(validateDocumentMagicBytes(isoBmff('heic'), 'image/heif')).toBeNull()
+  })
+
+  it('accepts a mif1-brand file under both declared family members', () => {
+    expect(validateDocumentMagicBytes(isoBmff('mif1'), 'image/heif')).toBeNull()
+    expect(validateDocumentMagicBytes(isoBmff('mif1'), 'image/heic')).toBeNull()
+  })
+
+  it('rejects garbage bytes declared image/heic (formerly blanket-exempted)', () => {
+    const garbage = new TextEncoder().encode('this is not an image at all')
+    const buffer = garbage.buffer.slice(garbage.byteOffset, garbage.byteOffset + garbage.byteLength) as ArrayBuffer
+    expect(validateDocumentMagicBytes(buffer, 'image/heic')).toMatch(/kunde inte verifieras/)
+    expect(validateDocumentMagicBytes(buffer, 'image/heif')).toMatch(/kunde inte verifieras/)
+  })
+
+  it('rejects JPEG bytes declared image/heic as a type mismatch', () => {
+    expect(validateDocumentMagicBytes(jpegBytes(), 'image/heic')).toMatch(/matchar inte/)
+  })
+
+  it('does not loosen validation for other declared types', () => {
+    // HEIC bytes declared as JPEG must still be rejected as a mismatch.
+    expect(validateDocumentMagicBytes(isoBmff('heic'), 'image/jpeg')).toMatch(/matchar inte/)
+  })
+})
+
 describe('uploadDocument', () => {
   it('computes SHA-256 hash, stores metadata, emits document.uploaded', async () => {
     const doc = makeDocumentAttachment({
@@ -264,6 +360,72 @@ describe('uploadDocument', () => {
         companyId: 'company-1',
       })
     )
+  })
+
+  it('returns the existing document instead of storing a copy when dedupeByContent hits', async () => {
+    const existing = makeDocumentAttachment({ id: 'doc-orig', sha256_hash: 'same' })
+    results = [
+      { data: [existing], error: null }, // dedupe lookup
+    ]
+
+    const handler = vi.fn()
+    eventBus.on('document.uploaded', handler)
+
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const supabase = makeClient({ upload })
+    const result = await uploadDocument(supabase as never, 'user-1', 'company-1', {
+      name: 'kvitto.pdf',
+      buffer: pdfBuffer(),
+      type: 'application/pdf',
+    }, { dedupeByContent: true })
+
+    expect(result.id).toBe('doc-orig')
+    expect(result.deduplicated).toBe(true)
+    // Nothing reaches storage and no document.uploaded fires: the archive
+    // already holds this content, so re-extraction must not run either.
+    expect(upload).not.toHaveBeenCalled()
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('rejects when the dedupe lookup itself fails, touching nothing', async () => {
+    // Fail closed: treating a broken lookup as "no match" would archive the
+    // duplicate the flag exists to prevent, silently, on transient DB errors.
+    results = [{ data: null, error: { message: 'connection reset' } }]
+
+    const handler = vi.fn()
+    eventBus.on('document.uploaded', handler)
+
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const supabase = makeClient({ upload })
+
+    await expect(
+      uploadDocument(supabase as never, 'user-1', 'company-1', {
+        name: 'kvitto.pdf',
+        buffer: pdfBuffer(),
+        type: 'application/pdf',
+      }, { dedupeByContent: true }),
+    ).rejects.toThrow(/dedupe lookup failed/i)
+    expect(upload).not.toHaveBeenCalled()
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('stores normally when dedupeByContent finds no match', async () => {
+    results = [
+      { data: [], error: null }, // dedupe lookup: miss
+      { data: makeDocumentAttachment({ id: 'doc-new' }), error: null }, // insert
+    ]
+
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const supabase = makeClient({ upload })
+    const result = await uploadDocument(supabase as never, 'user-1', 'company-1', {
+      name: 'kvitto.pdf',
+      buffer: pdfBuffer(),
+      type: 'application/pdf',
+    }, { dedupeByContent: true })
+
+    expect(result.id).toBe('doc-new')
+    expect(result.deduplicated).toBeUndefined()
+    expect(upload).toHaveBeenCalledOnce()
   })
 
   it('writes to the company-scoped key, not the legacy uploader-scoped key', async () => {
@@ -309,6 +471,415 @@ describe('uploadDocument', () => {
     const uploadedKey = upload.mock.calls[0]![0] as string
     expect(serviceRemove).toHaveBeenCalledWith([uploadedKey])
     expect(callerRemove).not.toHaveBeenCalled()
+  })
+
+  it('coalesces concurrent idempotent uploads on one immutable document row', async () => {
+    const rows = new Map<string, ReturnType<typeof makeDocumentAttachment>>()
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const serviceRemove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({ remove: serviceRemove })
+
+    let arrivals = 0
+    let releaseInserts = () => {}
+    const insertBarrier = new Promise<void>((resolve) => {
+      releaseInserts = resolve
+    })
+
+    const client = {
+      from: vi.fn(() => {
+        let insertPayload: Record<string, unknown> | null = null
+        let queriedId = ''
+        const builder: Record<string, unknown> = {}
+        builder.insert = vi.fn((payload: Record<string, unknown>) => {
+          insertPayload = payload
+          return builder
+        })
+        builder.select = vi.fn(() => builder)
+        builder.eq = vi.fn((column: string, value: string) => {
+          if (column === 'id') queriedId = value
+          return builder
+        })
+        builder.single = vi.fn(async () => {
+          arrivals++
+          if (arrivals === 2) releaseInserts()
+          await insertBarrier
+          const payload = insertPayload as Record<string, unknown>
+          const id = payload.id as string
+          if (rows.has(id)) {
+            return { data: null, error: { code: '23505', message: 'duplicate key' } }
+          }
+          const row = makeDocumentAttachment(payload)
+          rows.set(id, row)
+          return { data: row, error: null }
+        })
+        builder.maybeSingle = vi.fn(async () => ({
+          data: rows.get(queriedId) ?? null,
+          error: null,
+        }))
+        return builder
+      }),
+      storage: {
+        getBucket: vi.fn().mockResolvedValue({ data: { id: 'documents' }, error: null }),
+        createBucket: vi.fn().mockResolvedValue({ data: { name: 'documents' }, error: null }),
+        from: vi.fn().mockReturnValue({ upload }),
+      },
+    }
+
+    const handler = vi.fn()
+    eventBus.on('document.uploaded', handler)
+    const file = {
+      name: 'kvitto.pdf',
+      buffer: pdfBuffer('same retained receipt'),
+      type: 'application/pdf',
+    }
+    const metadata = {
+      upload_source: 'api' as const,
+      journal_entry_id: 'je-1',
+      idempotency_key: 'je-1',
+    }
+
+    const documents = await Promise.all([
+      uploadDocument(client as never, 'user-1', 'company-1', file, metadata),
+      uploadDocument(client as never, 'user-1', 'company-1', file, metadata),
+    ])
+
+    expect(documents[0].id).toBe(documents[1].id)
+    expect(rows.size).toBe(1)
+    expect(upload).toHaveBeenCalledTimes(2)
+    expect(upload.mock.calls[0]![0]).not.toBe(upload.mock.calls[1]![0])
+    expect(serviceRemove).toHaveBeenCalledTimes(1)
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not treat a non-unique insert error as an idempotent winner', async () => {
+    results = [
+      { data: null, error: { code: '42501', message: 'row-level security denied' } },
+    ]
+    const serviceRemove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({ remove: serviceRemove })
+    const supabase = makeClient()
+
+    await expect(
+      uploadDocument(
+        supabase as never,
+        'user-1',
+        'company-1',
+        {
+          name: 'kvitto.pdf',
+          buffer: pdfBuffer('retained receipt'),
+          type: 'application/pdf',
+        },
+        { journal_entry_id: 'je-1', idempotency_key: 'je-1' },
+      ),
+    ).rejects.toThrow('Failed to create document record: row-level security denied')
+
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+    expect(serviceRemove).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('model-free signed document uploads', () => {
+  const company = '11111111-1111-4111-8111-111111111111'
+  const user = '22222222-2222-4222-8222-222222222222'
+  const uploadId = '33333333-3333-4333-8333-333333333333'
+
+  it('creates a company-scoped signed upload reservation with a two-hour expiry', async () => {
+    const now = Date.parse('2026-08-03T10:00:00.000Z')
+    const createSignedUploadUrl = vi.fn().mockResolvedValue({
+      data: { signedUrl: 'https://storage.example/upload?token=signed' },
+      error: null,
+    })
+    const supabase = makeClient({ createSignedUploadUrl })
+
+    const reservation = await createPendingDocumentUpload(
+      supabase as never,
+      company,
+      user,
+      uploadId,
+      'Leverantör faktura.pdf',
+      now,
+    )
+
+    expect(createSignedUploadUrl).toHaveBeenCalledWith(
+      `documents/${company}/${user}/pending/${uploadId}_Leverant_r_faktura.pdf`,
+      { upsert: false },
+    )
+    expect(reservation).toEqual({
+      uploadId,
+      signedUrl: 'https://storage.example/upload?token=signed',
+      expiresAt: new Date(now + SIGNED_DOCUMENT_UPLOAD_TTL_MS).toISOString(),
+    })
+  })
+
+  it('adopts uploaded bytes under the reserved UUID and permanent WORM path', async () => {
+    const buffer = pdfBuffer('presigned upload')
+    const document = makeDocumentAttachment({
+      id: uploadId,
+      user_id: user,
+      company_id: company,
+      file_name: 'invoice.pdf',
+      mime_type: 'application/pdf',
+      storage_path: buildReservedDocumentStoragePath(company, user, uploadId, 'invoice.pdf'),
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [
+      { data: null, error: null },
+      { data: document, error: null },
+    ]
+
+    const move = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const download = vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null })
+    serviceClientOverride = makeClient({ download, move })
+
+    const completed = await completePendingDocumentUpload(
+      makeClient() as never,
+      company,
+      user,
+      uploadId,
+      'invoice.pdf',
+      'application/pdf',
+    )
+
+    expect(completed.document.id).toBe(uploadId)
+    expect(move).toHaveBeenCalledWith(
+      buildPendingDocumentStoragePath(company, user, uploadId, 'invoice.pdf'),
+      buildReservedDocumentStoragePath(company, user, uploadId, 'invoice.pdf'),
+    )
+  })
+
+  it('returns the existing immutable document on retry after verifying its hash', async () => {
+    const buffer = pdfBuffer('already complete')
+    const document = makeDocumentAttachment({
+      id: uploadId,
+      user_id: user,
+      company_id: company,
+      file_name: 'invoice.pdf',
+      mime_type: 'application/pdf',
+      storage_path: buildReservedDocumentStoragePath(company, user, uploadId, 'invoice.pdf'),
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [{ data: document, error: null }]
+
+    const move = vi.fn().mockResolvedValue({ data: {}, error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+      move,
+    })
+
+    const completed = await completePendingDocumentUpload(
+      makeClient() as never,
+      company,
+      user,
+      uploadId,
+      'invoice.pdf',
+      'application/pdf',
+    )
+
+    expect(completed.document).toEqual(document)
+    expect(move).not.toHaveBeenCalled()
+  })
+
+  it('removes corrupt pending bytes before rejecting completion', async () => {
+    results = [{ data: null, error: null }]
+    const pendingPath = buildPendingDocumentStoragePath(company, user, uploadId, 'invoice.pdf')
+    const remove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob(['not a pdf']), error: null }),
+      remove,
+    })
+
+    await expect(
+      completePendingDocumentUpload(
+        makeClient() as never,
+        company,
+        user,
+        uploadId,
+        'invoice.pdf',
+        'application/pdf',
+      ),
+    ).rejects.toMatchObject({
+      code: 'DOC_UPLOAD_INVALID_CONTENT',
+      message: expect.stringMatching(/kunde inte verifieras/),
+      messageSv: expect.stringMatching(/kunde inte verifieras/),
+    })
+    expect(remove).toHaveBeenCalledWith([pendingPath])
+  })
+
+  it('codes an empty pending object as DOC_UPLOAD_EMPTY and removes it', async () => {
+    results = [{ data: null, error: null }]
+    const pendingPath = buildPendingDocumentStoragePath(company, user, uploadId, 'invoice.pdf')
+    const remove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([]), error: null }),
+      remove,
+    })
+
+    await expect(
+      completePendingDocumentUpload(makeClient() as never, company, user, uploadId, 'invoice.pdf', 'application/pdf'),
+    ).rejects.toMatchObject({ code: 'DOC_UPLOAD_EMPTY' })
+    expect(remove).toHaveBeenCalledWith([pendingPath])
+  })
+
+  // The insert payload of a completion: from() call #0 is findReservedDocument,
+  // #1 the insert (no dedupe lookup in between unless opted in).
+  function insertPayloadOf(client: ReturnType<typeof makeClient>, fromIndex: number) {
+    const builder = client.from.mock.results[fromIndex]?.value as { insert: ReturnType<typeof vi.fn> }
+    return builder.insert.mock.calls[0]?.[0] as Record<string, unknown> | undefined
+  }
+
+  it("stamps upload_source 'api' by default (the MCP tools' provenance)", async () => {
+    const buffer = pdfBuffer('api upload')
+    const document = makeDocumentAttachment({ id: uploadId, sha256_hash: await computeSHA256(buffer) })
+    results = [
+      { data: null, error: null },
+      { data: document, error: null },
+    ]
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+    })
+    const client = makeClient()
+
+    await completePendingDocumentUpload(client as never, company, user, uploadId, 'invoice.pdf', 'application/pdf')
+
+    expect(insertPayloadOf(client, 1)?.upload_source).toBe('api')
+  })
+
+  it("stamps upload_source 'file_upload' for the browser direct-to-storage path", async () => {
+    const buffer = pdfBuffer('browser upload')
+    const document = makeDocumentAttachment({ id: uploadId, sha256_hash: await computeSHA256(buffer) })
+    results = [
+      { data: null, error: null },
+      { data: document, error: null },
+    ]
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+    })
+    const client = makeClient()
+
+    await completePendingDocumentUpload(
+      client as never,
+      company,
+      user,
+      uploadId,
+      'invoice.pdf',
+      'application/pdf',
+      undefined,
+      { uploadSource: 'file_upload' },
+    )
+
+    expect(insertPayloadOf(client, 1)?.upload_source).toBe('file_upload')
+    // No content-dedupe lookup unless asked for: exactly two from() calls.
+    expect(client.from).toHaveBeenCalledTimes(2)
+  })
+
+  it('opt-in content dedupe returns the existing document and removes the pending object', async () => {
+    const buffer = pdfBuffer('already archived')
+    const existingId = '55555555-5555-4555-8555-555555555555'
+    const existing = makeDocumentAttachment({
+      id: existingId,
+      company_id: company,
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [
+      { data: null, error: null }, // findReservedDocument
+      { data: [existing], error: null }, // dedupe lookup
+    ]
+    const move = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const remove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+      move,
+      remove,
+    })
+    const client = makeClient()
+
+    const completed = await completePendingDocumentUpload(
+      client as never,
+      company,
+      user,
+      uploadId,
+      'invoice.pdf',
+      'application/pdf',
+      undefined,
+      { dedupeByContent: true },
+    )
+
+    expect(completed.document.id).toBe(existingId)
+    expect(completed.document.deduplicated).toBe(true)
+    expect(remove).toHaveBeenCalledWith([buildPendingDocumentStoragePath(company, user, uploadId, 'invoice.pdf')])
+    expect(move).not.toHaveBeenCalled()
+    // findReservedDocument + dedupe lookup, and never an insert
+    expect(client.from).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the SQLSTATE on a rejected document insert so callers can map an RLS denial', async () => {
+    const buffer = pdfBuffer('viewer upload')
+    results = [
+      { data: null, error: null }, // findReservedDocument
+      {
+        data: null,
+        error: {
+          code: '42501',
+          message: 'new row violates row-level security policy for table "document_attachments"',
+        },
+      },
+      { data: null, error: null }, // concurrent-completion check
+    ]
+    const remove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+      remove,
+    })
+
+    await expect(
+      completePendingDocumentUpload(makeClient() as never, company, user, uploadId, 'invoice.pdf', 'application/pdf'),
+    ).rejects.toMatchObject({ code: '42501' })
+    // The moved object is taken back out: no row, no orphan.
+    expect(remove).toHaveBeenCalledWith([buildReservedDocumentStoragePath(company, user, uploadId, 'invoice.pdf')])
+  })
+
+  it('codes a missing or expired reservation as DOCUMENT_UPLOAD_NOT_FOUND', async () => {
+    results = [{ data: null, error: null }]
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: null, error: { message: 'Object not found' } }),
+    })
+
+    await expect(
+      completePendingDocumentUpload(makeClient() as never, company, user, uploadId, 'invoice.pdf', 'application/pdf'),
+    ).rejects.toMatchObject({ code: 'DOCUMENT_UPLOAD_NOT_FOUND' })
+  })
+
+  it('cleans only expired pending objects in a bounded company and user prefix', async () => {
+    const now = Date.parse('2026-08-03T10:00:00.000Z')
+    const remove = vi.fn().mockResolvedValue({ data: [], error: null })
+    const list = vi.fn().mockResolvedValue({
+      data: [
+        {
+          id: 'old-object',
+          name: `${uploadId}_old.pdf`,
+          created_at: new Date(now - PENDING_DOCUMENT_UPLOAD_RETENTION_MS - 1).toISOString(),
+        },
+        {
+          id: 'new-object',
+          name: `${uploadId}_new.pdf`,
+          created_at: new Date(now - 60_000).toISOString(),
+        },
+      ],
+      error: null,
+    })
+    serviceClientOverride = makeClient({ list, remove })
+
+    const removed = await cleanupExpiredPendingDocumentUploads(company, user, now)
+
+    expect(list).toHaveBeenCalledWith(`documents/${company}/${user}/pending`, {
+      limit: 100,
+      offset: 0,
+      sortBy: { column: 'created_at', order: 'asc' },
+    })
+    expect(remove).toHaveBeenCalledWith([
+      `documents/${company}/${user}/pending/${uploadId}_old.pdf`,
+    ])
+    expect(removed).toBe(1)
   })
 })
 
@@ -423,6 +994,16 @@ describe('storage key layout helpers', () => {
     )
     expect(buildDocumentStoragePath(company, user, 'faktura 2026-05.pdf', 1700000000000)).toBe(
       `documents/${company}/${user}/1700000000000_faktura_2026-05.pdf`,
+    )
+  })
+
+  it('builds deterministic pending and permanent keys for a reserved upload', () => {
+    const uploadId = '33333333-3333-4333-8333-333333333333'
+    expect(buildPendingDocumentStoragePath(company, user, uploadId, 'faktura 1.pdf')).toBe(
+      `documents/${company}/${user}/pending/${uploadId}_faktura_1.pdf`,
+    )
+    expect(buildReservedDocumentStoragePath(company, user, uploadId, 'faktura 1.pdf')).toBe(
+      `documents/${company}/${user}/${uploadId}_faktura_1.pdf`,
     )
   })
 
@@ -661,5 +1242,172 @@ describe('verifyIntegrity', () => {
     expect(result.valid).toBe(false)
     expect(result.storedHash).toBe('stored-hash-abc')
     expect(result.computedHash).not.toBe('stored-hash-abc')
+  })
+})
+
+describe('validated mime type persistence (stored type is what the bytes are)', () => {
+  const company = '11111111-1111-4111-8111-111111111111'
+  const user = '22222222-2222-4222-8222-222222222222'
+  const uploadId = '33333333-3333-4333-8333-333333333333'
+
+  // 16-byte ISO-BMFF ftyp box with the given major brand (see the HEIC tests).
+  const isoBmff = (brand: string): ArrayBuffer => {
+    const bytes = new Uint8Array(16)
+    bytes[3] = 16
+    bytes.set([0x66, 0x74, 0x79, 0x70], 4)
+    bytes.set(new TextEncoder().encode(brand), 8)
+    return bytes.buffer as ArrayBuffer
+  }
+  const pngBytes = (): ArrayBuffer =>
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer as ArrayBuffer
+  const textBytes = (text: string): ArrayBuffer => {
+    const bytes = new TextEncoder().encode(text)
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  }
+
+  function insertPayloadOf(client: ReturnType<typeof makeClient>, fromIndex: number) {
+    const builder = client.from.mock.results[fromIndex]?.value as { insert: ReturnType<typeof vi.fn> }
+    return builder.insert.mock.calls[0]?.[0] as Record<string, unknown> | undefined
+  }
+
+  describe('resolveStoredMimeType', () => {
+    it('returns the sniffed type for binary formats, including the HEIC/HEIF family swap', () => {
+      expect(resolveStoredMimeType(pdfBuffer(), 'application/pdf')).toBe('application/pdf')
+      expect(resolveStoredMimeType(pngBytes(), 'image/png')).toBe('image/png')
+      expect(resolveStoredMimeType(isoBmff('heic'), 'image/heif')).toBe('image/heic')
+      expect(resolveStoredMimeType(isoBmff('mif1'), 'image/heic')).toBe('image/heif')
+    })
+
+    it('keeps the declared type for the shape-checked text formats (no magic number)', () => {
+      expect(resolveStoredMimeType(textBytes('<?xml version="1.0"?><Invoice/>'), 'application/xml')).toBe('application/xml')
+      expect(resolveStoredMimeType(textBytes('<?xml version="1.0"?><Invoice/>'), 'text/xml')).toBe('text/xml')
+      expect(resolveStoredMimeType(textBytes('<!doctype html><html></html>'), 'text/html')).toBe('text/html')
+      expect(resolveStoredMimeType(textBytes('<?xml version="1.0"?><html/>'), 'application/xhtml+xml')).toBe('application/xhtml+xml')
+      expect(resolveStoredMimeType(textBytes('{"a":1}'), 'application/json')).toBe('application/json')
+    })
+
+    it('sniffs an undeclared type and stores null rather than an unverified string', () => {
+      expect(resolveStoredMimeType(pdfBuffer(), undefined)).toBe('application/pdf')
+      expect(resolveStoredMimeType(pdfBuffer(), '')).toBe('application/pdf')
+      expect(resolveStoredMimeType(textBytes('just text'), undefined)).toBeNull()
+    })
+  })
+
+  it('uploadDocument stores and stamps the sniffed type, not the declared one', async () => {
+    results = [{ data: makeDocumentAttachment({ id: 'doc-1' }), error: null }]
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const client = makeClient({ upload })
+
+    await uploadDocument(client as never, 'user-1', 'company-1', {
+      name: 'IMG_0001.heif',
+      buffer: isoBmff('heic'),
+      type: 'image/heif',
+    })
+
+    expect(insertPayloadOf(client, 0)?.mime_type).toBe('image/heic')
+    expect((upload.mock.calls[0]?.[2] as { contentType: string }).contentType).toBe('image/heic')
+  })
+
+  it('uploadDocument sniffs an undeclared type instead of storing null for a real PDF', async () => {
+    results = [{ data: makeDocumentAttachment({ id: 'doc-1' }), error: null }]
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const client = makeClient({ upload })
+
+    await uploadDocument(client as never, 'user-1', 'company-1', {
+      name: 'kvitto.pdf',
+      buffer: pdfBuffer('undeclared'),
+    })
+
+    expect(insertPayloadOf(client, 0)?.mime_type).toBe('application/pdf')
+    expect((upload.mock.calls[0]?.[2] as { contentType: string }).contentType).toBe('application/pdf')
+  })
+
+  it('completePendingDocumentUpload persists the sniffed type', async () => {
+    const buffer = isoBmff('heic')
+    const document = makeDocumentAttachment({
+      id: uploadId,
+      mime_type: 'image/heic',
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [
+      { data: null, error: null },
+      { data: document, error: null },
+    ]
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+    })
+    const client = makeClient()
+
+    await completePendingDocumentUpload(client as never, company, user, uploadId, 'IMG_0001.heif', 'image/heif')
+
+    expect(insertPayloadOf(client, 1)?.mime_type).toBe('image/heic')
+  })
+
+  it('completePendingDocumentUpload retry accepts the stored family member for the declared one', async () => {
+    const buffer = isoBmff('heic')
+    const document = makeDocumentAttachment({
+      id: uploadId,
+      user_id: user,
+      company_id: company,
+      file_name: 'IMG_0001.heif',
+      mime_type: 'image/heic',
+      storage_path: buildReservedDocumentStoragePath(company, user, uploadId, 'IMG_0001.heif'),
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [{ data: document, error: null }]
+    const move = vi.fn().mockResolvedValue({ data: {}, error: null })
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+      move,
+    })
+
+    const completed = await completePendingDocumentUpload(
+      makeClient() as never,
+      company,
+      user,
+      uploadId,
+      'IMG_0001.heif',
+      'image/heif',
+    )
+
+    expect(completed.document).toEqual(document)
+    expect(move).not.toHaveBeenCalled()
+  })
+
+  it('completePendingDocumentUpload retry still rejects a genuinely different stored type', async () => {
+    const buffer = isoBmff('heic')
+    const document = makeDocumentAttachment({
+      id: uploadId,
+      file_name: 'IMG_0001.heif',
+      mime_type: 'image/jpeg',
+      sha256_hash: await computeSHA256(buffer),
+    })
+    results = [{ data: document, error: null }]
+    serviceClientOverride = makeClient({
+      download: vi.fn().mockResolvedValue({ data: new Blob([buffer]), error: null }),
+    })
+
+    await expect(
+      completePendingDocumentUpload(makeClient() as never, company, user, uploadId, 'IMG_0001.heif', 'image/heif'),
+    ).rejects.toThrow(/different file metadata/)
+  })
+
+  it('createNewVersion passes the sniffed type to the versioning RPC and the storage object', async () => {
+    results = [
+      { data: { company_id: 'company-1' }, error: null },
+      { data: 'doc-2', error: null },
+      { data: makeDocumentAttachment({ id: 'doc-2', version: 2 }), error: null },
+    ]
+    const upload = vi.fn().mockResolvedValue({ data: {}, error: null })
+    const client = makeClient({ upload })
+
+    await createNewVersion(client as never, 'user-1', 'doc-1', {
+      name: 'IMG_0002.heif',
+      buffer: isoBmff('heic'),
+      type: 'image/heif',
+    })
+
+    expect((client.rpc.mock.calls[0]?.[1] as { p_mime_type: string }).p_mime_type).toBe('image/heic')
+    expect((upload.mock.calls[0]?.[2] as { contentType: string }).contentType).toBe('image/heic')
   })
 })

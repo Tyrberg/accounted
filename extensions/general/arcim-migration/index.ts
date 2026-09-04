@@ -14,22 +14,45 @@ import {
   resolveConsent,
   fetchCompanyInfoDirect,
   ProviderTokenInvalidError,
+  ProviderCompanyMismatchError,
   ConsentNotFoundError,
 } from './lib/provider-client'
-import { providerSupportsSie, fetchProviderSieFiles, getAllowedFiscalYears } from './lib/sie-fetcher'
+import {
+  providerSupportsSie,
+  fetchProviderSieFiles,
+  getAllowedFiscalYears,
+  FiscalYearSelectionError,
+  MAX_SELECTED_FISCAL_YEARS,
+  type SourceFiscalYear,
+} from './lib/sie-fetcher'
 import { mapCompanyInfo } from './lib/entity-mapper'
 import { executeMigration } from './lib/migration-orchestrator'
-import { importProviderDocuments } from './lib/import-documents'
+import {
+  FortnoxDocumentScopesRequiredError,
+  importProviderDocuments,
+} from './lib/import-documents'
+import { fetchFortnoxAssetPreview } from './lib/import-assets'
 import { reconcileSupplierInvoiceVouchers } from '@/lib/invoices/bulk-reconcile-supplier-vouchers'
+import { relinkRegistrationVouchers } from './lib/relink-registration-vouchers'
 import type { ArcimProvider } from './types'
 import { ARCIM_PROVIDERS } from './types'
 import { parseSIEFile, validateSIEFile } from '@/lib/import/sie-parser'
+import { mergeParsedSIEFiles } from '@/lib/import/sie-merge'
+import { scanSieForCp1252Artifacts, formatSieArtifactWarning } from '@/lib/import/sie-artifact-scan'
 import { suggestMappings, getMappingStats, isSystemAccount } from '@/lib/import/account-mapper'
-import { loadMappings, generateImportPreview, executeSIEImport } from '@/lib/import/sie-import'
-import { BAS_REFERENCE } from '@/lib/bookkeeping/bas-reference'
+import { loadMappings, generateImportPreview, executeSIEImport, findOverlappingPeriodImports } from '@/lib/import/sie-import'
+import { buildMappingTargets } from './lib/mapping-targets'
 import type { ProviderName } from '@/lib/providers/types'
+import { FORTNOX_DOCUMENT_SCOPES_APPROVED } from '@/lib/providers/fortnox/oauth'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { getErrorEntry } from '@/lib/errors/structured-errors'
+import {
+  requireFlowInitiator,
+  FLOW_INITIATOR_MISMATCH_MESSAGE,
+} from '@/lib/auth/oauth-flow-binding'
 import { classifyProviderError } from '@/lib/providers/with-provider-call'
+import { getProviderResourceForbiddenMessage } from '@/lib/errors/get-error-message'
+import { FortnoxApiError, fortnoxErrorMessage } from '@/lib/providers/fortnox/client'
 import { createLogger } from '@/lib/logger'
 
 const moduleLog = createLogger('extensions/arcim-migration')
@@ -42,6 +65,15 @@ const moduleLog = createLogger('extensions/arcim-migration')
  */
 const STATE_REJECTED_MESSAGE =
   'Ingen giltig migrationssession hittades. Starta om anslutningen.'
+
+/**
+ * A valid state reached the callback but the browser carries no session. The
+ * state is already spent by then (consumeOAuthState is atomic and runs first),
+ * so unlike the bank/Stripe callbacks there is nothing to resume after a
+ * login: the user starts the connect again from the wizard.
+ */
+const SESSION_MISSING_MESSAGE =
+  'Ingen inloggad session hittades i det här fönstret. Logga in och starta om anslutningen.'
 
 /**
  * Map known OAuth error codes from providers (Fortnox, Visma) to actionable
@@ -80,6 +112,17 @@ function translateOAuthError(error: string, description: string | null): string 
  * The override exists so dev environments can route through a single
  * registered URI instead of registering every ngrok URL on the OAuth client.
  */
+/**
+ * WINT ships dark until the connection is verified against a live WINT
+ * account (its API is spec-derived, not sandbox-verified) and the relationship
+ * question is settled. Flipping WINT_MIGRATION_ENABLED=true is the launch
+ * switch; the rest of the provider is fully wired.
+ */
+function enabledProviders(): typeof ARCIM_PROVIDERS {
+  if (process.env.WINT_MIGRATION_ENABLED === 'true') return ARCIM_PROVIDERS
+  return ARCIM_PROVIDERS.filter(p => p.id !== 'wint')
+}
+
 function resolveArcimCallbackUrl(provider: ArcimProvider | ProviderName): string {
   const providerRedirectEnv =
     provider === 'visma'
@@ -101,11 +144,17 @@ function resolveArcimCallbackUrl(provider: ArcimProvider | ProviderName): string
  * consent_id, so re-running OAuth against the same consent overwrites a dead
  * refresh-token pair in place: no disconnect/recreate needed.
  */
-async function buildArcimOAuthUrl(consentId: string, provider: ArcimProvider): Promise<string> {
-  // Server-side state row: consent id, provider (via the consent), expiry and a
-  // consumed marker all live in provider_otc. The `state` handed to the provider
-  // is that row's opaque random primary key, nothing more.
-  const otc = await generateOtc(consentId)
+async function buildArcimOAuthUrl(
+  consentId: string,
+  provider: ArcimProvider,
+  initiatedByUserId: string,
+  options?: { documentScopes?: boolean },
+): Promise<string> {
+  // Server-side state row: consent id, provider (via the consent), the user who
+  // started the flow, expiry and a consumed marker all live in provider_otc.
+  // The `state` handed to the provider is that row's opaque random primary
+  // key, nothing more.
+  const otc = await generateOtc(consentId, initiatedByUserId)
 
   const callbackUrl = resolveArcimCallbackUrl(provider)
 
@@ -113,8 +162,55 @@ async function buildArcimOAuthUrl(consentId: string, provider: ArcimProvider): P
   // above. It deliberately encodes NOTHING. The previous base64url JSON payload
   // was attacker-authored input the callback trusted, so anyone who learned a
   // consent id could redirect their own provider tokens onto that consent.
-  const { url } = await getAuthUrl(provider, otc.code, callbackUrl)
+  const { url } = await getAuthUrl(provider, otc.code, callbackUrl, {
+    documentScopes: options?.documentScopes,
+  })
   return url
+}
+
+/**
+ * Answer a failed provider call with its classified code, falling back to the
+ * caller's own code when the failure is not provider-shaped.
+ *
+ * PROVIDER_RESOURCE_FORBIDDEN carries its message here instead of from the
+ * shared registry: the useful half is the provider's own sentence naming the
+ * register it refused ("Saknar behörighet för leverantörsregister."), which
+ * only the error itself holds. Without the override the code would fall
+ * through entryFor() to INTERNAL_ERROR and answer 500.
+ */
+function providerFailureResponse(error: unknown, fallbackCode: string): NextResponse {
+  const classified = classifyProviderError(error)
+  const ctx = {
+    details: {
+      reason: error instanceof Error ? error.message : 'unknown',
+      classified: classified ?? 'unclassified',
+    },
+  }
+  if (classified === 'PROVIDER_RESOURCE_FORBIDDEN') {
+    const reason = fortnoxErrorMessage(error)
+    return errorResponseFromCode(classified, moduleLog, {
+      ...ctx,
+      status: 403,
+      messageSv: getProviderResourceForbiddenMessage(reason, 'sv'),
+      messageEn: getProviderResourceForbiddenMessage(reason, 'en'),
+    })
+  }
+  return errorResponseFromCode(classified ?? fallbackCode, moduleLog, ctx)
+}
+
+/**
+ * Map a failed /migrate run to its structured error response. Shared by the
+ * JSON path (returned as-is) and the NDJSON path (body re-sent as the
+ * terminal `error` event, since the stream's 200 status is already
+ * committed). Consent missing or owned by another company: same 404 either way.
+ */
+function migrateFailureResponse(error: unknown, consentId: string): NextResponse {
+  if (error instanceof ConsentNotFoundError) {
+    return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
+      details: { consentId },
+    })
+  }
+  return providerFailureResponse(error, 'PROVIDER_MIGRATE_FAILED')
 }
 
 /**
@@ -139,7 +235,7 @@ export const arcimMigrationExtension: Extension = {
       method: 'GET',
       path: '/providers',
       handler: async () => {
-        return NextResponse.json({ providers: ARCIM_PROVIDERS })
+        return NextResponse.json({ providers: enabledProviders() })
       },
     },
 
@@ -220,11 +316,23 @@ export const arcimMigrationExtension: Extension = {
 
         const companyId = ctx?.companyId ?? user.id
 
-        const { provider, companyName, orgNumber, reconnect } = await request.json() as {
+        const {
+          provider,
+          companyName,
+          orgNumber,
+          reconnect,
+          documentScopes,
+        } = await request.json() as {
           provider: ArcimProvider
           companyName?: string
           orgNumber?: string
           reconnect?: boolean
+          /**
+           * Reconnect specifically to grant the voucher-attachment scopes.
+           * Only the underlag follow-up sets it, so an ordinary connect never
+           * asks the customer for Arkivplats and Koppla filer.
+           */
+          documentScopes?: boolean
         }
 
         if (!provider) {
@@ -233,7 +341,7 @@ export const arcimMigrationExtension: Extension = {
           })
         }
 
-        const providerInfo = ARCIM_PROVIDERS.find(p => p.id === provider)
+        const providerInfo = enabledProviders().find(p => p.id === provider)
         if (!providerInfo) {
           return errorResponseFromCode('PROVIDER_INVALID', moduleLog, {
             details: { provider },
@@ -261,7 +369,9 @@ export const arcimMigrationExtension: Extension = {
                 await ctx.settings.set('provider', provider)
               }
               if (providerInfo.authType === 'oauth') {
-                const authUrl = await buildArcimOAuthUrl(stale.id, provider)
+                const authUrl = await buildArcimOAuthUrl(stale.id, provider, user.id, {
+                  documentScopes: documentScopes === true,
+                })
                 return NextResponse.json({
                   consentId: stale.id,
                   authType: 'oauth',
@@ -344,7 +454,7 @@ export const arcimMigrationExtension: Extension = {
           }
 
           if (providerInfo.authType === 'oauth') {
-            const authUrl = await buildArcimOAuthUrl(consent.id, provider)
+            const authUrl = await buildArcimOAuthUrl(consent.id, provider, user.id)
 
             return NextResponse.json({
               consentId: consent.id,
@@ -406,8 +516,10 @@ export const arcimMigrationExtension: Extension = {
         }
 
         // Briox needs the account ID (the /token clientid param) alongside
-        // the application token; Bokio/BL need their company GUID.
-        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox') && !providerCompanyId) {
+        // the application token; Bokio/BL need their company GUID. WINT
+        // reuses the field for the login mail (paired with the password in
+        // apiToken; both are exchanged for tokens and never stored).
+        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint') && !providerCompanyId) {
           return errorResponseFromCode('PROVIDER_COMPANY_ID_REQUIRED', moduleLog, {
             details: { provider },
           })
@@ -430,11 +542,28 @@ export const arcimMigrationExtension: Extension = {
               details: { consentId },
             })
           }
-          // Wrong credentials (provider actively rejected them): tell the
-          // user to re-check the pasted values instead of a generic 500.
+          // Provider rejected authentication or could not resolve the Bokio
+          // company: return the actionable problem instead of a generic 500.
           if (error instanceof ProviderTokenInvalidError) {
+            if (error.kind === 'company-not-found') {
+              return errorResponseFromCode('BOKIO_COMPANY_NOT_FOUND', moduleLog, {
+                details: { provider, reason: error.message },
+              })
+            }
             return errorResponseFromCode('PROVIDER_TOKEN_INVALID', moduleLog, {
               details: { provider, reason: error.message },
+            })
+          }
+          // Valid credentials, wrong company: name both org numbers so the user
+          // can see at a glance which company the token actually opened.
+          if (error instanceof ProviderCompanyMismatchError) {
+            return errorResponseFromCode('PROVIDER_COMPANY_MISMATCH', moduleLog, {
+              details: {
+                provider,
+                expectedOrgNumber: error.expectedOrgNumber,
+                actualOrgNumber: error.actualOrgNumber,
+                actualCompanyName: error.actualCompanyName,
+              },
             })
           }
           return errorResponseFromCode('PROVIDER_TOKEN_SUBMIT_FAILED', moduleLog, {
@@ -463,10 +592,11 @@ export const arcimMigrationExtension: Extension = {
         const jsLiteral = (value: unknown) =>
           JSON.stringify(value ?? '').replace(/</g, '\\u003c')
 
-        const respondWithError = (reason: string) => {
+        const respondWithError = (reason: string, consentId?: string) => {
           const fallbackUrl = new URL(`${appUrl}/import`)
           fallbackUrl.searchParams.set('migration', 'error')
           fallbackUrl.searchParams.set('reason', reason)
+          if (consentId) fallbackUrl.searchParams.set('consentId', consentId)
 
           const escapedReason = reason
             .replace(/&/g, '&amp;')
@@ -480,30 +610,60 @@ export const arcimMigrationExtension: Extension = {
           // describe as "nothing happens". Leaving the reason on screen keeps
           // every error diagnosable; the wizard also shows it when the message
           // does arrive.
+          //
+          // location.replace, not href: the callback URL carries a one-time
+          // state that is already spent, so a Back or a reload onto it can
+          // only fail. no-store keeps it out of the browser cache for the same
+          // reason.
           const html = `<!DOCTYPE html><html><body><script>
             if (window.opener) {
               window.opener.postMessage({ type: 'arcim-oauth-error', reason: ${jsLiteral(reason)} }, ${jsLiteral(appUrl)});
             } else {
-              window.location.href = ${jsLiteral(fallbackUrl.toString())};
+              window.location.replace(${jsLiteral(fallbackUrl.toString())});
             }
           </script><p>Anslutningen misslyckades: ${escapedReason}</p><p>Du kan stänga detta fönster.</p></body></html>`
 
           return new Response(html, {
             status: 200,
-            headers: { 'Content-Type': 'text/html' },
+            headers: {
+              // charset is required: without it browsers default to Latin-1 and
+              // render the Swedish text as mojibake (the "rÃ¤tt behÃ¶righeter" bug).
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+            },
           })
         }
 
         // Provider returned an OAuth error (user cancelled, missing API
         // subscription on the Fortnox side, invalid scope, etc.)
         if (oauthError) {
-          log.error('OAuth callback returned provider error', {
+          // access_denied is the user clicking "avbryt" in the provider's
+          // consent screen: an expected outcome of an optional flow, so it is
+          // logged at warn and stays out of the error panel. Every other
+          // provider error is still an error.
+          const oauthErrorDetails = {
             error: oauthError,
             errorDescription: oauthErrorDescription,
             hasCode: !!code,
             hasState: !!stateRaw,
-          })
-          return respondWithError(translateOAuthError(oauthError, oauthErrorDescription))
+          }
+          if (oauthError === 'access_denied') {
+            log.warn('OAuth callback cancelled by the user at the provider', oauthErrorDetails)
+          } else {
+            log.error('OAuth callback returned provider error', oauthErrorDetails)
+          }
+          let consentId: string | undefined
+          if (stateRaw) {
+            try {
+              consentId = (await consumeOAuthState(stateRaw))?.consentId
+            } catch (error) {
+              log.error('OAuth callback could not resolve failed consent', error)
+            }
+          }
+          return respondWithError(
+            translateOAuthError(oauthError, oauthErrorDescription),
+            consentId,
+          )
         }
 
         if (!code || !stateRaw) {
@@ -515,6 +675,7 @@ export const arcimMigrationExtension: Extension = {
           return respondWithError('Återanropet saknade code eller state. Försök igen.')
         }
 
+        let callbackConsentId: string | undefined
         try {
           // Single source of truth for who this callback belongs to: the
           // server-written provider_otc row, consumed atomically here. The row
@@ -536,7 +697,40 @@ export const arcimMigrationExtension: Extension = {
             return respondWithError(STATE_REJECTED_MESSAGE)
           }
 
-          const { consentId, provider } = resolvedState
+          const { consentId, provider, userId: initiatedByUserId } = resolvedState
+
+          // The state proves this callback belongs to a flow WE started; it
+          // says nothing about who is finishing it. Before the code is
+          // exchanged, the completing browser's own session must belong to the
+          // user recorded on the state row at connect time. Otherwise a victim
+          // lured into approving a consent someone else started has their
+          // Fortnox/Visma account bound to that someone's consent, and the
+          // next migration imports the victim's ledger into a stranger's
+          // company. Checked before callbackConsentId is set: a refused
+          // completion must not hand the consent id to whoever is refused.
+          if (!initiatedByUserId) {
+            // Row minted before provider_otc.user_id existed (or written
+            // outside generateOtc): nobody to bind to, so nobody may finish it.
+            // Such rows expire within 10 minutes of the deploy.
+            log.error('OAuth callback state carries no initiator; refusing', { consentId })
+            return respondWithError(STATE_REJECTED_MESSAGE)
+          }
+          const initiator = await requireFlowInitiator(request, initiatedByUserId, {
+            flow: 'arcim-migration.callback',
+          })
+          if (!initiator.ok) {
+            log.error('OAuth callback refused: completing session is not the initiator', {
+              consentId,
+              reason: initiator.reason,
+            })
+            return respondWithError(
+              initiator.reason === 'no_session'
+                ? SESSION_MISSING_MESSAGE
+                : FLOW_INITIATOR_MISMATCH_MESSAGE,
+            )
+          }
+
+          callbackConsentId = consentId
 
           // Must match the redirect_uri the authorization request was built
           // with, so both come from resolveArcimCallbackUrl.
@@ -547,23 +741,43 @@ export const arcimMigrationExtension: Extension = {
 
           // Return an HTML page that notifies the opener tab and closes itself
           const successUrl = `${appUrl}/import?migration=connected&consentId=${encodeURIComponent(consentId)}`
+          // location.replace + no-store: see respondWithError above. The state
+          // is spent the moment consumeOAuthState returns, and prod caught the
+          // consequence of leaving the URL in history: a second delivery 19
+          // seconds after a successful connect, answered with a red "ingen
+          // giltig migrationssession" about a connection that had just worked.
           const html = `<!DOCTYPE html><html><body><script>
             if (window.opener) {
               window.opener.postMessage({ type: 'arcim-oauth-success', consentId: ${jsLiteral(consentId)} }, ${jsLiteral(appUrl)});
               window.close();
             } else {
-              window.location.href = ${jsLiteral(successUrl)};
+              window.location.replace(${jsLiteral(successUrl)});
             }
           </script><p>Anslutningen lyckades. Du kan stänga denna flik.</p></body></html>`
 
           return new Response(html, {
             status: 200,
-            headers: { 'Content-Type': 'text/html' },
+            headers: {
+              // charset is required: without it browsers default to Latin-1 and
+              // render the Swedish text as mojibake (the "rÃ¤tt behÃ¶righeter" bug).
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+            },
           })
         } catch (error) {
           log.error('OAuth callback exchange failed', error)
+          // Valid tokens for the WRONG company: exchangeAuthToken stored
+          // nothing. Show the user-facing sentence from the error registry
+          // (the same one /submit-token answers with for Bokio/WINT) instead
+          // of the English diagnostic on the error object.
+          if (error instanceof ProviderCompanyMismatchError) {
+            return respondWithError(
+              getErrorEntry('PROVIDER_COMPANY_MISMATCH')?.message_sv ?? error.message,
+              callbackConsentId,
+            )
+          }
           const reason = error instanceof Error ? error.message : 'Okänt fel vid tokenutbyte.'
-          return respondWithError(reason)
+          return respondWithError(reason, callbackConsentId)
         }
       },
     },
@@ -614,34 +828,68 @@ export const arcimMigrationExtension: Extension = {
             const companyInfo = await fetchCompanyInfoDirect(provider, resolved.accessToken, resolved.providerCompanyId)
             mapped = companyInfo ? mapCompanyInfo(companyInfo) : null
           } catch (err) {
+            // A missing integration license / inactive API module dooms every
+            // later call in the wizard too: fail the preview with the typed
+            // code (via the outer catch) so the user reads the remediation at
+            // connect time, not after a silently empty migration. Other
+            // failures stay soft: the preview is still useful without company
+            // info (e.g. SIE-over-API can work with narrower scopes).
+            const classified = classifyProviderError(err)
+            if (classified === 'PROVIDER_API_MODULE_INACTIVE' || classified === 'PROVIDER_LICENSE_MISSING') {
+              throw err
+            }
             log.info('Company info fetch failed:', err instanceof Error ? err.message : String(err))
           }
 
           // Try to fetch SIE data (Fortnox and Briox serve SIE over the API)
           let sieAvailable = false
           let sieStats: { accountCount: number; transactionCount: number; fiscalYears: number[] } | null = null
+          // Every fiscal year the source has, with the default selection
+          // marked: the preview step renders them as the year picker, so the
+          // user chooses BEFORE the import runs and no year is left out
+          // silently (issues #2211, #2238). The stats below stay on the
+          // default selection: that is what the preview fetched.
+          let sourceYears: SourceFiscalYear[] = []
 
           if (providerSupportsSie(provider)) {
             try {
               log.info(`Fetching SIE export from ${provider} for consent ${consentId}...`)
-              // Fetch SIE type 4 for the most recent allowed year to get stats
-              const { files, availableYears } = await fetchProviderSieFiles(
+              // Fetch SIE type 4 for EVERY allowed year, not latestOnly: the
+              // stats below render as "Hittade X konton och Y verifikationer"
+              // on the connect step, and a mid-year export has few or zero
+              // vouchers in the newest year (the One.com migration previewed
+              // "0 verifikationer" and then imported 4153). Costs one SIE
+              // export per extra year, the same work /sie-data repeats right
+              // after: honest numbers are worth it.
+              const { files, availableYears, sourceYears: source } = await fetchProviderSieFiles(
                 provider,
                 resolved.accessToken,
                 resolved.providerCompanyId,
-                { latestOnly: true },
               )
+              sourceYears = source
               if (files.length > 0) {
-                const parsed = parseSIEFile(files[files.length - 1].rawContent)
+                const merged = mergeParsedSIEFiles(files.map((f) => parseSIEFile(f.rawContent)))
                 sieAvailable = true
                 sieStats = {
-                  accountCount: parsed.accounts.length,
-                  transactionCount: parsed.vouchers.length,
+                  accountCount: merged.accounts.length,
+                  transactionCount: merged.vouchers.length,
                   fiscalYears: availableYears,
                 }
               }
             } catch (err) {
               log.info('SIE export failed:', err instanceof Error ? err.message : String(err))
+            }
+          }
+
+          // Asset register stats (Fortnox only). Soft: a consent without the
+          // assets scope (or licence) just omits the line; anything else is
+          // logged and omitted rather than failing an otherwise good preview.
+          let assetStats: { total: number; importable: number } | null = null
+          if (provider === 'fortnox') {
+            try {
+              assetStats = await fetchFortnoxAssetPreview(resolved.accessToken)
+            } catch (err) {
+              log.info('Asset preview failed:', err instanceof Error ? err.message : String(err))
             }
           }
 
@@ -662,6 +910,11 @@ export const arcimMigrationExtension: Extension = {
             companyInfo: mapped,
             sieAvailable,
             sieStats,
+            sourceYears,
+            // The picker enforces the same cap as /sie-data, read from here
+            // rather than duplicated in the client.
+            maxSelectedYears: MAX_SELECTED_FISCAL_YEARS,
+            assetStats,
             hasSieData: (sieImportCount ?? 0) > 0,
           })
         } catch (error) {
@@ -674,13 +927,7 @@ export const arcimMigrationExtension: Extension = {
           }
           // Classify HTTP failures into typed codes so the toast can suggest
           // reconnect / retry instead of a generic "preview failed".
-          const classified = classifyProviderError(error)
-          return errorResponseFromCode(classified ?? 'PROVIDER_PREVIEW_FAILED', moduleLog, {
-            details: {
-              reason: error instanceof Error ? error.message : 'unknown',
-              classified: classified ?? 'unclassified',
-            },
-          })
+          return providerFailureResponse(error, 'PROVIDER_PREVIEW_FAILED')
         }
       },
     },
@@ -707,6 +954,34 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ error: 'consentId is required' }, { status: 400 })
         }
 
+        // `years`: the fiscal years the user ticked in the preview step
+        // (start years, comma-separated). Absent = the default selection.
+        // Every selected year is one SIE export fetched and parsed in THIS
+        // invocation, so the selection is the user's own wait; it fails
+        // loudly here, before any ledger write, if it is too much.
+        const yearsParam = url.searchParams.get('years')
+        let requestedYears: number[] | undefined
+        if (yearsParam !== null) {
+          const parsed = yearsParam.split(',').filter(Boolean).map(Number)
+          const valid = parsed.length > 0 && parsed.every((y) => Number.isInteger(y) && y >= 1900 && y <= 2200)
+          if (!valid) {
+            return errorResponseFromCode('VALIDATION_ERROR', moduleLog, {
+              details: { field: 'years', reason: 'comma-separated fiscal year start years' },
+            })
+          }
+          requestedYears = [...new Set(parsed)].sort((a, b) => a - b)
+          // The resource bound: each selected year is one provider export
+          // fetched and parsed in this invocation (derivation on the
+          // constant). Rejected before any provider call.
+          if (requestedYears.length > MAX_SELECTED_FISCAL_YEARS) {
+            return errorResponseFromCode('VALIDATION_ERROR', moduleLog, {
+              messageSv: `Högst ${MAX_SELECTED_FISCAL_YEARS} räkenskapsår kan hämtas per körning. Välj färre år; äldre år kan hämtas i en ny körning.`,
+              messageEn: `At most ${MAX_SELECTED_FISCAL_YEARS} fiscal years can be fetched per run. Select fewer years; older years can be fetched in a second run.`,
+              details: { field: 'years', reason: 'too_many', max: MAX_SELECTED_FISCAL_YEARS, requested: requestedYears.length },
+            })
+          }
+        }
+
         try {
           // Resolve consent
           const resolved = await resolveConsent(companyId, consentId)
@@ -718,19 +993,38 @@ export const arcimMigrationExtension: Extension = {
             })
           }
 
-          // Fetch SIE type 4 for each allowed fiscal year
-          const { files: sieFiles, failedYears } = await fetchProviderSieFiles(
-            provider,
-            resolved.accessToken,
-            resolved.providerCompanyId,
-          )
+          // Fetch SIE type 4 for each selected fiscal year. A selected year
+          // the source does not have is refused by the fetcher right after
+          // the year listing, before any export is fetched.
+          let fetched: Awaited<ReturnType<typeof fetchProviderSieFiles>>
+          try {
+            fetched = await fetchProviderSieFiles(
+              provider,
+              resolved.accessToken,
+              resolved.providerCompanyId,
+              requestedYears ? { years: requestedYears } : undefined,
+            )
+          } catch (err) {
+            if (err instanceof FiscalYearSelectionError) {
+              const years = err.unknownYears.join(', ')
+              return errorResponseFromCode('VALIDATION_ERROR', moduleLog, {
+                messageSv: `Räkenskapsår ${years} finns inte hos leverantören.`,
+                messageEn: `Fiscal years ${years} do not exist at the provider.`,
+                details: { field: 'years', reason: 'unknown_year', unknownYears: err.unknownYears },
+              })
+            }
+            throw err
+          }
+          const { files: sieFiles, failedYears, omittedYears } = fetched
 
           if (sieFiles.length === 0) {
-            // The allowed window is rolling (current year and the two before
-            // it): interpolate the actual range instead of the static
-            // registry message so the text never goes stale.
-            const allowedYears = [...getAllowedFiscalYears()].sort((a, b) => a - b)
-            const range = `${allowedYears[0]}-${allowedYears[allowedYears.length - 1]}`
+            // Name the selection: the explicit years when the picker sent
+            // them, else the rolling default window (interpolated so the
+            // text never goes stale).
+            const selection = requestedYears ?? [...getAllowedFiscalYears()].sort((a, b) => a - b)
+            const range = requestedYears
+              ? requestedYears.join(', ')
+              : `${selection[0]}-${selection[selection.length - 1]}`
             return errorResponseFromCode('PROVIDER_SIE_NO_YEARS', moduleLog, {
               messageSv: `Inga räkenskapsår ${range} hittades hos leverantören.`,
               messageEn: `No fiscal years available for ${range}.`,
@@ -738,14 +1032,26 @@ export const arcimMigrationExtension: Extension = {
             })
           }
 
-          // Parse most recent file for preview/validation
-          const sieFile = sieFiles[sieFiles.length - 1]
-          const parsed = parseSIEFile(sieFile.rawContent)
-          const validation = validateSIEFile(parsed)
+          // Parse every file ONCE: validation, account collection, the
+          // preview and the returned `parsed` all read from these parses.
+          const parsedFiles = sieFiles.map((file) => ({
+            file,
+            parsed: parseSIEFile(file.rawContent),
+          }))
+
+          // Validate the most recent file's parse: unchanged behavior, so no
+          // previously accepted dataset is newly rejected. Older years get no
+          // gate here (they never had one); their problems still surface
+          // per-file at import time. Validating the merged parse instead
+          // would be wrong: validateSIEFile assumes single-file invariants
+          // (balance yearIndexes relative to ONE current year) that the
+          // merged view deliberately does not preserve.
+          const newestFile = parsedFiles[parsedFiles.length - 1]
+          const validation = validateSIEFile(newestFile.parsed)
 
           if (!validation.valid) {
             log.warn(
-              `arcim sie-data validation failed for ${provider} fiscal year ${sieFile.fiscalYear}: ` +
+              `arcim sie-data validation failed for ${provider} fiscal year ${newestFile.file.fiscalYear}: ` +
               `${validation.errors.length} error(s): ${validation.errors.slice(0, 3).join(' | ')}`,
             )
             return NextResponse.json({
@@ -755,17 +1061,16 @@ export const arcimMigrationExtension: Extension = {
             }, { status: 400 })
           }
 
-          // Collect ALL unique accounts across ALL fiscal year files
-          const allAccountsMap = new Map<string, { number: string; name: string }>()
-          for (const file of sieFiles) {
-            const fileParsed = parseSIEFile(file.rawContent)
-            for (const acc of fileParsed.accounts) {
-              if (!allAccountsMap.has(acc.number)) {
-                allAccountsMap.set(acc.number, { number: acc.number, name: acc.name })
-              }
-            }
-          }
-          const allAccounts = [...allAccountsMap.values()]
+          // Whole-dataset view across ALL fiscal years. Mid-year provider
+          // exports have few or zero vouchers in the newest file, so the
+          // preview counts and the theater model must never be built from
+          // that file alone ("Hittade 740 konton och 0 verifikationer" while
+          // 4153 vouchers were about to be imported).
+          const merged = mergeParsedSIEFiles(parsedFiles.map((p) => p.parsed))
+
+          // All unique accounts across all files (first file's name wins,
+          // same as the merge's account union).
+          const allAccounts = merged.accounts
             .filter(a => !isSystemAccount(a.number))
             .map(a => ({ number: a.number, name: a.name }))
 
@@ -783,17 +1088,18 @@ export const arcimMigrationExtension: Extension = {
             updated_at: '',
           }))
 
-          // Suggest mappings
-          const basAccounts = BAS_REFERENCE.map(b => ({
-            account_number: b.account_number,
-            account_name: b.account_name,
-          }))
-          const mappings = suggestMappings(allAccounts, basAccounts, existingRecords)
+          // Mapping targets are the company's OWN chart of accounts first,
+          // then BAS for anything it does not have yet. BAS alone cannot
+          // express an account the company added outside the standard, so
+          // such an account was impossible to map onto. See
+          // ./lib/mapping-targets.
+          const mappingTargets = await buildMappingTargets(supabase, companyId)
+          const mappings = suggestMappings(allAccounts, mappingTargets, existingRecords)
           const mappingStats = getMappingStats(mappings)
 
           log.info(`Account mapping: ${allAccounts.length} unique accounts across ${sieFiles.length} files, ${mappingStats.unmapped} unmapped`)
 
-          const preview = generateImportPreview(parsed, mappings)
+          const preview = generateImportPreview(merged, mappings)
 
           // Detect prior imports by *fiscal period overlap*, not file hash.
           // Providers embed the export-time #GEN date in every SIE export so
@@ -808,8 +1114,7 @@ export const arcimMigrationExtension: Extension = {
               fiscalYearEnd: string | null
             } | null
           }[] = []
-          for (const file of sieFiles) {
-            const fileParsed = parseSIEFile(file.rawContent)
+          for (const { file, parsed: fileParsed } of parsedFiles) {
             const fyStart = fileParsed.stats.fiscalYearStart
             const fyEnd = fileParsed.stats.fiscalYearEnd
 
@@ -820,16 +1125,17 @@ export const arcimMigrationExtension: Extension = {
             } | null = null
 
             if (fyStart && fyEnd) {
-              const { data } = await supabase
-                .from('sie_imports')
-                .select('imported_at, fiscal_year_start, fiscal_year_end')
-                .eq('company_id', companyId)
-                .eq('status', 'completed')
-                .lte('fiscal_year_start', fyEnd)
-                .gte('fiscal_year_end', fyStart)
-                .limit(1)
-                .maybeSingle()
-              priorImport = data
+              // Newest first: several completed rows can overlap the same
+              // year (manual upload + provider sync, or residue from
+              // partially deleted data). The unordered .limit(1) this
+              // replaces picked an arbitrary row, so the wizard could show
+              // a stale "ersätter tidigare import från <date>" (issue #1667).
+              // Import-time replace resolves ALL rows regardless of which
+              // one is displayed here.
+              const overlapping = await findOverlappingPeriodImports(
+                supabase, companyId, fyStart, fyEnd
+              )
+              priorImport = overlapping[0] ?? null
             }
 
             fileStatuses.push({
@@ -848,7 +1154,10 @@ export const arcimMigrationExtension: Extension = {
           const replacedFileCount = fileStatuses.filter(f => f.previousImport).length
 
           return NextResponse.json({
-            parsed,
+            // The merged whole-dataset parse: SIEData.parsed feeds the
+            // migration theater (buildTheaterModel), which must see every
+            // fiscal year, not just the newest file.
+            parsed: merged,
             mappings,
             mappingStats,
             preview,
@@ -868,17 +1177,14 @@ export const arcimMigrationExtension: Extension = {
             // Allowed years whose provider export failed: the wizard warns
             // the user before proceeding so an IB/UB gap cannot slip through.
             failedYears,
-            basAccounts: BAS_REFERENCE,
+            // Source years outside the selection: the result step names them
+            // so nobody believes the books are complete (#2211).
+            omittedYears,
+            basAccounts: mappingTargets,
           })
         } catch (error) {
           log.error('arcim sie-data fetch failed', error as Error)
-          const classified = classifyProviderError(error)
-          return errorResponseFromCode(classified ?? 'PROVIDER_SIE_FETCH_FAILED', moduleLog, {
-            details: {
-              reason: error instanceof Error ? error.message : 'unknown',
-              classified: classified ?? 'unclassified',
-            },
-          })
+          return providerFailureResponse(error, 'PROVIDER_SIE_FETCH_FAILED')
         }
       },
     },
@@ -916,6 +1222,20 @@ export const arcimMigrationExtension: Extension = {
 
         try {
           const parsed = parseSIEFile(rawContent)
+
+          // Mojibake tripwire (warn, never block). This handler receives SIE
+          // as an ALREADY-DECODED string, so an upstream that decoded CP437
+          // bytes as windows-1252 has baked the corruption in before we ever
+          // see it (the retired Arcim Sync gateway did exactly that on
+          // 2026-03-17). Flag the signature so it can never again land
+          // silently in posted entries; the import itself proceeds untouched.
+          const artifactScan = scanSieForCp1252Artifacts(parsed)
+          if (artifactScan.flagged) {
+            log.warn('import-sie: CP1252 mojibake artifacts in SIE text', {
+              artifactCount: artifactScan.artifactCount,
+              samples: artifactScan.samples,
+            })
+          }
 
           // Validate all accounts are mapped (same as manual upload)
           const unmapped = mappings.filter((m: import('@/lib/import/types').AccountMapping) => !m.targetAccount)
@@ -957,6 +1277,12 @@ export const arcimMigrationExtension: Extension = {
             onExistingPeriod: 'replace',
           })
 
+          // Surface the tripwire on the result the workspace UI already
+          // renders (its "Remaining warnings" card shows result.warnings).
+          if (artifactScan.flagged) {
+            result.warnings.push(formatSieArtifactWarning(artifactScan))
+          }
+
           log.info('SIE import completed:', {
             success: result.success,
             journalEntriesCreated: result.journalEntriesCreated,
@@ -967,13 +1293,7 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json(result)
         } catch (error) {
           log.error('arcim sie import failed', error as Error)
-          const classified = classifyProviderError(error)
-          return errorResponseFromCode(classified ?? 'SIE_IMPORT_UNEXPECTED', moduleLog, {
-            details: {
-              reason: error instanceof Error ? error.message : 'unknown',
-              classified: classified ?? 'unclassified',
-            },
-          })
+          return providerFailureResponse(error, 'SIE_IMPORT_UNEXPECTED')
         }
       },
     },
@@ -1000,6 +1320,11 @@ export const arcimMigrationExtension: Extension = {
           importSuppliers = true,
           importSalesInvoices = true,
           importSupplierInvoices = true,
+          // New option: an omitted field must behave exactly as it did before
+          // this option existed, so it defaults OFF. An older client that omits
+          // it neither imports assets nor trips the SIE guard below; the wizard
+          // always sends it explicitly.
+          importAssets = false,
           reconcileVouchers = true,
         } = await request.json() as {
           consentId: string
@@ -1008,6 +1333,7 @@ export const arcimMigrationExtension: Extension = {
           importSuppliers?: boolean
           importSalesInvoices?: boolean
           importSupplierInvoices?: boolean
+          importAssets?: boolean
           reconcileVouchers?: boolean
         }
 
@@ -1028,36 +1354,66 @@ export const arcimMigrationExtension: Extension = {
           }
 
           // ── Guard: a completed SIE import is required before entity import ──
-          // Most providers expose ONLY entity data (customers, suppliers,
-          // invoices) via API: never the general ledger. Fortnox pulls the GL
-          // itself via SIE-over-API and is exempt. Briox and Björn Lundén also
-          // serve SIE over the API, but the wizard runs /import-sie before
-          // /migrate, so this guard stays satisfied, and keeps protecting
-          // against a skipped SIE step. Importing entities without the
-          // SIE-derived ledger (kontoplan,
-          // ingående balanser, verifikationer) would leave an incomplete
-          // bokföring under BFL: a subledger with no chart of accounts and no
-          // opening balances, so every subsequent posting and balance is wrong.
-          // The wizard surfaces this as an advisory banner, but it must be
-          // enforced here so the rule cannot be bypassed by a direct API call,
-          // a skipped wizard step, or a stale client.
-          if (consent.provider !== 'fortnox') {
-            const { count: completedSieImports } = await supabase
-              .from('sie_imports')
-              .select('id', { count: 'exact', head: true })
-              .eq('company_id', companyId)
-              .eq('status', 'completed')
+          // Provider APIs expose ONLY entity data (customers, suppliers,
+          // invoices): never the general ledger. The GL (kontoplan, ingående
+          // balanser, verifikationer) arrives via SIE, either uploaded by the
+          // user or, for Fortnox, Briox, Björn Lundén and WINT, pulled over the
+          // API by the wizard's /import-sie phase. Importing entities without
+          // that ledger would leave an incomplete bokföring under BFL: a
+          // subledger with no chart of accounts and no opening balances, so
+          // every subsequent posting and balance is wrong.
+          //
+          // The rule is "a completed SIE import must EXIST for the company",
+          // not "must be part of this run": an entities-only re-run after an
+          // earlier full migration passes. No provider is exempt. Fortnox used
+          // to be, on the assumption that the wizard always runs SIE-over-API
+          // first, but the wizard lets the user uncheck "Bokföringsdata (SIE)"
+          // while keeping entities checked (#2000), and a direct API call or a
+          // stale client can skip it regardless.
+          //
+          // Company info (name, org number, VAT number) writes no accounts,
+          // balances or subledger rows, so a run that imports only that is
+          // not gated.
+          // The asset register counts as entity data for this gate: its rows
+          // carry BAS account triples and depreciation plans that only mean
+          // something against an imported chart of accounts.
+          const importsEntities = importCustomers ||
+            importSuppliers ||
+            importSalesInvoices ||
+            importSupplierInvoices ||
+            importAssets
+          const { count: completedSieImports } = importsEntities
+            ? await supabase
+                .from('sie_imports')
+                .select('id', { count: 'exact', head: true })
+                .eq('company_id', companyId)
+                .eq('status', 'completed')
+            : { count: null }
 
-            if (!completedSieImports || completedSieImports < 1) {
-              return errorResponseFromCode('PROVIDER_SIE_IMPORT_REQUIRED', moduleLog, {
-                details: { provider: consent.provider },
-              })
-            }
+          if (importsEntities && (!completedSieImports || completedSieImports < 1)) {
+            // Providers that serve SIE over the API have no file to upload:
+            // point the user at the wizard checkbox instead of the static
+            // "ladda upp en SIE-fil" text. Same code and status either way so
+            // the wizard's error path renders it unchanged.
+            const sieViaApi = ARCIM_PROVIDERS.some(
+              (p) => p.id === consent.provider && p.sieViaApi,
+            )
+            return errorResponseFromCode('PROVIDER_SIE_IMPORT_REQUIRED', moduleLog, {
+              details: { provider: consent.provider },
+              ...(sieViaApi
+                ? {
+                    messageSv:
+                      'Bokföringsdata (SIE) måste importeras först. Kryssa i "Bokföringsdata (SIE)" i guiden så att kontoplan, ingående balanser och verifikationer hämtas innan kunder, leverantörer, fakturor och anläggningstillgångar importeras.',
+                    messageEn:
+                      'A completed SIE import is required first. Tick "Bokföringsdata (SIE)" in the wizard so the chart of accounts, opening balances and verifications are fetched before customers, suppliers, invoices and fixed assets are imported.',
+                  }
+                : {}),
+            })
           }
 
           log.info(`Starting migration for user ${user.id} from ${consent.provider}`)
 
-          const results = await executeMigration({
+          const migrationOptions = {
             consentId,
             companyId,
             userId: user.id,
@@ -1067,8 +1423,66 @@ export const arcimMigrationExtension: Extension = {
             importSuppliers,
             importSalesInvoices,
             importSupplierInvoices,
+            importAssets,
             reconcileVouchers,
-          })
+          }
+
+          // Streaming mode (the migration wizard opts in via Accept): one
+          // NDJSON line per orchestrator progress event, then a terminal
+          // `done` or `error` line. Errors after the stream opens cannot
+          // change the HTTP status, so the terminal `error` line carries the
+          // same structured envelope the JSON path answers with. Callers
+          // without the Accept header keep the original JSON contract.
+          if ((request.headers.get('accept') ?? '').includes('application/x-ndjson')) {
+            const encoder = new TextEncoder()
+            const stream = new ReadableStream<Uint8Array>({
+              async start(controller) {
+                const send = (event: Record<string, unknown>) => {
+                  try {
+                    controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'))
+                  } catch {
+                    // Reader cancelled (tab closed, navigation). The migration
+                    // keeps running server-side; we just stop narrating.
+                  }
+                }
+                try {
+                  const results = await executeMigration({
+                    ...migrationOptions,
+                    onProgress: (p) => send({
+                      kind: 'progress',
+                      status: p.status,
+                      currentStep: p.currentStep,
+                      progress: p.progress,
+                    }),
+                  })
+                  log.info('Migration completed:', results)
+                  // Mark consent as fully accepted now that data has been imported
+                  await acceptConsent(consentId)
+                  send({ kind: 'done', success: true, results })
+                } catch (error) {
+                  log.error('arcim migration failed', error as Error)
+                  const envelope = await migrateFailureResponse(error, consentId).json()
+                  send({ kind: 'error', ...envelope })
+                } finally {
+                  try {
+                    controller.close()
+                  } catch {
+                    // Already closed because the reader cancelled; close()
+                    // would otherwise reject start() as an unhandled rejection.
+                  }
+                }
+              },
+            })
+            return new Response(stream, {
+              headers: {
+                'Content-Type': 'application/x-ndjson; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'X-Accel-Buffering': 'no',
+              },
+            })
+          }
+
+          const results = await executeMigration(migrationOptions)
 
           log.info('Migration completed:', results)
 
@@ -1078,19 +1492,7 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ success: true, results })
         } catch (error) {
           log.error('arcim migration failed', error as Error)
-          // Consent missing or owned by another company: same 404 either way.
-          if (error instanceof ConsentNotFoundError) {
-            return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
-              details: { consentId },
-            })
-          }
-          const classified = classifyProviderError(error)
-          return errorResponseFromCode(classified ?? 'PROVIDER_MIGRATE_FAILED', moduleLog, {
-            details: {
-              reason: error instanceof Error ? error.message : 'unknown',
-              classified: classified ?? 'unclassified',
-            },
-          })
+          return migrateFailureResponse(error, consentId)
         }
       },
     },
@@ -1103,6 +1505,16 @@ export const arcimMigrationExtension: Extension = {
     // auto-link settled supplier invoices to their existing vouchers. Pass
     // { dryRun: true } to preview the plan (incl. items needing manual review)
     // without writing.
+    //
+    // Pass { consentId } to ALSO re-link registration vouchers (the verifikat
+    // that BOOKED each invoice). The imported rows do not store the provider's
+    // voucher ref, so that pass re-fetches both registers from the provider
+    // through the given consent; without a consentId it is skipped and the
+    // response carries no `registrationLinks`. The consent is validated
+    // (company-scoped) BEFORE the payment reconcile writes anything, so a
+    // wrong id is a clean 404; a provider failure during the relink itself is
+    // reported beside the payment result, which was already persisted, as
+    // `registrationLinksError` rather than by discarding that result.
     {
       method: 'POST',
       path: '/reconcile',
@@ -1118,15 +1530,29 @@ export const arcimMigrationExtension: Extension = {
         const companyId = ctx?.companyId ?? user.id
 
         let dryRun = false
+        let consentId: string | null = null
         try {
-          const body = (await request.json()) as { dryRun?: boolean }
+          const body = (await request.json()) as { dryRun?: boolean; consentId?: unknown }
           dryRun = body?.dryRun === true
+          consentId = typeof body?.consentId === 'string' && body.consentId ? body.consentId : null
         } catch {
           // empty body is fine: default to a real run
         }
 
+        if (consentId) {
+          // A foreign consent throws the same ConsentNotFoundError as a
+          // nonexistent one (no cross-tenant existence oracle).
+          try {
+            await getConsent(consentId, companyId)
+          } catch (error) {
+            log.error('arcim reconcile: consent lookup failed', error as Error)
+            return migrateFailureResponse(error, consentId)
+          }
+        }
+
+        let result: Awaited<ReturnType<typeof reconcileSupplierInvoiceVouchers>>
         try {
-          const result = await reconcileSupplierInvoiceVouchers({
+          result = await reconcileSupplierInvoiceVouchers({
             supabase,
             companyId,
             userId: user.id,
@@ -1139,24 +1565,64 @@ export const arcimMigrationExtension: Extension = {
             ambiguous: result.ambiguous,
             unmatched: result.unmatched,
           })
-          return NextResponse.json({ success: true, dryRun, result })
         } catch (error) {
           log.error('arcim reconcile failed', error as Error)
           return errorResponseFromCode('PROVIDER_MIGRATE_FAILED', moduleLog, {
             details: { reason: error instanceof Error ? error.message : 'unknown' },
           })
         }
+
+        if (!consentId) {
+          return NextResponse.json({ success: true, dryRun, result })
+        }
+
+        try {
+          const registrationLinks = await relinkRegistrationVouchers({
+            supabase,
+            companyId,
+            consentId,
+            dryRun,
+          })
+          log.info('arcim registration relink completed', {
+            companyId,
+            dryRun,
+            providerInvoices: registrationLinks.providerInvoices,
+            matched: registrationLinks.matched,
+            linked: registrationLinks.linked,
+            refNotFetched: registrationLinks.refNotFetched,
+            ambiguous: registrationLinks.ambiguous,
+            amountMismatch: registrationLinks.amountMismatch,
+          })
+          return NextResponse.json({ success: true, dryRun, result, registrationLinks })
+        } catch (error) {
+          // resolveConsent throws plain `{ status, message }` objects for a
+          // consent that vanished or lost its tokens between the check above
+          // and here; classifyProviderError handles the provider-side ones.
+          log.error('arcim registration relink failed', error as Error)
+          const status = typeof error === 'object' && error !== null && 'status' in error
+            ? (error as { status?: unknown }).status
+            : undefined
+          const code = error instanceof ConsentNotFoundError || status === 404
+            ? 'PROVIDER_CONSENT_NOT_FOUND'
+            : classifyProviderError(error) ?? 'PROVIDER_MIGRATE_FAILED'
+          return NextResponse.json({
+            success: true,
+            dryRun,
+            result,
+            registrationLinks: null,
+            registrationLinksError: { code },
+          })
+        }
       },
     },
 
     // ── Import provider underlag (receipts) and link to verifikat ──
-    // Best-effort, re-runnable. Kept off the migration's critical path: the
-    // Bokio document API is rate-limited (200 req/60s) and a full receipt
-    // sweep issues hundreds of download calls, which would blow the 300s
-    // migration window. Pages /uploads, resolves each receipt's verifikat via
-    // the SIE-preserved Bokio voucher number, and archives it idempotently
-    // (skips content already stored for the company). Pass { dryRun: true } to
-    // preview the match plan without downloading or writing.
+    // Best-effort, re-runnable. Kept off the migration's critical path because
+    // the Bokio and Fortnox APIs are rate-limited and a full receipt sweep can
+    // issue hundreds of download calls. Resolves each receipt's verifikat via
+    // the SIE-preserved provider voucher number and archives it idempotently.
+    // Fortnox consents need archive and connectfile scopes. Pass
+    // { dryRun: true } to preview the match plan without downloading or writing.
     {
       method: 'POST',
       path: '/import-documents',
@@ -1173,10 +1639,23 @@ export const arcimMigrationExtension: Extension = {
 
         let consentId: string | undefined
         let dryRun = false
+        let cursor: string | null = null
         try {
-          const body = (await request.json()) as { consentId?: string; dryRun?: boolean }
+          const body = (await request.json()) as {
+            consentId?: string
+            dryRun?: boolean
+            cursor?: string
+          }
           consentId = body?.consentId
           dryRun = body?.dryRun === true
+          // Resume point from a previous partial call (the last handled
+          // provider attachment id, see import-documents.ts); anything else
+          // restarts from the top, which is always safe: already-archived
+          // receipts are skipped by hash.
+          cursor =
+            typeof body?.cursor === 'string' && body.cursor.length > 0 && body.cursor.length <= 256
+              ? body.cursor
+              : null
         } catch {
           // empty/invalid body: consentId check below rejects it
         }
@@ -1192,21 +1671,53 @@ export const arcimMigrationExtension: Extension = {
             userId: user.id,
             consentId,
             dryRun,
+            cursor,
           })
           log.info('arcim import-documents completed', {
             companyId,
             dryRun,
+            cursor,
+            total: result.total,
             scanned: result.scanned,
             linked: result.linked,
             skipped: result.skipped,
             unmatched: result.unmatched,
             failed: result.failed,
+            partial: result.partial,
+            nextCursor: result.nextCursor,
           })
           return NextResponse.json({ success: true, dryRun, result })
         } catch (error) {
-          log.error('arcim import-documents failed', error as Error)
+          // "400 Bad Request" alone told us nothing when a live Fortnox
+          // discovery failed (2026-08-20): keep status, Fortnox's own
+          // message and a body excerpt in the log, and hand the message
+          // to the UI so the user sees what the source system said.
+          const providerStatus = error instanceof FortnoxApiError ? error.statusCode : undefined
+          const providerMessage = fortnoxErrorMessage(error)
+          log.error('arcim import-documents failed', error as Error, {
+            providerStatus,
+            providerMessage,
+            providerBody:
+              error instanceof FortnoxApiError ? error.body?.slice(0, 500) : undefined,
+          })
+          if (error instanceof FortnoxDocumentScopesRequiredError) {
+            // Reconnecting only helps once the connect request actually asks
+            // for Arkiv and Koppla fil. While it does not, say so plainly
+            // instead of sending the user around a loop that cannot succeed.
+            return errorResponseFromCode(
+              FORTNOX_DOCUMENT_SCOPES_APPROVED
+                ? 'PROVIDER_DOCUMENT_SCOPES_REQUIRED'
+                : 'PROVIDER_DOCUMENT_SCOPES_UNAVAILABLE',
+              moduleLog,
+              { status: 403 },
+            )
+          }
           return errorResponseFromCode('PROVIDER_IMPORT_DOCUMENTS_FAILED', moduleLog, {
-            details: { reason: error instanceof Error ? error.message : 'unknown' },
+            details: {
+              reason: error instanceof Error ? error.message : 'unknown',
+              ...(providerStatus ? { providerStatus } : {}),
+              ...(providerMessage ? { providerMessage } : {}),
+            },
           })
         }
       },

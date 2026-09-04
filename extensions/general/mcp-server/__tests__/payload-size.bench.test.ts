@@ -1,26 +1,47 @@
 import { describe, it, expect } from 'vitest'
 import { tools, deriveToolMeta, isDefaultCatalogTool } from '../server'
 import { projectToolInputSchema } from '../company-routing'
+import { projectToolReferences } from '../tool-namespace'
+
+// Mirror the real tools/list serializer, including the derived staging _meta
+// (requires_approval / approve_tool / preflight) merged over any literal
+// _meta: otherwise the guard under-measures the wire payload.
+const canonicalToolNames = new Set(tools.map((t) => t.name))
+
+function serializeCatalog(namespace: 'gnubok' | 'accounted'): string {
+  const projection = tools.filter(isDefaultCatalogTool).map((t) => {
+    const meta = { ...(deriveToolMeta(t) ?? {}), ...(t._meta ?? {}) }
+    const projected = {
+      name: t.name,
+      ...(t.title ? { title: t.title } : {}),
+      description: t.description,
+      inputSchema: projectToolInputSchema(t),
+      ...(t.outputSchema ? { outputSchema: t.outputSchema } : {}),
+      annotations: t.annotations,
+      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+    }
+    return namespace === 'accounted'
+      ? projectToolReferences(projected, namespace, canonicalToolNames)
+      : projected
+  })
+  return JSON.stringify({ tools: projection })
+}
+
+const tokensFor = (namespace: 'gnubok' | 'accounted') =>
+  Math.round(serializeCatalog(namespace).length / 4)
 
 describe('tools/list payload size guard', () => {
   it('keeps the projected tools/list payload under the context-budget ceiling', () => {
-    // Mirror the real tools/list serializer, including the derived staging
-    // _meta (requires_approval / approve_tool / preflight) merged over any
-    // literal _meta: otherwise the guard under-measures the wire payload.
-    const projection = tools.filter(isDefaultCatalogTool).map((t) => {
-      const meta = { ...(deriveToolMeta(t) ?? {}), ...(t._meta ?? {}) }
-      return {
-        name: t.name,
-        ...(t.title ? { title: t.title } : {}),
-        description: t.description,
-        inputSchema: projectToolInputSchema(t),
-        ...(t.outputSchema ? { outputSchema: t.outputSchema } : {}),
-        annotations: t.annotations,
-        ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
-      }
-    })
-    const payload = JSON.stringify({ tools: projection })
-    const approxTokens = Math.round(payload.length / 4)
+    // Measure BOTH namespaces and guard the larger.
+    //
+    // `?tool_namespace=accounted` rewrites every gnubok_* reference to
+    // accounted_* (+3 chars each), so the accounted projection is inherently
+    // ~200 tokens larger than the gnubok one. CLAUDE.md points new MCP
+    // installs at the accounted-mcp package and the accounted_* aliases, so
+    // that larger payload is what a NEW user's client actually receives,
+    // while this guard measured only the legacy namespace and let the real
+    // worst case drift untested.
+    const approxTokens = Math.max(tokensFor('gnubok'), tokensFor('accounted'))
     // Ceiling progression: 20K to 25K to 30K to 31K to 31.5K to 32K to 36K.
     //   * 20K → 25K when item 8 of the agent-native API plan landed
     //     (additionalProperties: false on all inputSchemas + period_status in the
@@ -152,9 +173,281 @@ describe('tools/list payload size guard', () => {
     //     hint prose was trimmed to the floor first (~30 tokens recovered);
     //     headroom before the change was ~14 tokens, so even the trimmed wire
     //     contract crossed.
-    // Long-term answer to growth is leaning harder on gnubok_search_tools: if this
-    // fires again, prefer trimming descriptions or making a tool opt-in via search
-    // before bumping further.
-    expect(approxTokens).toBeLessThan(58_500)
+    //   * 58.5K → 59K with the model-free upload pair (#748):
+    //     gnubok_create_document_upload + gnubok_complete_document_upload move
+    //     document bytes out of the model context via a signed PUT URL, fixing
+    //     silent base64 corruption on real-size PDFs. Neither tool can be
+    //     search-only: the pair is the primary upload path for harnesses with
+    //     file access, and the legacy inline tool stays listed for clients
+    //     without it. Trimmed first: the create tool's outputSchema was cut to
+    //     upload_id/upload_url/expires_at (method, size cap and echo fields
+    //     moved to description prose) and mime_type made optional on complete;
+    //     the ~360-token remainder is the two tools' wire contract.
+    //   * 59K → 59.5K with the correction-chain depth guard: allow_deep_chain on
+    //     gnubok_correct_entry + gnubok_reverse_journal_entry (the explicit
+    //     bypass agents must discover to override CORRECTION_CHAIN_TOO_DEEP).
+    //     Both property descriptions trimmed to one sentence first; headroom
+    //     before the change was under 20 tokens, so even the trimmed wire
+    //     contract crossed.
+    //   * 59.5K to 59.7K with account VAT treatments: create_account and
+    //     update_account both expose the 12-value treatment vocabulary. The
+    //     descriptions are minimal; the enum values are the wire contract.
+    //   * 59.7K to 59.75K with customer_number on gnubok_create_customer:
+    //     parity with gnubok_update_customer, so setting a customer number no
+    //     longer needs a second staged update after create. The property has
+    //     no description (name + maxLength are the whole contract); headroom
+    //     before the change was ~11 tokens, so even that minimal form crossed.
+    //   * 59.75K to 59.85K with personal_number on gnubok_create_customer: a
+    //     private person's personnummer had no input at all on the MCP path,
+    //     so agents put it in org_number, where nothing masks it (GDPR art.
+    //     5.1 c; 134 such rows across 10 companies on prod). The property is
+    //     the contract; its description and the org_number/payment_terms
+    //     descriptions were trimmed to one short sentence first; headroom
+    //     before the change was ~11 tokens, so even the trimmed form crossed.
+    //   * 59.85K to 59.9K with the bank account on transaction listings
+    //     (customer A4): cash_account_id + cash_account_ledger on
+    //     gnubok_list_uncategorized_transactions and
+    //     gnubok_list_transactions_without_documents, plus a cash_account_id
+    //     filter on the former, so per-account reconciliation can be driven
+    //     from outside. No property descriptions (names are the contract);
+    //     the tool description gained six words; headroom before the change
+    //     was ~50 tokens, so even the bare contract crossed by ~10.
+    //   * 59.9K to 59.95K with the vat_amount currency contract (MCP feedback
+    //     seq 254607): vat_amount on categorize + bulk_book now states its
+    //     denomination (transaction currency, booked in SEK), and
+    //     matched_supplier_id on the two upload tools became ['string','null']
+    //     so strict clients stop failing successful unmatched uploads (seq
+    //     261972). Prose trimmed to the floor first; headroom before the
+    //     change was ~19 tokens, so even the trimmed contract crossed.
+    //   * 59.95K to 60K with operation_status on gnubok_approve_pending_operation
+    //     (feedback seq 261545): a failed approve used to consume the op
+    //     silently, and agents inferred "consumed" from status 'failed' both
+    //     ways. The enum is the contract; the description is one clause;
+    //     headroom before the change was ~15 tokens, so even that crossed.
+    //   * 60K to 60.2K with skatteverket_connection on the briefing: the
+    //     connection-health block (status/source/connected_at) that lets an
+    //     agent warn the user about a dead 65-minute SKV session at session
+    //     start instead of mid-task. The runtime block is emitted only for
+    //     companies with a connection; this cost is the outputSchema contract
+    //     (~140 tokens), already trimmed to two short description strings.
+    //   * 60.2K to 60.7K with gnubok_create_company (issue #1814 PR 3): a
+    //     default-catalog tool by necessity, since a client that has not
+    //     connected yet can only call what tools/list shows and this is the
+    //     first protected call of agent-driven onboarding. Its contract was
+    //     trimmed to bare property names first (the two connect-link tools
+    //     are search-only); headroom before the change was ~0 after the skatteverket_connection bump, so even the
+    //     bare contract crossed by ~420.
+    //   * 60.7K to 61.2K with the two connect-link tools moved into the default
+    //     catalog (issue #1814): Claude.ai can only CALL tools present in
+    //     tools/list, so catalogVisibility 'search' means discover-only there;
+    //     the onboarding flow dead-ended on client-side tool-not-found when
+    //     the skill pointed at them (SilverPark session, 2026-08-26).
+    //   * 61.2K to 61.5K with gnubok_lookup_company (org-number-first
+    //     onboarding): default-catalog for the same reason as the connect
+    //     tools; the onboarding skill's first instruction is to call it, and
+    //     a search-only tool is uncallable on Claude.ai. Descriptions were
+    //     trimmed first; the tool costs ~265 tokens against ~0 headroom.
+    //   * 61.5K to 62K with gnubok_sie_preflight (migration-first onboarding):
+    //     the scan-before-import step the skill instructs for shared SIE
+    //     files, so default-catalog for the same Claude.ai reason; ~390
+    //     tokens (schema carries the mappings-passthrough contract).
+    //   * 62K to 62.4K with gnubok_create_sie_upload + upload_id/sha256 on the
+    //     two SIE tools: the byte-exact upload path after a real 104 KB file
+    //     dead-ended in chat (a model cannot reproduce 30k tokens verbatim
+    //     without silent-truncation risk); skill-instructed, so default catalog.
+    //   * 62.4K to 63K with gnubok_connect_migration (the previous-system
+    //     connect card, same one-click feel as bank/Skatteverket): the skill
+    //     instructs calling it when the user names Fortnox/BL/Briox/Wint, so
+    //     default catalog for the standing Claude.ai reason.
+    //   * 63K to 63.4K with gnubok_reconcile_match promoted to the default
+    //     catalog: the onboarding efterkontroll instructs matching bank rows
+    //     against SIE verifikat, and a search-only tool is uncallable on
+    //     Claude.ai (E2E #12 punted to the web app over it).
+    //   * 63.4K to 63.6K with NO new tool: the guard started measuring the
+    //     accounted_* namespace as well as gnubok_* and asserting on the
+    //     larger. The accounted projection was already ~90 tokens over the
+    //     63.4K line (the namespace rewrite costs ~209 tokens on its own) and
+    //     nothing tested it, so this bump buys no new catalog surface. It
+    //     re-points an existing ceiling at the payload new installs actually
+    //     receive; the gnubok projection still sits ~320 tokens under it.
+    //   * 63.6K DOWN to 63.1K, the first tightening in this ledger. Two
+    //     changes, net -549 tokens on the guarded (accounted) projection:
+    //     gnubok_get_agent_briefing's outputSchema went 7,743 to 4,565 chars
+    //     by condensing four sub-schemas whose interiors were documentation
+    //     rather than contract (ledger_context, dimensions,
+    //     skatteverket_connection, recommended_tools: agent-briefing.test.ts
+    //     pins their RUNTIME shape, so nothing was left unguarded), against
+    //     +~245 for the new gnubok_call_tool.
+    //   * 63.1K to 63.8K with gnubok_update_customer promoted to the default
+    //     catalog (#1706, #1876). gnubok_call_tool (above) only bridges READ
+    //     tools and refuses writes, so a search-only WRITE tool is still
+    //     uncallable on Claude.ai; the reporter read the tool as missing twice.
+    //     The +761 tokens are the 19-property partial-update wire contract plus
+    //     the staging envelope; the description is already 152 chars.
+    //     Measured 63 761 on the accounted projection after merging #1993
+    //     (line_type and revenue_account declared on the create item schema).
+    //   * 63.8K to 64.4K with gnubok_set_run_salary in the default catalog
+    //     (variable owner pay, the payroll_month flagship flow). Same reason
+    //     as update_customer: a search-only WRITE is uncallable on Claude.ai,
+    //     and both update_payslip_line's description and the payroll_month
+    //     loadout point agents at this tool. Measured 64 315 on the accounted
+    //     projection. This bump skips the "demote a read first" rule below
+    //     deliberately: picking which read to demote needs prod usage data
+    //     (MCP usage profile), not a guess inside a payroll PR: do that
+    //     demotion as its own change and ratchet this ceiling back down.
+    //   * 64.4K to 65K with gnubok_ignore_transaction in the default catalog
+    //     (issue #1661: private marking in a locked period). Same reason as
+    //     set_run_salary: a search-only WRITE is uncallable on Claude.ai, and
+    //     the TX_CATEGORIZE_PRIVATE_PERIOD_LOCKED remediation, three loadouts
+    //     and the reconcile-month skill instruct agents to CALL it. Measured
+    //     64 863 on the accounted projection (+548: a 4-property schema plus
+    //     the staging envelope; the description is one sentence per fact).
+    //     Same deliberate skip of the read-demotion rule as the entry above:
+    //     the demotion needs prod usage data, not a guess inside this PR.
+    //   * 65K to 61.3K by demoting ten rarely-called READ tools to
+    //     search-only (2026-08-31). This is the demotion the two entries above
+    //     deferred for want of prod usage data, done as its own change and
+    //     ratcheting the ceiling back down as they asked.
+    //
+    //     Picked from 60 days of mcp.tool_called: default-catalog reads with
+    //     <= 25 calls, excluding anything in RECOMMENDED_WORKFLOW_LOADOUTS.
+    //     Deliberately NOT demoted despite low counts:
+    //       - gnubok_call_tool, which IS the search-only bridge;
+    //       - gnubok_receipt_matcher and gnubok_vat_review_widget, which are
+    //         WIDGET tools: the host renders them from the _meta.ui they
+    //         publish in tools/list, so search-only makes the widget
+    //         unrenderable. Their own tests catch this; both were demoted in a
+    //         first pass and put back.
+    //       - the connect_* onboarding tools (#1936 put them in the catalog on
+    //         purpose: a fresh agent has not learned to search yet);
+    //       - gnubok_lookup_company, the org-number-first onboarding entry;
+    //       - every arsredovisning / dispositioner / depreciation / accrual
+    //         PROPOSAL tool. A 60-day window ending in August cannot see
+    //         bokslut season at all: most Swedish companies close on 31 Dec and
+    //         do the work Jan-Jun, so summer counts understate them to near
+    //         zero. Demoting those would hide the year-end flow exactly when it
+    //         is needed. Usage data is necessary here, not sufficient.
+    //
+    //   * 61.3K to 61.5K by adding worked `examples` to five tools
+    //     (2026-09-01, #2066): categorize_transaction, create_voucher,
+    //     query_journal, approve_pending_operation, get_kpi_report. 199 tokens
+    //     for 10 examples, spending part of what the demotion above reclaimed
+    //     and leaving ~118 under the ceiling. The ceiling is NOT raised.
+    //     Examples were priced against 30 days of mcp.tool_called and aimed at
+    //     the combinations the descriptions already warn about and callers
+    //     still get wrong (account_override without vat_treatment;
+    //     representation without deltagare; confirmed on a high-risk approval;
+    //     `metric` sent to a tool whose only parameter is period_id).
+    //     Cheaper than it looks per example, so the next batch should still
+    //     demote a read first rather than assume there is room.
+    //
+    //   * 61.5K to 58.9K by trimming the ONE schema 58 catalogued tools share
+    //     (2026-09-01). Measured first, which is what made it findable:
+    //     outputSchema is 38% of the whole catalog (23 290 tokens), and
+    //     STAGED_OPERATION_SCHEMA alone accounted for 14 736 of it, the same
+    //     envelope transmitted 58 times. Descriptions, which the three rounds
+    //     above trimmed, are only 10%.
+    //
+    //     Three edits, no tool demoted and no field removed: period_status
+    //     stops declaring its sub-shape as JSON Schema and carries it in one
+    //     sentence instead (actor, approve and preview were already bare
+    //     objects, so this makes the envelope internally consistent), the next
+    //     hint drops args' redundant additionalProperties: true, and
+    //     operation_id's description loses six words. Every
+    //     change is in the LOOSER direction: the server emits
+    //     structuredContent for every tool, and the documented failure mode is
+    //     a declaration too TIGHT making a strict client reject a successful
+    //     call. A looser declaration cannot do that.
+    //
+    //     next keeps additionalProperties: false: staging.test.ts pins it as a
+    //     closed shape, and a guard whose reason is not in front of you is not
+    //     a guard to loosen for 420 tokens.
+    //
+    //     Ceiling set to 60 000, not to 59 250. That leaves ~1 070 tokens of
+    //     deliberate working margin, about two or three ordinary tool
+    //     additions. The log above shows the tight-ratchet cycle: ratchet to
+    //     ~300 margin, block the next feature, bump, feel bad, demote. server.ts
+    //     took 70 commits in the 14 days before this change and the margin was
+    //     116 tokens, which is how that cycle starts. The margin is here so the
+    //     guard catches sustained growth rather than the next commit.
+    //
+    //     If more is needed, the lever is known and priced: the envelope still
+    //     costs ~11 800 tokens across those 58 tools, and the structural fix is
+    //     to stop repeating it, not to trim it further.
+    //
+    //   * 59.0K to 59.1K: second examples batch (2026-09-01, #2066), 7
+    //     examples on 5 more tools for 80 tokens, spending under half the
+    //     margin the envelope trim created. Picked by evidence: search_tools
+    //     was sent a nonexistent `offset` in prod the same day, the upload
+    //     pair's examples ARE the two-step flow, and
+    //     list_uncategorized_transactions is the highest-traffic read.
+    //
+    //   * +1 property, ~25 tokens (2026-09-02, MCP feedback seq 299742):
+    //     exchange_rate_override on create_supplier_invoice_from_inbox. A
+    //     foreign supplier invoice whose Riksbanken lookup fails stages with
+    //     exchange_rate: null and can never be approved (SI_FX_RATE_MISSING);
+    //     the property is the only way to unblock it from an agent. One short
+    //     description, no example; the lookup itself now goes through the
+    //     shared resolver with the cache, so the case is also rarer.
+    //
+    // Long-term answer to growth is no longer a ceiling bump. gnubok_call_tool
+    // makes `catalogVisibility: 'search'` usable for READ tools on hosts that
+    // can only invoke what tools/list showed them, which is the constraint that
+    // forced gnubok_reconcile_match back into the default catalog on
+    // 2026-08-26. Demote a read to search-only before proposing a bump.
+    //
+    // Only READ tools may be demoted: gnubok_call_tool refuses writes, so a
+    // search-only WRITE is uncallable on Claude.ai. That is why the three
+    // bumps above happened instead of demotions.
+    //
+    //   * 2026-09-02, offert (#2163): gnubok_set_quote_status (a WRITE, so it
+    //     must stay in the default catalog) plus document_type / valid_until /
+    //     quote_status on create, list and get. Measured 60 306 after merging
+    //     the sales-order tools from #2166, then 60 093 after shortening every
+    //     quote description and dropping set_quote_status's outputSchema to a
+    //     bare object. The remaining ~100 tokens came from demoting
+    //     gnubok_get_arsredovisning_filing_status to search-only: iXBRL
+    //     filing is off until the Bolagsverket avtal exists, so no client
+    //     polls it. Ceiling unchanged.
+    //   * 2026-09-03, jamkning (#2240) landing on top of proforma (#2254):
+    //     two one-line field notes on create/update_employee measured 60 010
+    //     after merging main. Demoted gnubok_list_arsredovisning_versions to
+    //     search-only: versions exist only once a report is rendered for
+    //     signing or filing, which is the same switched-off iXBRL path as its
+    //     sibling filing_status tool. Ceiling unchanged.
+    expect(approxTokens).toBeLessThan(60_000)
+  })
+
+  /**
+   * The trap that catches anyone reclaiming budget by demoting reads.
+   *
+   * A widget tool publishes _meta.ui in tools/list, and that is how the host
+   * knows to render it. Search-only hides it from tools/list, so the widget
+   * silently stops rendering while the tool still "works" when called. Two
+   * widget tools were demoted in the 2026-08-31 pass and put back; their own
+   * suites caught it, but only because those suites happen to exist. This
+   * makes the rule hold for every widget tool added later.
+   */
+  it('never lets a widget tool fall out of the default catalog', () => {
+    const hiddenWidgets = tools
+      .filter((t) => (t as { _meta?: { ui?: unknown } })._meta?.ui)
+      .filter((t) => !isDefaultCatalogTool(t))
+      .map((t) => t.name)
+
+    expect(
+      hiddenWidgets,
+      `Widget tools publish _meta.ui in tools/list and the host renders them from it. ` +
+        `catalogVisibility: 'search' hides them there, so the widget stops rendering: ` +
+        hiddenWidgets.join(', '),
+    ).toEqual([])
+  })
+
+  it('keeps the accounted_* namespace as the measured worst case', () => {
+    // Pins the DIRECTION of the delta, not its size. If a future change ever
+    // made gnubok_* the larger projection, the Math.max above would silently
+    // keep passing while this guard stopped describing reality.
+    expect(serializeCatalog('accounted').length).toBeGreaterThan(
+      serializeCatalog('gnubok').length,
+    )
   })
 })

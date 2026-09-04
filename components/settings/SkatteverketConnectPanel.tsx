@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/components/ui/use-toast'
 import { useCapability } from '@/contexts/CompanyContext'
 import { isAllowedSkvPopupOrigin } from '@/lib/skatteverket/popup-origin'
+import { isSelfHosted } from '@/lib/env/public-flags'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { UpgradeNote } from '@/components/billing/UpgradeNote'
 import {
@@ -18,6 +19,7 @@ import {
 } from '@/components/settings/SettingsRows'
 import { CheckCircle2, ExternalLink, Loader2, ShieldOff, FlaskConical, ShieldAlert } from 'lucide-react'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { useBranding } from '@/lib/branding/brand-context'
 
 type Environment = 'test' | 'prod'
 
@@ -304,7 +306,13 @@ function SkatteverketPersonalConnectionCard() {
               size="sm"
               onClick={startConnect}
               disabled={status?.disabled || !hasSkatteverket || connecting}
-              title={!hasSkatteverket ? 'Anslutning till Skatteverket kräver ett abonnemang' : undefined}
+              title={
+                !hasSkatteverket
+                  ? isSelfHosted()
+                    ? t('connect_requires_connector_key')
+                    : t('connect_requires_subscription')
+                  : undefined
+              }
             >
               <ExternalLink className="mr-2 h-4 w-4" />
               {connecting ? t('connect_waiting') : t('connect_with_bankid')}
@@ -363,7 +371,13 @@ function SkatteverketPersonalConnectionCard() {
               size="sm"
               onClick={startConnect}
               disabled={status.disabled || !hasSkatteverket || connecting}
-              title={!hasSkatteverket ? 'Anslutning till Skatteverket kräver ett abonnemang' : undefined}
+              title={
+                !hasSkatteverket
+                  ? isSelfHosted()
+                    ? t('connect_requires_connector_key')
+                    : t('connect_requires_subscription')
+                  : undefined
+              }
             >
               <ExternalLink className="mr-2 h-4 w-4" />
               {connecting ? t('connect_waiting') : t('reconnect')}
@@ -381,7 +395,7 @@ function SkatteverketPersonalConnectionCard() {
         </SettingsRowEnd>
       </SettingsRow>
 
-      <SettingsRow label={t('token_expires_label')}>
+      <SettingsRow label={t('token_expires_label')} help={t('session_lifetime_note')}>
         <SettingsRowNote className="tabular-nums">
           {expiresAtDate.toLocaleString('sv-SE')}
           {!status.expired && expiresInMinutes > 0 && (
@@ -442,9 +456,51 @@ interface SystemConnectionState {
  */
 function SkatteverketSystemConnectionCard() {
   const t = useTranslations('settings_skatteverket_connect')
+  const { appName } = useBranding()
   const { toast } = useToast()
   const [state, setState] = useState<SystemConnectionState | null>(null)
   const [verifying, setVerifying] = useState(false)
+  const [linking, setLinking] = useState(false)
+
+  /**
+   * Ombudshantering deep link: Skatteverket's e-service opens with the app
+   * pre-filled as ombud and both roles pre-selected, so the company only
+   * signs. The tab is opened synchronously on click (popup blockers) and
+   * pointed at the link once the server has minted it.
+   */
+  async function openDeepLink() {
+    setLinking(true)
+    // No 'noopener' feature here: with it window.open returns null and the
+    // pre-opened tab (the popup-blocker mitigation) would never exist. The
+    // opener link is cut by hand instead.
+    const tab = window.open('', '_blank')
+    if (tab) tab.opener = null
+    try {
+      const res = await fetch('/api/extensions/ext/skatteverket/system-connection/deeplink', {
+        method: 'POST',
+      })
+      const body = await res.json().catch(() => ({}))
+      const url = typeof body?.data?.djuplank === 'string' ? body.data.djuplank : null
+      if (!res.ok || !url) {
+        tab?.close()
+        toast({
+          title: t('system_deeplink_failed'),
+          description: typeof body?.error === 'string' ? body.error : undefined,
+          variant: 'destructive',
+        })
+        return
+      }
+      // A blocked pre-open means a second window.open after the await would
+      // be blocked too: navigate this tab instead so the link is never lost.
+      if (tab) tab.location.href = url
+      else window.location.assign(url)
+    } catch {
+      tab?.close()
+      toast({ title: t('system_deeplink_failed'), variant: 'destructive' })
+    } finally {
+      setLinking(false)
+    }
+  }
 
   async function loadState() {
     try {
@@ -511,7 +567,7 @@ function SkatteverketSystemConnectionCard() {
   }
 
   return (
-    <SettingsGroup label={t('system_title')} help={t('system_intro')}>
+    <SettingsGroup label={t('system_title')} help={t('system_intro', { appName })}>
       {state.ombud_org_number && (
         <SettingsRow label={t('system_org_label')}>
           <span className="font-mono text-sm tabular-nums">{state.ombud_org_number}</span>
@@ -527,11 +583,15 @@ function SkatteverketSystemConnectionCard() {
 
       {state.cert?.expiresSoon && (
         <WarningLine>
-          {t('system_cert_expires_soon', { days: state.cert.daysUntilExpiry })}
+          {t('system_cert_expires_soon', { days: state.cert.daysUntilExpiry, appName })}
         </WarningLine>
       )}
 
       <div className="flex flex-wrap items-center gap-4 px-1 py-3">
+        <Button size="sm" variant="outline" onClick={openDeepLink} disabled={linking} title={t('system_deeplink_hint', { appName })}>
+          {linking ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ExternalLink className="mr-2 h-4 w-4" />}
+          {linking ? t('system_deeplink_loading') : t('system_deeplink', { appName })}
+        </Button>
         {state.grant_url && (
           <a
             href={state.grant_url}

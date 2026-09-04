@@ -19,12 +19,27 @@ vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: vi.fn().mockResolvedValue({ ok: true }),
 }))
 vi.mock('@/lib/email/service', () => ({ getEmailService: vi.fn() }))
+// The sandbox guard issues a company_settings query at the top of the route;
+// short-circuit it in tests since the queued mock-supabase is shaped for the
+// route's existing fetch chain, not an extra pre-flight read. Mirrors the same
+// mock on the sibling /api/invoices/[id]/send route.
+vi.mock('@/lib/sandbox/guard', () => ({
+  guardSandbox: vi.fn().mockResolvedValue(null),
+  isSandboxCompany: vi.fn().mockResolvedValue(false),
+  sandboxBlockedResponse: vi.fn(),
+}))
+
 vi.mock('@/lib/entitlements/has-capability', () => ({
   requireCapability: vi.fn().mockResolvedValue(null),
 }))
 vi.mock('@/lib/branding/service', () => ({
   getBranding: () => ({ appUrl: 'https://app.example.test' }),
 }))
+const brandSenderMock = vi.hoisted(() => ({
+  getSenderForCompany: vi.fn(),
+  getBaseUrlForBrand: vi.fn(),
+}))
+vi.mock('@/lib/email/brand-sender', () => brandSenderMock)
 vi.mock('@/lib/salary/payslips/links', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/salary/payslips/links')>()
   return {
@@ -70,6 +85,13 @@ describe('POST /api/salary/runs/[id]/payslips/send', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(rotateLinkForEmployee).mockResolvedValue({ token: 'T'.repeat(43) })
+    brandSenderMock.getSenderForCompany.mockResolvedValue({
+      fromName: null,
+      fromAddress: null,
+      replyTo: null,
+      brand: null,
+    })
+    brandSenderMock.getBaseUrlForBrand.mockReturnValue('https://app.example.test')
   })
 
   it('returns 401 when unauthenticated', async () => {
@@ -82,6 +104,25 @@ describe('POST /api/salary/runs/[id]/payslips/send', () => {
     const request = createMockRequest('/api/salary/runs/run-1/payslips/send', { method: 'POST' })
     const response = await POST(request, createMockRouteParams({ id: 'run-1' }))
     expect(response.status).toBe(401)
+  })
+
+  it('refuses to send for a sandbox company', async () => {
+    // The demo ships a booked salary run, which puts "Skicka lönebesked" one
+    // click from an anonymous visitor. Without this gate the route reaches the
+    // live mail provider and bounces off the production sending domain.
+    const { guardSandbox } = await import('@/lib/sandbox/guard')
+    vi.mocked(guardSandbox).mockResolvedValueOnce(
+      NextResponse.json({ sandbox_blocked: true }, { status: 403 }),
+    )
+    const { supabase } = createQueuedMockSupabase()
+    authed(supabase)
+    const sendEmail = mockEmail({ success: true, messageId: 'm-1' })
+
+    const request = createMockRequest('/api/salary/runs/run-1/payslips/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'run-1' }))
+
+    expect(response.status).toBe(403)
+    expect(sendEmail).not.toHaveBeenCalled()
   })
 
   it('returns 403 when the company lacks the email_send capability', async () => {
@@ -197,6 +238,44 @@ describe('POST /api/salary/runs/[id]/payslips/send', () => {
     // Uses the current company name (company_settings.company_name via the
     // resolver), not the frozen onboarding companies.name ('Bolaget AB').
     expect(emailArgs.subject).toContain('Ny Firma AB')
+  })
+
+  it('sends the branded payslip mail: brand link base + brand sender (WL-13)', async () => {
+    brandSenderMock.getSenderForCompany.mockResolvedValue({
+      fromName: 'Siffra',
+      fromAddress: 'noreply@post.siffra.se',
+      replyTo: 'support@siffra.se',
+      brand: { appName: 'Siffra', domain: 'app.siffra.se' },
+    })
+    brandSenderMock.getBaseUrlForBrand.mockReturnValue('https://app.siffra.se')
+
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    authed(supabase)
+    const sendEmail = mockEmail({ success: true, messageId: 'msg-1' })
+
+    enqueueMany([
+      { data: RUN },
+      { data: { name: 'Bolaget AB', org_number: '5560000000' } },
+      {
+        data: [
+          {
+            employee_id: 'emp-1',
+            employee: { first_name: 'Anna', last_name: 'A', email: 'anna@example.test' },
+          },
+        ],
+      },
+    ])
+
+    const request = createMockRequest('/api/salary/runs/run-1/payslips/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'run-1' }))
+    expect(response.status).toBe(200)
+
+    expect(brandSenderMock.getSenderForCompany).toHaveBeenCalledWith('company-1')
+    const emailArgs = sendEmail.mock.calls[0][0]
+    expect(emailArgs.html).toContain(`https://app.siffra.se/payslip/${'T'.repeat(43)}`)
+    expect(emailArgs.fromName).toBe('Siffra')
+    expect(emailArgs.fromAddress).toBe('noreply@post.siffra.se')
+    expect(emailArgs.replyTo).toBe('support@siffra.se')
   })
 
   it('records provider failures without failing the whole batch', async () => {

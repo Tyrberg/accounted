@@ -3,7 +3,7 @@
  *
  * Full send pipeline. Renders the invoice PDF, emails it to the customer
  * (with a copy to the company), allocates the F-series number, posts the
- * journal entry under accrual basis, archives the PDF as underlag, and
+ * journal entry when the company books at issue, archives the PDF as underlag, and
  * emits invoice.sent. This is :mark-sent + PDF + email + archival.
  *
  * Failure ordering (matches the dashboard's internal /api/invoices/[id]/send
@@ -26,12 +26,12 @@
  *      failure never blocks the send; it surfaces as a PAYMENT_LINK_FAILED
  *      warning on the response once the email is delivered.
  *   7. Final PDF render with the real number.
- *   8. Email send via Resend (the email extension). Fail → 502
+ *   8. Email send via the email extension (Resend or SMTP). Fail → 502
  *      INVOICE_SEND_PROVIDER_FAILED. The number IS consumed at this point;
  *      same orphan-window as :mark-sent (architecturally tracked).
  *   9. POINT OF NO RETURN. Steps below are best-effort; failures surface
  *      as `warnings` on the response. Status flip → 'sent', journal entry
- *      (accrual + real invoice), PDF archival via uploadDocument,
+ *      (book-at-issue + real invoice), PDF archival via uploadDocument,
  *      invoice.sent event emission.
  *
  * Idempotent (mandatory Idempotency-Key). Dry-runnable: dry-run goes
@@ -45,17 +45,20 @@ import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
 import { prepareInvoicePdfRender, buildSwishQrDataUrl, buildPaymentLinkQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import { snapshotInvoicePayee } from '@/lib/invoices/invoice-payee'
 import { applyPaymentLinkToInvoice } from '@/lib/extensions/payment-links'
 import { getEmailService } from '@/lib/email/service'
+import { resolveInvoiceSender } from '@/lib/email/invoice-sender'
 import {
   generateInvoiceEmailHtml,
   generateInvoiceEmailSubject,
   generateInvoiceEmailText,
 } from '@/lib/email/invoice-templates'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
+import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
@@ -76,6 +79,7 @@ import {
   hasRequiredInvoicePaymentAccount,
   invoiceRequiresPaymentAccount,
 } from '@/lib/invoices/payment-accounts'
+import { hasRequiredSellerVatNumber } from '@/lib/invoices/seller-vat-number'
 import { eventBus } from '@/lib/events'
 import { guardSandbox } from '@/lib/sandbox/guard'
 import { requireCapability } from '@/lib/entitlements/has-capability'
@@ -121,14 +125,14 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/invoices/:id/send',
   summary: 'Send a draft invoice to the customer by email.',
   description:
-    'The full send pipeline: preflight PDF render → allocate F-series number atomically → final PDF render → email via Resend (PDF attachment, copy to company) → flip status to sent → post journal entry (accrual + real invoice) → archive PDF as underlag → emit invoice.sent. Email failure is a hard 502 before state changes; post-email failures surface as warnings but the invoice IS marked sent.',
+    'The full send pipeline: preflight PDF render → allocate F-series number atomically → final PDF render → email via the email extension (Resend or SMTP; PDF attachment, copy to company) → flip status to sent → post journal entry (real invoice, unless kontantmetoden or defer_invoice_booking) → archive PDF as underlag → emit invoice.sent. Email failure is a hard 502 before state changes; post-email failures surface as warnings but the invoice IS marked sent.',
   useWhen:
-    'You want Accounted to deliver the invoice to the customer via email. For invoices delivered through another channel (Peppol, postal, own SMTP) use :mark-sent instead.',
+    'You want Accounted to deliver the invoice to the customer via email. Peppol e-invoices are sent from the invoice page in the dashboard (per-company access grant requested under Inställningar > Fakturering (Settings > Invoicing); aktiebolag senders, standard invoices only, Swedish org-number buyers whose org number is not a personnummer, SEK with taxable Swedish VAT at 6/12/25 % only, no ROT/RUT deductions); a v1 or MCP Peppol send action is not yet available. A successful dashboard Peppol send issues the invoice itself, so do not call :mark-sent after it; only if the dashboard reports that the invoice was sent via Peppol but could not be marked as sent does :mark-sent complete the issuance. For invoices delivered through another channel (an external e-invoice provider, postal, own SMTP) use :mark-sent instead.',
   doNotUseFor:
     'Re-sending an already-sent invoice (returns 409 INVOICE_UPDATE_NOT_DRAFT). Sending a delivery note (no F-series lifecycle). Sending a credit note (use the :credit endpoint to issue the kreditfaktura; subsequent re-send of the credit note via :mark-sent is the supported path).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
-    'Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.',
+    'Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL (or an SMTP relay via EMAIL_PROVIDER=smtp) the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.',
     'Customer must have an email address. 400 INVOICE_SEND_NO_CUSTOMER_EMAIL otherwise.',
     'A cancelled invoice is rejected (400 INVOICE_SEND_CANCELLED): its F-series number is preserved for compliance but the document is not a valid faktura.',
     'Email failure before the status flip leaves the F-series number consumed but the invoice in `draft` status. Same orphan window as :mark-sent (architecturally tracked, matches internal route).',
@@ -225,7 +229,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     const { data: invoice, error: fetchErr } = await ctx.supabase
       .from('invoices')
       .select(
-        `${INVOICE_FULL_COLUMNS}, customer:customers(id, name, customer_number, email, customer_type, country, address_line1, address_line2, postal_code, city, vat_number), items:invoice_items(${INVOICE_ITEM_FULL_COLUMNS})`,
+        // deduction_personnummer_encrypted rides along for the render only:
+        // the PDF template derives the masked personnummer (YYYYMMDD-XXXX)
+        // from it. It stays out of INVOICE_FULL_COLUMNS (the API projection)
+        // and this route never echoes the row.
+        `${INVOICE_FULL_COLUMNS}, deduction_personnummer_encrypted, customer:customers(id, name, customer_number, email, customer_type, country, address_line1, address_line2, postal_code, city, vat_number, invoice_email_cc_addresses, invoice_email_bcc_addresses), items:invoice_items(${INVOICE_ITEM_FULL_COLUMNS})`,
       )
       .eq('company_id', ctx.companyId!)
       .eq('id', invoiceId)
@@ -264,17 +272,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     }
 
     const bodyResult = InvoiceSendBody.safeParse(rawBody)
-    if (!bodyResult.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: bodyResult.error.issues.map((issue) => ({
-            field: issue.path.join('.'),
-            message: issue.message,
-          })),
-        },
-      })
-    }
+    if (!bodyResult.success) return v1ValidationError(ctx, bodyResult.error)
 
     // Reject delivery notes: they have a different (D-series) lifecycle.
     if (typed.document_type === 'delivery_note') {
@@ -344,10 +342,25 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     }
     const settings = company as CompanySettings & { accounting_method?: string }
     const paymentAccountRequired = invoiceRequiresPaymentAccount(typed)
+    // Freeze the chosen bank account's payee at issue (no-op without a choice).
+    const payeeSnapshot = await snapshotInvoicePayee(ctx.supabase, ctx.companyId!, typed, { persist: !ctx.dryRun })
+    if (!payeeSnapshot.ok) {
+      return v1ErrorResponseFromCode(payeeSnapshot.code, ctx.log, {
+        requestId: ctx.requestId,
+        details: payeeSnapshot.details,
+      })
+    }
+    typed.payment_details = payeeSnapshot.payee
     if (!hasRequiredInvoicePaymentAccount(settings, typed)) {
       return v1ErrorResponseFromCode('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING', ctx.log, {
         requestId: ctx.requestId,
         details: { currency: typed.currency },
+      })
+    }
+
+    if (!hasRequiredSellerVatNumber(settings, typed)) {
+      return v1ErrorResponseFromCode('INVOICE_SEND_VAT_NUMBER_MISSING', ctx.log, {
+        requestId: ctx.requestId,
       })
     }
 
@@ -382,6 +395,8 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       to: customer.email,
       configuredCc: settings.invoice_email_cc_addresses,
       configuredBcc: settings.invoice_email_bcc_addresses,
+      customerCc: customer.invoice_email_cc_addresses,
+      customerBcc: customer.invoice_email_bcc_addresses,
       // The company email is fixed routing, not an arbitrary
       // request-controlled recipient.
       legacyCc: settings.email,
@@ -421,6 +436,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       try {
         const preflight = await prepareInvoicePdfRender(settings, typed.currency, {
           paymentAccountRequired,
+          payee: typed.payment_details ?? null,
         })
         await renderToBuffer(
           InvoicePDF({
@@ -456,7 +472,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           would_cc_addresses: recipients.cc,
           would_create_journal_entry:
             (!typed.document_type || typed.document_type === 'invoice') &&
-            (settings.accounting_method ?? 'accrual') === 'accrual',
+            booksInvoicesOnIssue(settings),
           accounting_method: settings.accounting_method ?? 'accrual',
           preflight_pdf_render: 'ok',
         },
@@ -556,7 +572,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       const { branding, company: renderCompany } = await prepareInvoicePdfRender(
         settings,
         renderableInvoice.currency,
-        { paymentAccountRequired },
+        { paymentAccountRequired, payee: typed.payment_details ?? null },
       )
       const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, renderableInvoice)
       const paymentLinkQrDataUrl = await buildPaymentLinkQrDataUrl(renderableInvoice)
@@ -616,6 +632,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         text,
         replyTo: settings.email ?? undefined,
         fromName: settings.company_name ?? undefined,
+        from: await resolveInvoiceSender(ctx.supabase, ctx.companyId!, settings.company_name),
         filename,
         pdfBuffer,
       })
@@ -700,11 +717,12 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
-    // Step 9b: journal entry (accrual + real invoices).
+    // Step 9b: journal entry for real invoices when the company books at
+    // issue. Kontantmetoden books at payment; defer_invoice_booking (#967)
+    // books via the explicit Bokför step. Same gate as the dashboard.
     let journalEntryId: string | null = null
     const isRealInvoice = !typed.document_type || typed.document_type === 'invoice'
-    const accountingMethod = settings.accounting_method ?? 'accrual'
-    if (isRealInvoice && accountingMethod === 'accrual') {
+    if (isRealInvoice && booksInvoicesOnIssue(settings)) {
       try {
         const entry = await createInvoiceJournalEntry(
           ctx.supabase,

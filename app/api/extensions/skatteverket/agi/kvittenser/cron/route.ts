@@ -1,11 +1,11 @@
-import { createClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { createLogger } from '@/lib/logger'
 import { verifyCronSecret } from '@/lib/auth/cron'
 import { SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api-client'
 import { markNeedsReconsent, RECONSENT_ERROR_CODES } from '@/extensions/general/skatteverket/lib/token-store'
-import { currentSkvEnvironment } from '@/extensions/general/skatteverket/lib/resolve-auth'
+import { currentSkvEnvironment, findCompanyTokenUser } from '@/extensions/general/skatteverket/lib/resolve-auth'
 import { markGrantRevoked } from '@/extensions/general/skatteverket/lib/connection-store'
 import { reconcileAgiDeclaration } from '@/extensions/general/skatteverket/lib/agi-kvittens-reconcile'
 import { formatRedovisningsperiod } from '@/lib/skatteverket/format'
@@ -18,8 +18,8 @@ ensureInitialized()
 export const maxDuration = 60
 
 // Failure logs route through the structured logger so third-party error
-// strings pass its redaction. The APIGW warn / budget + summary logs /
-// capability skip stay on console.*: their content is fixed internal strings.
+// strings pass its redaction. The budget + summary logs / capability skip
+// stay on console.*: their content is fixed internal strings.
 const log = createLogger('agi-kvittenser-cron')
 
 // Cron responses must never be cached: they report a point-in-time run.
@@ -68,7 +68,7 @@ export async function GET(request: Request) {
     )
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   const { data: pending, error: pendingError } = await supabase
     .from('agi_declarations')
@@ -104,14 +104,10 @@ export async function GET(request: Request) {
   type Result = {
     declarationId: string
     period: string
-    status: 'signed' | 'still_pending' | 'already_claimed' | 'no_token' | 'no_company_settings' | 'expired_token' | 'grant_revoked' | 'apigw_config' | 'error'
+    status: 'signed' | 'still_pending' | 'already_claimed' | 'no_token' | 'no_company_settings' | 'expired_token' | 'grant_revoked' | 'error'
     error?: string
   }
   const results: Result[] = []
-  // The APIGW subscription gap is one run-level configuration problem, not a
-  // per-declaration one: warn once per run instead of spamming an identical
-  // warning for every affected declaration.
-  let apigwAccessDeniedWarned = false
 
   for (const decl of pending) {
     if (Date.now() - startTime > TIME_BUDGET_MS) {
@@ -166,13 +162,12 @@ export async function GET(request: Request) {
       ) {
         // Persist the health flag so both crons stop retrying this
         // connection and the UI can prompt for re-consent proactively.
-        const { data: tokenRow } = await supabase
-          .from('skatteverket_tokens')
-          .select('user_id')
-          .eq('company_id', companyId)
-          .maybeSingle()
-        if (tokenRow?.user_id) {
-          await markNeedsReconsent(supabase, tokenRow.user_id as string, err.code)
+        // Same pick as the reconciler's resolveReadAuth (a company can hold
+        // one row per connected member), so the flag lands on the row that
+        // just failed.
+        const tokenRow = await findCompanyTokenUser(supabase, companyId)
+        if (tokenRow) {
+          await markNeedsReconsent(supabase, tokenRow.userId, companyId, err.code)
         }
         results.push({ declarationId, period, status: 'expired_token', error: err.code })
         continue
@@ -182,30 +177,23 @@ export async function GET(request: Request) {
         results.push({ declarationId, period, status: 'expired_token', error: err.code })
         continue
       }
-      if (err instanceof SkatteverketAuthError && err.code === 'ACCESS_DENIED') {
-        // Skatteverkets API gateway rejected our client credentials before
-        // the user's bearer was ever evaluated: the APIGW client
-        // (SKATTEVERKET_APIGW_CLIENT_ID) lacks an Utvecklarportalen
-        // subscription for the AGI hantera API. Retrying every run cannot
-        // heal this and the user reconnecting via BankID does not help, so
-        // log at warn level instead of error to keep the 2h cron from
-        // producing error-noise for a known configuration gap. The distinct
-        // status keeps the gap visible in the run summary until fixed. The
-        // warn is emitted once per run (context is the first affected
-        // declaration); every affected declaration still lands in results.
-        if (!apigwAccessDeniedWarned) {
-          apigwAccessDeniedWarned = true
-          console.warn(
-            '[agi-kvittenser-cron] APIGW client lacks Utvecklarportalen subscription for the AGI hantera API; check SKATTEVERKET_APIGW_CLIENT_ID subscriptions. Skipping affected declarations until the subscription is added.',
-            { declarationId, companyId, period, message },
-          )
-        }
-        results.push({ declarationId, period, status: 'apigw_config', error: err.code })
-        continue
-      }
-
+      // ACCESS_DENIED (Skatteverket's gateway refusing the APIGW client) is
+      // no longer bucketed as a known configuration gap: the AGI hantera
+      // subscription is expected to be in place (#2226), so a gateway refusal
+      // is a real regression and lands in the error path below like any
+      // other failure.
       log.error('Reconciliation failed', { declarationId, companyId, period, message })
-      results.push({ declarationId, period, status: 'error', error: getErrorMessage(err) })
+      // A gateway refusal keeps its machine-readable code in the body (as the
+      // expired_token / grant_revoked rows do): the keyword heuristic in
+      // getErrorMessage misses the gateway wording and would collapse it
+      // into "Något gick fel". The full guidance is in the error log above.
+      const isGatewayRefusal = err instanceof SkatteverketAuthError && err.code === 'ACCESS_DENIED'
+      results.push({
+        declarationId,
+        period,
+        status: 'error',
+        error: isGatewayRefusal ? err.code : getErrorMessage(err),
+      })
     }
   }
 
@@ -214,11 +202,10 @@ export async function GET(request: Request) {
   const alreadyClaimed = results.filter(r => r.status === 'already_claimed').length
   const expired = results.filter(r => r.status === 'expired_token').length
   const grantRevoked = results.filter(r => r.status === 'grant_revoked').length
-  const apigwConfig = results.filter(r => r.status === 'apigw_config').length
   const errors = results.filter(r => r.status === 'error').length
 
   console.log(
-    `[agi-kvittenser-cron] Processed ${results.length}: ${signed} signed, ${stillPending} still pending, ${alreadyClaimed} already claimed, ${expired} expired, ${grantRevoked} grants revoked, ${apigwConfig} apigw config gaps, ${errors} errors`,
+    `[agi-kvittenser-cron] Processed ${results.length}: ${signed} signed, ${stillPending} still pending, ${alreadyClaimed} already claimed, ${expired} expired, ${grantRevoked} grants revoked, ${errors} errors`,
   )
 
   return NextResponse.json(
@@ -229,7 +216,6 @@ export async function GET(request: Request) {
       alreadyClaimed,
       expired,
       grantRevoked,
-      apigwConfig,
       errors,
       results,
     },

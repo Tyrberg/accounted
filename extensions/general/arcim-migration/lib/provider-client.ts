@@ -10,17 +10,39 @@ import { randomBytes } from 'node:crypto'
 import { createServiceClient } from '@/lib/supabase/server'
 import type { ProviderName } from '@/lib/providers/types'
 import { getOAuthConfig } from '@/lib/providers/oauth-config'
-import { buildFortnoxAuthUrl } from '@/lib/providers/fortnox/oauth'
+import {
+  buildFortnoxAuthUrl,
+  fortnoxConsentScopes,
+} from '@/lib/providers/fortnox/oauth'
 import { exchangeFortnoxCode } from '@/lib/providers/fortnox/oauth'
 import { buildVismaAuthUrl, exchangeVismaCode } from '@/lib/providers/visma/oauth'
 import { refreshBjornLundenToken } from '@/lib/providers/bjornlunden/oauth'
 import { BjornLundenClient, BjornLundenApiError } from '@/lib/providers/bjornlunden/client'
 import { exchangeBrioxCode } from '@/lib/providers/briox/oauth'
 import { BrioxApiError } from '@/lib/providers/briox/client'
+import {
+  BokioClient,
+  BokioApiError,
+  normalizeBokioAccessToken,
+} from '@/lib/providers/bokio/client'
+import { WintClient, WintApiError } from '@/lib/providers/wint/client'
+import { loginWint, WintLoginRejectedError } from '@/lib/providers/wint/oauth'
+import { normalizeOrgNumber } from '@/lib/company-lookup/normalize-org-number'
+import { fetchCompanyInfoDirect } from '@/lib/providers/provider-data-fetcher'
+import type { CompanyInformationDto } from '@/lib/providers/dto'
+import { createLogger } from '@/lib/logger'
 import type { ConsentRecord, OtcResponse } from '../types'
+
+const log = createLogger('extensions/arcim-migration/provider-client')
 
 // Singleton (holds the rate limiter): used to validate BL User-Keys at submit
 const bjornLundenClient = new BjornLundenClient()
+
+// Singleton (holds the rate limiter): used to verify Bokio company identity
+const bokioClient = new BokioClient()
+
+// Singleton (holds the rate limiter): used to verify the WINT login at submit
+const wintClient = new WintClient()
 
 /**
  * Thrown by submitProviderToken when the provider actively rejects the
@@ -29,7 +51,10 @@ const bjornLundenClient = new BjornLundenClient()
  * the user to re-check what they pasted.
  */
 export class ProviderTokenInvalidError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    public readonly kind: 'credentials' | 'company-not-found' = 'credentials',
+  ) {
     super(message)
     this.name = 'ProviderTokenInvalidError'
   }
@@ -48,15 +73,33 @@ export class ConsentNotFoundError extends Error {
   }
 }
 
+/**
+ * Thrown when the credentials are valid but open a company whose org number is
+ * not the one being imported into. Reported as PROVIDER_COMPANY_MISMATCH (422).
+ *
+ * The failure this prevents is silent and expensive: a token that works plus a
+ * company id for the wrong company imports a FOREIGN legal entity's customers,
+ * suppliers and invoices into this ledger. Nothing errors, so the first signal
+ * is the user noticing their books are full of a stranger's data. Both org
+ * numbers are carried on the error so the wizard can name the two companies.
+ */
+export class ProviderCompanyMismatchError extends Error {
+  constructor(
+    public readonly expectedOrgNumber: string,
+    public readonly actualOrgNumber: string,
+    public readonly actualCompanyName: string | null,
+  ) {
+    super(
+      `Provider company mismatch: credentials open ${actualOrgNumber}, ` +
+      `but the target company is ${expectedOrgNumber}`,
+    )
+    this.name = 'ProviderCompanyMismatchError'
+  }
+}
+
 // Re-export data fetching functions from the provider layer
 export { resolveConsent } from '@/lib/providers/resolve-consent'
-export {
-  fetchCompanyInfoDirect,
-  fetchCustomersDirect,
-  fetchSuppliersDirect,
-  fetchSalesInvoicesDirect,
-  fetchSupplierInvoicesDirect,
-} from '@/lib/providers/provider-data-fetcher'
+export { fetchCompanyInfoDirect } from '@/lib/providers/provider-data-fetcher'
 
 // ── Consent lifecycle (direct Supabase) ─────────────────────────────
 
@@ -191,9 +234,15 @@ export async function deleteConsent(consentId: string): Promise<void> {
  * to the provider's login page and back. OAuth guidance puts state/OTC
  * lifetimes at 5-10 minutes; every extra minute widens the window in which a
  * leaked or phished state can still be consumed.
+ *
+ * `initiatedByUserId` is the user who clicked connect. The row remembers it so
+ * the callback can insist that the SAME user's browser session completes the
+ * flow: the state proves the callback belongs to a flow we started, not that
+ * the person finishing it is the person who started it.
  */
 export async function generateOtc(
   consentId: string,
+  initiatedByUserId: string,
   expiresInMinutes: number = 10,
 ): Promise<OtcResponse> {
   const supabase = createServiceClient()
@@ -206,6 +255,7 @@ export async function generateOtc(
     .insert({
       code,
       consent_id: consentId,
+      user_id: initiatedByUserId,
       expires_at: expiresAt,
     })
 
@@ -231,10 +281,14 @@ export async function generateOtc(
  * Returns null for every failure mode: unknown/forged state, expired state,
  * already-consumed state, deleted consent. Callers must not distinguish them,
  * that distinction is exactly the oracle this function exists to remove.
+ *
+ * `userId` is the initiator recorded at generateOtc time (null only for rows
+ * minted before provider_otc.user_id existed). The callback compares it to the
+ * completing browser's session before exchanging the code.
  */
 export async function consumeOAuthState(
   state: string,
-): Promise<{ consentId: string; provider: ProviderName } | null> {
+): Promise<{ consentId: string; provider: ProviderName; userId: string | null } | null> {
   const supabase = createServiceClient()
   const now = new Date().toISOString()
 
@@ -244,7 +298,7 @@ export async function consumeOAuthState(
     .eq('code', state)
     .is('used_at', null)
     .gt('expires_at', now)
-    .select('consent_id')
+    .select('consent_id, user_id')
     .maybeSingle()
 
   if (error || !consumed?.consent_id) {
@@ -264,6 +318,7 @@ export async function consumeOAuthState(
   return {
     consentId: consumed.consent_id as string,
     provider: consent.provider as ProviderName,
+    userId: typeof consumed.user_id === 'string' ? consumed.user_id : null,
   }
 }
 
@@ -273,6 +328,12 @@ export async function getAuthUrl(
   provider: ProviderName,
   state?: string,
   redirectUri?: string,
+  /**
+   * Ask Fortnox for the voucher-attachment scopes as well. Opt-in, so only a
+   * user who wants their underlag is put in front of the extra permissions
+   * (and their licence requirements).
+   */
+  options?: { documentScopes?: boolean },
 ): Promise<{ url: string }> {
   const config = getOAuthConfig(provider)
 
@@ -282,7 +343,10 @@ export async function getAuthUrl(
     : config
 
   if (provider === 'fortnox') {
-    const url = buildFortnoxAuthUrl(effectiveConfig, { state })
+    const url = buildFortnoxAuthUrl(effectiveConfig, {
+      state,
+      scopes: fortnoxConsentScopes({ documents: options?.documentScopes }),
+    })
     return { url }
   }
 
@@ -316,6 +380,13 @@ export async function exchangeAuthToken(
 
   const expiresAt = new Date(Date.now() + tokenResponse.expires_in * 1000).toISOString()
 
+  // The code is spent and the tokens are valid, but nothing so far ties the
+  // provider account they open to the Accounted company this consent belongs
+  // to: the user (or someone who lured them) may have signed in to a different
+  // Fortnox/Visma company. Same guard as Bokio/WINT in submitProviderToken:
+  // refuse BEFORE anything is stored, so a foreign ledger never gets imported.
+  await assertProviderCompanyMatchesConsent(supabase, consentId, provider, tokenResponse.access_token)
+
   // Store tokens
   await supabase
     .from('provider_consent_tokens')
@@ -334,6 +405,61 @@ export async function exchangeAuthToken(
     .eq('id', consentId)
 
   return { success: true, consentId }
+}
+
+/**
+ * Compare the org number of the company the freshly issued token opens with
+ * the org number of the Accounted company that owns the consent.
+ *
+ * Only a confident mismatch blocks (throws ProviderCompanyMismatchError). A
+ * missing org number on either side is not evidence of anything: Accounted
+ * allows companies without one, a provider response can omit it, and the
+ * company-information call itself can fail for reasons unrelated to identity
+ * (scope not granted on this app registration, provider hiccup). Those cases
+ * fall through and the connect completes exactly as before.
+ */
+async function assertProviderCompanyMatchesConsent(
+  supabase: ReturnType<typeof createServiceClient>,
+  consentId: string,
+  provider: ProviderName,
+  accessToken: string,
+): Promise<void> {
+  let info: CompanyInformationDto | null
+  try {
+    info = await fetchCompanyInfoDirect(provider, accessToken)
+  } catch (error) {
+    log.warn('provider company information unavailable after OAuth exchange; org-number check skipped', {
+      provider,
+      consentId,
+      reason: error instanceof Error ? error.message : 'unknown',
+    })
+    return
+  }
+
+  const providerOrgNumber = normalizeOrgNumber(info?.organizationNumber)
+  if (!providerOrgNumber) return
+
+  const { data: consent } = await supabase
+    .from('provider_consents')
+    .select('company_id')
+    .eq('id', consentId)
+    .maybeSingle()
+  if (!consent?.company_id) return
+
+  const { data: targetCompany } = await supabase
+    .from('companies')
+    .select('org_number')
+    .eq('id', consent.company_id as string)
+    .maybeSingle()
+  const targetOrgNumber = normalizeOrgNumber(targetCompany?.org_number)
+
+  if (targetOrgNumber && providerOrgNumber !== targetOrgNumber) {
+    throw new ProviderCompanyMismatchError(
+      targetOrgNumber,
+      providerOrgNumber,
+      info?.companyName?.trim() || null,
+    )
+  }
 }
 
 export async function submitProviderToken(
@@ -364,6 +490,11 @@ export async function submitProviderToken(
   let accessToken = apiToken
   let refreshToken: string | null = null
   let tokenExpiresAt: string | null = null
+  // What lands in provider_consent_tokens.provider_company_id. Usually the
+  // caller-supplied value (BL User-Key, Bokio GUID, Briox account id); WINT
+  // overrides it below because its caller-supplied value is the login mail,
+  // which must not be persisted.
+  let storedProviderCompanyId: string | undefined = providerCompanyId
 
   // BL uses app-level client credentials: get a real token, then prove the
   // pasted User-Key actually opens a company before storing anything.
@@ -439,6 +570,163 @@ export async function submitProviderToken(
     }
   }
 
+  // Bokio: the pasted integration token is scoped to ONE Bokio company, and the
+  // company GUID is typed in by hand. Nothing upstream ties either to the
+  // Accounted company being imported into, so a token/GUID for the user's other
+  // company imports that company's customers, suppliers and invoices here with
+  // no error at all. Probe the documented company-information endpoint before
+  // storing anything: it proves the credentials work and returns the
+  // organizationNumber to compare.
+  if (provider === 'bokio') {
+    const bokioCompanyId = providerCompanyId?.trim() ?? ''
+    accessToken = normalizeBokioAccessToken(apiToken)
+
+    if (!accessToken) {
+      throw new ProviderTokenInvalidError('Bokio requires an integration token')
+    }
+    if (!bokioCompanyId) {
+      throw new ProviderTokenInvalidError(
+        'Bokio requires a company id',
+        'company-not-found',
+      )
+    }
+    storedProviderCompanyId = bokioCompanyId
+
+    let bokioCompany: Record<string, unknown> | null
+    try {
+      bokioCompany = await bokioClient.getCompany<Record<string, unknown>>(
+        accessToken,
+        bokioCompanyId,
+      )
+    } catch (error) {
+      if (error instanceof BokioApiError) {
+        // Only 401/403 are authentication verdicts. A 404 from the documented
+        // company-information endpoint means the company id is unknown or is
+        // not available to this company-scoped token. Other statuses can be a
+        // provider/API failure and must not be blamed on the pasted token.
+        if (error.statusCode === 401 || error.statusCode === 403) {
+          throw new ProviderTokenInvalidError(
+            `Bokio rejected the integration token (HTTP ${error.statusCode})`,
+          )
+        }
+      }
+      throw error
+    }
+
+    // getCompany() maps 404 to null: an unknown GUID is a bad company id, not
+    // an outage.
+    if (!bokioCompany) {
+      throw new ProviderTokenInvalidError(
+        'Bokio does not know that company id',
+        'company-not-found',
+      )
+    }
+
+    const bokioName = typeof bokioCompany['name'] === 'string'
+      ? (bokioCompany['name'] as string).trim()
+      : ''
+    const bokioOrgNumber = normalizeOrgNumber(
+      bokioCompany['organizationNumber'] as string | undefined,
+    )
+
+    const { data: targetCompany } = await supabase
+      .from('companies')
+      .select('org_number')
+      .eq('id', ownerCompanyId)
+      .maybeSingle()
+    const targetOrgNumber = normalizeOrgNumber(targetCompany?.org_number)
+
+    // Only a confident mismatch blocks. A missing org number on either side is
+    // not evidence of anything (Accounted allows companies without one, and a
+    // Bokio response could omit it), so those fall through to the labelling
+    // below: the wizard still shows WHICH Bokio company was linked, which is
+    // what lets the user catch it themselves.
+    if (bokioOrgNumber && targetOrgNumber && bokioOrgNumber !== targetOrgNumber) {
+      throw new ProviderCompanyMismatchError(
+        targetOrgNumber,
+        bokioOrgNumber,
+        bokioName || null,
+      )
+    }
+
+    // Label the consent with what the credentials actually opened. Written as
+    // an object literal (not a conditional spread) so the phantom-column guard
+    // can see which columns this touches. `undefined` is dropped by the JSON
+    // serialisation, so a field Bokio did not return is left alone rather than
+    // overwriting a value the user typed at connect time with null.
+    if (bokioName || bokioOrgNumber) {
+      await supabase
+        .from('provider_consents')
+        .update({
+          company_name: bokioName || undefined,
+          org_number: bokioOrgNumber || undefined,
+        })
+        .eq('id', consentId)
+    }
+  }
+
+  // WINT: no API keys exist, so the wizard sends the user's WINT login
+  // (providerCompanyId = mail, apiToken = password). The pair is exchanged
+  // HERE, once, for an access/refresh token pair; the password is used for
+  // this single call and never stored, logged, or echoed. The token is then
+  // probed against GET /api/Auth to learn WHICH company it opens, mirroring
+  // the Bokio org-number mismatch guard.
+  if (provider === 'wint') {
+    const mail = providerCompanyId?.trim()
+    if (!mail || !mail.includes('@')) {
+      throw new ProviderTokenInvalidError('WINT requires the login e-mail address')
+    }
+
+    try {
+      const tokenResponse = await loginWint(mail, apiToken)
+      accessToken = tokenResponse.access_token
+      refreshToken = tokenResponse.refresh_token || null
+      tokenExpiresAt = new Date(Date.now() + tokenResponse.expires_in * 1000).toISOString()
+    } catch (error) {
+      // A definitive LoginState (wrong password, locked, BankID-only) is a
+      // credential verdict. Auth-endpoint 400/401/403 likewise. 429/5xx are
+      // transient: rethrow as a generic submit failure.
+      if (error instanceof WintLoginRejectedError) {
+        throw new ProviderTokenInvalidError(`WINT rejected the login (${error.state})`)
+      }
+      if (error instanceof WintApiError && error.statusCode < 500 && error.statusCode !== 429) {
+        throw new ProviderTokenInvalidError(`WINT rejected the login (HTTP ${error.statusCode})`)
+      }
+      throw error
+    }
+
+    const wintCompany = await wintClient.get<Record<string, unknown>>(accessToken, '/api/Auth')
+    const wintCompanyName = typeof wintCompany['Name'] === 'string' ? (wintCompany['Name'] as string).trim() : ''
+    const wintOrgNumber = normalizeOrgNumber(wintCompany['Org'] as string | undefined)
+
+    const { data: targetCompany } = await supabase
+      .from('companies')
+      .select('org_number')
+      .eq('id', ownerCompanyId)
+      .maybeSingle()
+    const targetOrgNumber = normalizeOrgNumber(targetCompany?.org_number)
+
+    // Same confident-mismatch-only rule as Bokio: a missing org number on
+    // either side falls through to labelling, a definite mismatch blocks.
+    if (wintOrgNumber && targetOrgNumber && wintOrgNumber !== targetOrgNumber) {
+      throw new ProviderCompanyMismatchError(targetOrgNumber, wintOrgNumber, wintCompanyName || null)
+    }
+
+    // The WINT-internal company id is what later calls may need (CompanyAuth
+    // company switching); the login mail is deliberately NOT persisted.
+    storedProviderCompanyId = wintCompany['Id'] != null ? String(wintCompany['Id']) : undefined
+
+    if (wintCompanyName || wintOrgNumber) {
+      await supabase
+        .from('provider_consents')
+        .update({
+          company_name: wintCompanyName || undefined,
+          org_number: wintOrgNumber || undefined,
+        })
+        .eq('id', consentId)
+    }
+  }
+
   // Store tokens: consent stays at status 0 until migration/SIE import completes
   await supabase
     .from('provider_consent_tokens')
@@ -448,7 +736,7 @@ export async function submitProviderToken(
       access_token: accessToken,
       refresh_token: refreshToken,
       token_expires_at: tokenExpiresAt,
-      provider_company_id: providerCompanyId,
+      provider_company_id: storedProviderCompanyId,
     })
 
   return { success: true, consentId }

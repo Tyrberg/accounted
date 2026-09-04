@@ -96,6 +96,8 @@ function queueFor(
 const euCustomer = makeCustomer({
   id: 'cust-1',
   customer_type: 'eu_business',
+  country: 'DE',
+  vat_number: 'DE811234567',
   vat_number_validated: true,
 })
 
@@ -265,6 +267,79 @@ describe('commitPendingOperation: create_invoice: VAT rates for a foreign busine
   })
 })
 
+describe('commitPendingOperation: create_invoice: staged article references', () => {
+  it('writes a company-scoped article_id through to the invoice_items row', async () => {
+    // Queue: CAS claim → customers → company_settings → articles scope check →
+    // invoices insert → invoice_items insert → complete select → update.
+    const { supabase, inserts } = createCapturingSupabase([
+      { data: { id: 'op-1' } },
+      { data: customer },
+      { data: { vat_registered: true } },
+      { data: [{ id: 'art-1' }] },
+      { data: { id: 'inv-1', invoice_number: null } },
+      { data: null },
+      { data: { id: 'inv-1' } },
+      { data: null },
+    ])
+
+    const op = makePendingOp({
+      params: {
+        customer_id: 'cust-1',
+        items: [
+          {
+            description: 'Konsulttimme',
+            quantity: 2,
+            unit: 'tim',
+            unit_price: 1200,
+            vat_rate: 25,
+            article_id: 'art-1',
+          },
+        ],
+      },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    const itemRows = inserts['invoice_items'][0] as Array<Record<string, unknown>>
+    expect(itemRows[0]).toMatchObject({ article_id: 'art-1', line_total: 2400 })
+  })
+
+  it('fails when a staged article_id belongs to another company (drift/tamper gate)', async () => {
+    // The FK on invoice_items.article_id only proves existence, not tenancy:
+    // the executor must refuse an id the scoped select cannot see.
+    const { supabase, inserts } = createCapturingSupabase([
+      { data: { id: 'op-1' } },
+      { data: customer },
+      { data: { vat_registered: true } },
+      { data: [] },
+      { data: null },
+    ])
+
+    const op = makePendingOp({
+      params: {
+        customer_id: 'cust-1',
+        items: [
+          {
+            description: 'Konsulttimme',
+            quantity: 1,
+            unit: 'tim',
+            unit_price: 1200,
+            vat_rate: 25,
+            article_id: 'art-foreign',
+          },
+        ],
+      },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.error).toMatch(/Artikel art-foreign finns inte i företaget/)
+    expect(inserts['invoices']).toBeUndefined()
+  })
+})
+
 describe('commitPendingOperation: create_invoice: dimensions propagation (PR7)', () => {
   it('staged default_dimensions lands on the invoices row and item bags on invoice_items rows', async () => {
     const { supabase, inserts } = createCapturingSupabase(queueFor({ vat_registered: true }))
@@ -345,5 +420,96 @@ describe('commitPendingOperation: create_invoice: dimensions propagation (PR7)',
     expect(inserts['invoices'][0]).toMatchObject({ default_dimensions: {} })
     const itemRows = inserts['invoice_items'][0] as Array<Record<string, unknown>>
     expect(itemRows[0]).toMatchObject({ dimensions: {} })
+  })
+})
+
+describe('commitPendingOperation: create_invoice as a quote (offert)', () => {
+  /** Quote queue: CAS claim → customers → company_settings → invoices insert →
+   *  invoice_items insert → dispatcher update. No complete-invoice select:
+   *  quotes never emit invoice.created. */
+  const quoteQueue = [
+    { data: { id: 'op-1' } },
+    { data: customer },
+    { data: { vat_registered: true } },
+    { data: { id: 'inv-q', invoice_number: 'OF-001' } },
+    { data: null },
+    { data: null },
+  ]
+
+  it('allocates OF-nnn via generate_quote_number and never touches the F-series', async () => {
+    const base = createCapturingSupabase(quoteQueue)
+    const rpc = vi.fn().mockResolvedValue({ data: 'OF-001', error: null })
+    const supabase = { ...base.supabase, rpc }
+    const emitted: string[] = []
+    eventBus.on('invoice.created', async () => {
+      emitted.push('invoice.created')
+    })
+
+    const op = makePendingOp({
+      params: {
+        customer_id: 'cust-1',
+        document_type: 'quote',
+        valid_until: '2026-12-31',
+        items: [{ description: 'Konsulttimmar', quantity: 1, unit: 'tim', unit_price: 1000, vat_rate: 25 }],
+        invoice_date: '2026-09-02',
+        due_date: '2026-12-31',
+      },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('generate_quote_number', { p_company_id: 'company-1' })
+    expect(rpc).not.toHaveBeenCalledWith('generate_invoice_number', expect.anything())
+    expect(base.inserts['invoices'][0]).toMatchObject({
+      invoice_number: 'OF-001',
+      document_type: 'quote',
+      quote_status: 'open',
+      valid_until: '2026-12-31',
+      due_date: '2026-12-31',
+      total: 1250,
+    })
+    expect(emitted).toEqual([])
+  })
+
+  it('refuses a quote without valid_until', async () => {
+    const base = createCapturingSupabase([{ data: { id: 'op-1' } }])
+    const rpc = vi.fn()
+    const supabase = { ...base.supabase, rpc }
+
+    const op = makePendingOp({
+      params: {
+        customer_id: 'cust-1',
+        document_type: 'quote',
+        items: [{ description: 'Konsulttimmar', quantity: 1, unit: 'tim', unit_price: 1000, vat_rate: 25 }],
+      },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).not.toBe('committed')
+    expect(rpc).not.toHaveBeenCalled()
+    expect(base.inserts['invoices']).toBeUndefined()
+  })
+
+  it('fails closed when the OF-series allocation errors, inserting nothing', async () => {
+    const base = createCapturingSupabase([{ data: { id: 'op-1' } }, { data: customer }, { data: { vat_registered: true } }])
+    const rpc = vi.fn().mockResolvedValue({ data: null, error: { message: 'boom' } })
+    const supabase = { ...base.supabase, rpc }
+
+    const op = makePendingOp({
+      params: {
+        customer_id: 'cust-1',
+        document_type: 'quote',
+        valid_until: '2026-12-31',
+        items: [{ description: 'Konsulttimmar', quantity: 1, unit: 'tim', unit_price: 1000, vat_rate: 25 }],
+      },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).not.toBe('committed')
+    expect(base.inserts['invoices']).toBeUndefined()
   })
 })

@@ -7,6 +7,7 @@ import { Separator } from '@/components/ui/separator'
 import { formatCurrency, formatDate } from '@/lib/utils'
 import { getDisplayTotal } from '@/lib/invoices/rounding'
 import { isTextLikeLine } from '@/lib/invoices/display'
+import { computeLineNet } from '@/lib/invoices/line-amounts'
 import { itemHasAccrual } from '@/lib/bookkeeping/accruals/account-suggestions'
 import type { Customer, Currency } from '@/types'
 
@@ -15,6 +16,8 @@ interface ReviewItem {
   quantity: number
   unit: string
   unit_price: number
+  /** Line discount 0-100; amounts render net of it. */
+  discount_percent?: number | null
   vat_rate?: number
   /** 'text' rows are free-text/blank lines: description only, no amounts. */
   line_type?: 'product' | 'text'
@@ -38,6 +41,7 @@ interface InvoiceReviewContentProps {
   total: number
   yourReference?: string
   ourReference?: string
+  invoiceMarking?: string
   notes?: string
   /** The invoice number that will be assigned on confirm. Null when unknown
    *  (e.g. delivery notes use a different sequence) or unfetched. */
@@ -47,6 +51,11 @@ interface InvoiceReviewContentProps {
   /** Mirrors `company_settings.vat_registered`. When false and the invoice carries
    *  no VAT, the moms row is suppressed to match the PDF (pdf-template.tsx:876). */
   vatRegistered?: boolean
+  /** Payment-link förval on this invoice: Stripe auto-link on send, a manually
+   *  pasted link, or none. Renders in the Förval summary line when set. */
+  paymentLink?: 'auto' | 'manual' | null
+  /** Quotes show their expiry ("Giltig till") where an invoice shows its due date. */
+  dueDateLabelKey?: 'due_date' | 'valid_until'
 }
 
 export function InvoiceReviewContent({
@@ -60,10 +69,13 @@ export function InvoiceReviewContent({
   total,
   yourReference,
   ourReference,
+  invoiceMarking,
+  dueDateLabelKey = 'due_date',
   notes,
   numberPreview,
   oreRounding,
   vatRegistered,
+  paymentLink,
 }: InvoiceReviewContentProps) {
   const t = useTranslations('invoice_review')
   const rounding = getDisplayTotal({ total, currency }, { ore_rounding: oreRounding ?? true })
@@ -80,7 +92,7 @@ export function InvoiceReviewContent({
   for (const item of items) {
     if (isTextLikeLine(item)) continue
     const rate = item.vat_rate ?? 0
-    const lineTotal = item.quantity * item.unit_price
+    const lineTotal = computeLineNet(item.quantity, item.unit_price, item.discount_percent)
     const lineVat = Math.round(lineTotal * rate / 100 * 100) / 100
     vatByRate.set(rate, (vatByRate.get(rate) || 0) + lineVat)
   }
@@ -113,10 +125,31 @@ export function InvoiceReviewContent({
           <p className="font-medium">{invoiceDate ? formatDate(invoiceDate) : ''}</p>
         </div>
         <div>
-          <span className="text-muted-foreground">{t('due_date')}</span>
+          <span className="text-muted-foreground">{t(dueDateLabelKey)}</span>
           <p className="font-medium">{dueDate ? formatDate(dueDate) : ''}</p>
         </div>
       </div>
+
+      {/* Applied förval: the collapsed defaults the invoice will carry
+          (currency, öresavrundning, payment-link state). One muted line so
+          the review states what the settings panel may have been hiding. */}
+      <p className="text-xs text-muted-foreground">
+        {[
+          t('forval_currency', { currency }),
+          currency === 'SEK'
+            ? (oreRounding ?? true)
+              ? t('forval_ore_on')
+              : t('forval_ore_off')
+            : null,
+          paymentLink === 'auto'
+            ? t('forval_link_auto')
+            : paymentLink === 'manual'
+              ? t('forval_link_manual')
+              : null,
+        ]
+          .filter(Boolean)
+          .join(' · ')}
+      </p>
 
       {/* Line items: table on desktop, cards on mobile */}
       <div className="hidden sm:block">
@@ -157,12 +190,19 @@ export function InvoiceReviewContent({
                   </td>
                   <td className="py-2 text-right">{item.quantity}</td>
                   <td className="py-2 text-center">{item.unit}</td>
-                  <td className="py-2 text-right">{formatCurrency(item.unit_price, currency)}</td>
+                  <td className="py-2 text-right">
+                    {formatCurrency(item.unit_price, currency)}
+                    {(item.discount_percent ?? 0) > 0 && (
+                      <span className="ml-1 text-xs text-muted-foreground">
+                        &minus;{item.discount_percent}%
+                      </span>
+                    )}
+                  </td>
                   {showVatColumn && (
                     <td className="py-2 text-right">{item.vat_rate ?? 0}%</td>
                   )}
                   <td className="py-2 text-right">
-                    {formatCurrency(item.quantity * item.unit_price, currency)}
+                    {formatCurrency(computeLineNet(item.quantity, item.unit_price, item.discount_percent), currency)}
                   </td>
                 </tr>
               )
@@ -189,11 +229,14 @@ export function InvoiceReviewContent({
                 </p>
               )}
               <div className="flex items-center justify-between text-muted-foreground">
-                <span>{item.quantity} {item.unit} × {formatCurrency(item.unit_price, currency)}</span>
+                <span>
+                  {item.quantity} {item.unit} × {formatCurrency(item.unit_price, currency)}
+                  {(item.discount_percent ?? 0) > 0 && <> &minus;{item.discount_percent}%</>}
+                </span>
                 {showVatColumn && <span className="text-xs">{t('mobile_vat_suffix', { rate: item.vat_rate ?? 0 })}</span>}
               </div>
               <p className="text-right font-medium">
-                {formatCurrency(item.quantity * item.unit_price, currency)}
+                {formatCurrency(computeLineNet(item.quantity, item.unit_price, item.discount_percent), currency)}
               </p>
             </div>
           )
@@ -235,7 +278,7 @@ export function InvoiceReviewContent({
       </div>
 
       {/* References/notes */}
-      {(yourReference || ourReference || notes) && (
+      {(yourReference || ourReference || invoiceMarking || notes) && (
         <div className="border-t pt-3 space-y-2 text-sm text-muted-foreground">
           {yourReference && (
             <p>
@@ -245,6 +288,11 @@ export function InvoiceReviewContent({
           {ourReference && (
             <p>
               <span>{t('our_reference')}</span> {ourReference}
+            </p>
+          )}
+          {invoiceMarking && (
+            <p>
+              <span>{t('invoice_marking')}</span> {invoiceMarking}
             </p>
           )}
           {notes && <p>{t('notes_prefix', { notes })}</p>}

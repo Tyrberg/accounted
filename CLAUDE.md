@@ -36,6 +36,16 @@ General prohibitions:
 - **Swedish domain questions are never answered from training data.** Load the matching `swedish-*` skill (vat, accounting-compliance, invoice-compliance, payroll, year-end-closing, sie-import-export, sru-filing, financial-reporting, asset-accounting, project-accounting, tax-planning, e-invoicing).
 - Scaffolding has skills; use them instead of improvising: `/erp-api-route` (API routes), `/supabase-migration` (migrations), `/create-extension` (extensions), `/frontend-design` (new UI), `vercel:deploy` (deployment).
 
+## Fix From First Principles
+
+A reported problem usually arrives with a proposed solution: the reporter's workaround, the issue author's fix shape, the obvious patch at the line that broke. Treat it as evidence about the pain, not as the spec. Before implementing, answer three questions and put the answers in the PR body:
+
+1. **Why did the problem occur?** Name the mechanism, not the symptom. A wrong number in one place usually means the definition lives in several places; a bypassed check usually means the invariant lives only in application code; a confusing label usually means a field nobody reads. Fix at the level that stops the class of bug, not the instance that was reported.
+2. **What could be removed or simplified instead?** A counter that cannot be wrong because it is gone, a policy dropped instead of a check added, one write path instead of a third copy of a formula, a constraint instead of a trigger. The solution with fewer states and less code wins unless something concrete needs the extra state.
+3. **Is this the best solution, or just the proposed one?** Write down the alternative you considered and why you did not take it. When the better answer removes or changes something users see (a column, a field, a limit), state both options with a recommendation: that choice is the founder's, and the PR should make it easy to take either way.
+
+When the chosen path differs from the one proposed in the issue, record it in `DECISIONS.md` (see Decision Log).
+
 ## Definition of Done
 
 A change is done when all of these hold; iterate until they do:
@@ -49,6 +59,7 @@ A change is done when all of these hold; iterate until they do:
 7. Commit is conventional (`feat:`/`fix:`/`refactor:`/`test:`/`docs:`), atomic, branched from `main`.
 8. If the change touches migrations, local and prod are reconciled: every version in prod's `schema_migrations` has a matching file in `supabase/migrations/`, and vice versa. Check before opening the PR (e.g. `list_migrations` / `select version from supabase_migrations.schema_migrations`); a remote-only version means an uncommitted orphan that will fail the merge.
 9. **The last mile is verified in-session, not assumed.** Whatever was built is confirmed switched on before the session ends: merged PR's migration applied to prod, scheduled loop/routine observed firing, script actually executed, feature reachable. If switch-on must wait, the session's final output states exactly what is NOT live yet and who flips it. History shows the expensive failure mode is built-but-never-initiated, not built-wrong.
+10. The PR body answers the three questions in [Fix From First Principles](#fix-from-first-principles): why the problem occurred, what removal or simplification was considered, and why the chosen solution is the best one rather than the proposed one.
 
 ## Commands
 
@@ -60,6 +71,7 @@ npm test                 # All Vitest tests
 npx vitest run <dir>     # Tests in one directory
 npm run test:pg          # pg-real tests against real Postgres
 npm run check:guards     # Ratchet guard (e.g. no hand-rolled route auth)
+npm run check:types      # Typecheck ratchet. `npm test` does NOT typecheck: run this before the build
 npm run setup:extensions # Regenerate extension registry from extensions.config.json
 npm run skills:generate  # Regenerate agent_atom_registry seed after editing an atom SKILL.md
 ```
@@ -68,11 +80,11 @@ npm run skills:generate  # Regenerate agent_atom_registry seed after editing an 
 
 - **Journal entry lifecycle**: `createDraftEntry()` → `commitEntry()` (atomic voucher via `commit_journal_entry` RPC); `createJournalEntry()` does both. Everything accounting-shaped routes through this engine.
 - **Tenancy**: every business table has `company_id`. Active company resolves in `lib/supabase/middleware.ts` from `user_preferences.active_company_id` (authoritative: RLS reads the same value via `current_active_company_id()`), falling back to first non-archived membership. The `gnubok-company-id` cookie is written as a hint for legacy read paths but deliberately no longer read: letting it override the DB would desync Next.js from RLS. RLS uses `user_company_ids()`; queries still filter by `company_id` explicitly (defense in depth: service-role paths have no RLS).
-- **Auth**: Supabase email+password + TOTP MFA, enforced **application-side**, not in RLS. `NEXT_PUBLIC_REQUIRE_MFA=true` on hosted; `NEXT_PUBLIC_SELF_HOSTED=true` disables MFA. API routes wrap `withRouteContext`: it is the only path that enforces MFA, so never hand-roll `supabase.auth.getUser()` in a route.
+- **Auth**: Supabase email+password + TOTP MFA, enforced **application-side**, not in RLS. `NEXT_PUBLIC_REQUIRE_MFA=true` on hosted; `NEXT_PUBLIC_SELF_HOSTED=true` disables MFA. Hosted browser sessions also have signed server-enforced idle/absolute limits (`lib/auth/session-timeout.ts`); API-key and MCP bearer surfaces are exempt. API routes wrap `withRouteContext`: it is the only path that enforces MFA, so never hand-roll `supabase.auth.getUser()` in a route.
 - **Events**: `lib/events/bus.ts` is a module-level singleton. Any route that emits events must call `ensureInitialized()` (`lib/init.ts`) at module level: otherwise extension handlers are never wired and events silently go nowhere.
 - **Supabase clients**: browser `client.ts`, server `createClient()`, service role `createServiceClient()`, cookieless service role `createServiceClientNoCookies()` (lives in `lib/auth/api-keys.ts`; for API-key/MCP paths). Paginate with `fetchAllRows()`: PostgREST silently caps at 1000 rows.
 - **Extensions**: opt-in plugins in `extensions/general/<name>/`; `extensions.config.json` is the source of truth for what's enabled. Core must run with zero extensions.
-- **MCP server**: the bookkeeping engine is exposed as 100+ MCP tools (`extensions/general/mcp-server/`), authenticated by `gnubok_sk_` API keys (SHA-256, scoped, default 100 RPM per key).
+- **MCP server**: the bookkeeping engine is exposed as 150+ MCP tools (`extensions/general/mcp-server/`), authenticated by `gnubok_sk_` API keys (SHA-256, scoped, default 100 RPM per key).
 - **Types**: import from `@/types` (`types/index.ts`); event types in `lib/events/types.ts`.
 - **User-facing errors are Swedish**: map through `lib/errors/get-error-message.ts`.
 - **Cron**: hosted cron jobs live in `vercel.json`, authenticated via `verifyCronSecret()` (`lib/auth/cron.ts`).

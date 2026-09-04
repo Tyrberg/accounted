@@ -10,8 +10,8 @@ import { useToast } from '@/components/ui/use-toast'
 import { AlertTriangle, CreditCard, ExternalLink } from 'lucide-react'
 import { getSettingsPanel } from '@/lib/extensions/settings-panel-registry'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
-import BankSyncStatusChip from '@/components/transactions/BankSyncStatusChip'
 import { SettingsSectionHeader } from '@/components/settings/SettingsRows'
+import { useBranding } from '@/lib/branding/brand-context'
 
 const BankingPanel = getSettingsPanel('enable-banking')
 
@@ -19,6 +19,7 @@ export function BankingSettingsContent() {
   const t = useTranslations('settings_banking')
   const tNav = useTranslations('settings_nav')
   const tIntro = useTranslations('settings_intro')
+  const { appName } = useBranding()
   const searchParams = useSearchParams()
   const router = useRouter()
   const { toast } = useToast()
@@ -77,7 +78,7 @@ export function BankingSettingsContent() {
 
   return (
     <div>
-      <SettingsSectionHeader title={tNav('banking')} intro={tIntro('banking')} />
+      <SettingsSectionHeader title={tNav('banking')} intro={tIntro('banking', { appName })} />
 
       {/* OAuth bounce-back failure: a live warning, so it stays visible in the
           page flow, as compact warning-tone lines instead of a bordered box. */}
@@ -115,7 +116,7 @@ export function BankingSettingsContent() {
               setIsAccessDenied(false)
               setShowHbPoaHint(false)
             }}
-            className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:text-foreground"
+            className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors duration-150 hover:text-foreground"
             aria-label={t('dismiss_aria')}
           >
             <span className="text-lg leading-none">&times;</span>
@@ -124,14 +125,10 @@ export function BankingSettingsContent() {
       )}
 
       {hasBankingExtension && BankingPanel ? (
-        <>
-          {/* The chip renders null when there are no connections; empty:hidden
-              keeps its margin from leaving a stray gap in that case. */}
-          <div className="mt-6 empty:hidden">
-            <BankSyncStatusChip />
-          </div>
-          <BankingPanel />
-        </>
+        // No BankSyncStatusChip here: on this page the chip links to itself,
+        // and the panel now carries its own single attention sentence. The
+        // chip stays on /transactions.
+        <BankingPanel />
       ) : (
         <div className="pt-8">
           <EmptyState

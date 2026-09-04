@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useAccounts, useCompanySettings, useFiscalPeriods } from '@/lib/reference-data/hooks'
 import Link from 'next/link'
 import {
   Dialog,
@@ -21,7 +22,8 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useToast } from '@/components/ui/use-toast'
-import { Loader2 } from 'lucide-react'
+import { ChevronRight, Loader2 } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { useCompany } from '@/contexts/CompanyContext'
 import {
@@ -31,8 +33,9 @@ import {
 import {
   resolveBookedCoverage,
   resolveFiscalYearStart,
+  resolveGapFillStart,
 } from '../lib/date-suggestions'
-import type { CompanySettings } from '@/types'
+import { describeClaimedElsewhere, partitionByClaim } from '../lib/claimed-accounts'
 import type { StoredAccount } from '../types'
 import {
   BankSyncProgressDialog,
@@ -57,7 +60,7 @@ interface ChartAccount {
   account_name: string
 }
 
-type LookbackMode = 'fast' | 'fiscal-year' | 'custom'
+type LookbackMode = 'gap-fill' | 'fast' | 'fiscal-year' | 'custom'
 type CustomSubMode = 'date' | 'previous-fiscal-year'
 
 // Suggested BAS account per currency. The mapping engine falls back to 1930
@@ -89,21 +92,75 @@ export function AccountPickerDialog({
 
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [isSaving, setIsSaving] = useState(false)
+  // Accounts the callback found booked by another of the user's companies
+  // (one SEB consent covers every company the signer represents). They are
+  // kept out of the main list so the picker shows THIS company's accounts,
+  // and live behind a collapsed disclosure: still reachable, never pre-checked.
+  const { own: ownAccounts, claimedElsewhere } = useMemo(
+    () => partitionByClaim(accounts),
+    [accounts],
+  )
+  const [claimedOpen, setClaimedOpen] = useState(false)
   // Server-side save rejection (validation / ledger conflict). Shown inline in
   // the dialog: a rejected save persisted nothing and started no sync, so the
   // user must see why and be able to correct the picks.
   const [saveError, setSaveError] = useState<string | null>(null)
   const [lastBookedDate, setLastBookedDate] = useState<string | null>(null)
-  const [chartAccounts, setChartAccounts] = useState<ChartAccount[]>([])
-  const [chartError, setChartError] = useState(false)
+  // Earliest completed SIE import coverage start: present = migrator flow.
+  const [sieCoverageStart, setSieCoverageStart] = useState<string | null>(null)
+  // Reference data from the session cache (lib/reference-data), seeded by
+  // the dashboard layout: settings, the period containing today and the
+  // chart are known when the dialog opens, no requests of its own. A failed
+  // load keeps settingsLoaded false so the calendar-year fallback is never
+  // presented as the authoritative fiscal-year start (issue #917).
+  const {
+    settings: companySettings,
+    isLoading: settingsLoading,
+    error: settingsError,
+  } = useCompanySettings()
+  const { periods, isLoading: periodsLoading, error: periodsError } = useFiscalPeriods()
+  // Inactive accounts included: the old chart query did not filter on is_active.
+  const { accounts: allAccounts, error: chartLoadError } = useAccounts(false)
+  const settingsLoaded = !settingsLoading && !periodsLoading && !settingsError && !periodsError
+  const currentPeriodStart = useMemo(() => {
+    const today = new Date().toISOString().split('T')[0]
+    const containing = periods
+      .filter((p) => p.period_start <= today && today <= p.period_end)
+      .sort((a, b) => b.period_start.localeCompare(a.period_start))
+    return containing[0]?.period_start || null
+  }, [periods])
+  // 19xx accounts for the per-account ledger combobox. Class 19 = bank/cash
+  // on the BAS chart.
+  const chartAccounts = useMemo<ChartAccount[]>(
+    () =>
+      allAccounts
+        .filter((a) => a.account_number.startsWith('19'))
+        .sort((a, b) => a.account_number.localeCompare(b.account_number))
+        .map((a) => ({ account_number: a.account_number, account_name: a.account_name })),
+    [allAccounts],
+  )
+  // Surface the failure: without the 19xx chart the ledger picker is
+  // silently empty, which reads as "no bank accounts exist".
+  const chartError = Boolean(chartLoadError)
   const [ledgerByUid, setLedgerByUid] = useState<Record<string, string>>({})
-  const [companySettings, setCompanySettings] = useState<Pick<CompanySettings, 'fiscal_year_start_month' | 'entity_type'> | null>(null)
-  const [currentPeriodStart, setCurrentPeriodStart] = useState<string | null>(null)
-  const [settingsLoaded, setSettingsLoaded] = useState(false)
 
-  const [lookbackMode, setLookbackMode] = useState<LookbackMode>('fiscal-year')
+  // Default 'fast' (90 days): the known-good PSD2 window. The fiscal-year
+  // default used to send 365+-day requests that some banks (Swedbank) answer
+  // by TERMINATING the session: zero transactions, connection expired, no
+  // error surfaced (E2E 2026-08-26). Longer ranges stay available as explicit
+  // choices with the risk spelled out.
+  const [lookbackMode, setLookbackMode] = useState<LookbackMode>('fast')
   const [customSubMode, setCustomSubMode] = useState<CustomSubMode>('date')
   const [customDate, setCustomDate] = useState<string>('')
+  // Newest transaction date this CONNECTION has already imported (date null on
+  // a first connect). A date means this is a renewal, where the default must be
+  // "fill the gap", not a fresh long lookback over bookkept periods. Keyed by
+  // connectionId so a stale value can never render into another connection's
+  // dialog between open and probe: the gapFill memo ignores mismatched keys.
+  const [latestImported, setLatestImported] = useState<{ connectionId: string; date: string | null } | null>(null)
+  // Ref, not state: only the async default below reads it, and putting it in
+  // the effect's deps would re-fire the query on the first radio click.
+  const lookbackTouched = useRef(false)
 
   const [progressOpen, setProgressOpen] = useState(false)
   const [progressState, setProgressState] = useState<SyncProgressState>({ kind: 'syncing' })
@@ -115,17 +172,16 @@ export function AccountPickerDialog({
 
   useEffect(() => {
     if (open) {
-      // Re-arm the "settings loaded" gate each open so the fiscal-year label
-      // doesn't flash last-open's resolved date before this open's fetch lands.
-      setSettingsLoaded(false)
       const initial = new Set<string>(
         accounts.filter(a => a.enabled !== false).map(a => a.uid)
       )
       setSelected(initial)
       setSaveError(null)
-      setLookbackMode('fiscal-year')
+      setClaimedOpen(false)
+      setLookbackMode('fast')
       setCustomSubMode('date')
       setCustomDate('')
+      lookbackTouched.current = false
 
       // Pre-populate ledger picks from existing StoredAccount values, falling
       // back to currency-based suggestions for accounts the user hasn't mapped
@@ -146,45 +202,11 @@ export function AccountPickerDialog({
     }
   }, [open, accounts])
 
-  // Load fiscal_year_start_month + entity_type so "Sedan räkenskapsårets början"
-  // resolves to the right date for non-calendar fiscal years, plus the actual
-  // fiscal_periods row containing today: the recurring setting cannot represent
-  // an extended or shortened first year, so the period row wins when it exists.
-  useEffect(() => {
-    if (!open || !company?.id) return
-    let cancelled = false
-    ;(async () => {
-      const today = new Date().toISOString().split('T')[0]
-      const [settingsRes, periodRes] = await Promise.all([
-        supabase
-          .from('company_settings')
-          .select('fiscal_year_start_month, entity_type')
-          .eq('company_id', company.id)
-          .maybeSingle(),
-        supabase
-          .from('fiscal_periods')
-          .select('period_start')
-          .eq('company_id', company.id)
-          .lte('period_start', today)
-          .gte('period_end', today)
-          .order('period_start', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-      ])
-      if (cancelled) return
-      if (settingsRes.error || periodRes.error) {
-        // A failed fetch must not present the calendar-year fallback as the
-        // authoritative fiscal-year start (issue #917). Leave settingsLoaded
-        // false so the date stays masked; if the user proceeds anyway the
-        // request falls back to the recurring-setting derivation.
-        return
-      }
-      setCompanySettings((settingsRes.data as { fiscal_year_start_month?: number; entity_type?: CompanySettings['entity_type'] } | null) as Pick<CompanySettings, 'fiscal_year_start_month' | 'entity_type'> | null)
-      setCurrentPeriodStart((periodRes.data as { period_start?: string } | null)?.period_start || null)
-      setSettingsLoaded(true)
-    })()
-    return () => { cancelled = true }
-  }, [open, company?.id, supabase])
+  // fiscal_year_start_month + entity_type make "Sedan räkenskapsårets början"
+  // resolve to the right date for non-calendar fiscal years, and the actual
+  // fiscal_periods row containing today wins when it exists: the recurring
+  // setting cannot represent an extended or shortened first year. Both are
+  // derived above from the session cache.
 
   // Fetch the latest posted verifikat date so we can offer "day after the last
   // booked entry" as a one-click escape from the default fiscal-year start.
@@ -192,59 +214,120 @@ export function AccountPickerDialog({
   // fiscal period's end, which can lie months past the last actually booked
   // transaction and would make the user skip everything unbooked in between.
   // Only matters on the initial activation flow: selection edits don't re-run sync.
+  //
+  // Alongside it: the earliest completed SIE import's coverage start. For a
+  // migrator the right move is the OPPOSITE of skipping the booked overlap:
+  // fetch the whole period and let the post-sync sweep match bank rows against
+  // the imported verifikat. The nudge below flips accordingly.
   useEffect(() => {
     if (!open || !isInitialSelection || !company?.id) {
       setLastBookedDate(null)
+      setSieCoverageStart(null)
       return
     }
     let cancelled = false
     ;(async () => {
-      const { data } = await supabase
-        .from('journal_entries')
-        .select('entry_date')
-        .eq('company_id', company.id)
-        .eq('status', 'posted')
-        .order('entry_date', { ascending: false })
-        .limit(1)
-        .maybeSingle()
+      const [entryRes, sieRes] = await Promise.all([
+        supabase
+          .from('journal_entries')
+          .select('entry_date')
+          .eq('company_id', company.id)
+          .eq('status', 'posted')
+          .order('entry_date', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        supabase
+          .from('sie_imports')
+          .select('fiscal_year_start')
+          .eq('company_id', company.id)
+          .eq('status', 'completed')
+          .not('fiscal_year_start', 'is', null)
+          .order('fiscal_year_start', { ascending: true })
+          .limit(1)
+          .maybeSingle(),
+      ])
       if (cancelled) return
-      setLastBookedDate((data as { entry_date?: string } | null)?.entry_date || null)
+      setLastBookedDate((entryRes.data as { entry_date?: string } | null)?.entry_date || null)
+      setSieCoverageStart(
+        (sieRes.data as { fiscal_year_start?: string } | null)?.fiscal_year_start || null,
+      )
     })()
     return () => { cancelled = true }
   }, [open, isInitialSelection, company?.id, supabase])
 
-  // Load 19xx accounts from the chart for the per-account ledger combobox.
-  // Class 19 = bank/cash on the BAS chart.
+  // Fetch the newest transaction this connection has already imported. Any row
+  // means this pending_selection is a RENEWAL: the flow re-runs the initial
+  // backfill, and a fresh consent often makes the bank release history the
+  // first connect never delivered. Defaulting to the fiscal-year lookback then
+  // re-imports whole bookkept periods as "ohanterade" (the 2026-08 renewal
+  // flood), so a renewal defaults to gap-fill instead, unless the user has
+  // already picked a mode by the time the query lands.
   useEffect(() => {
-    if (!open || !company?.id) return
+    // `accounts` is deliberately a dep even though only its length is read: the
+    // reset effect above re-runs on every accounts identity change (the panel's
+    // visibility refetch produces a fresh array mid-open, e.g. returning from a
+    // BankID app switch) and resets the lookback default. Re-probing on the
+    // same trigger re-establishes the gap-fill default; without it the reset
+    // would silently strand a renewal back on the fiscal-year default.
+    if (!open || !isInitialSelection || !company?.id || accounts.length === 0) return
     let cancelled = false
     ;(async () => {
-      const { data, error } = await supabase
-        .from('chart_of_accounts')
-        .select('account_number, account_name')
+      // Include rows this connection superseded: a renewal that arrived via a
+      // fresh connect owns no transactions until the callback's supersede has
+      // re-pointed them, and the gap-fill default must not depend on winning
+      // that race. A failed lookup (e.g. column not deployed yet) falls back
+      // to probing this connection alone.
+      let probeConnectionIds: string[] = [connectionId]
+      const { data: supersededRows, error: supersededError } = await supabase
+        .from('bank_connections')
+        .select('id')
         .eq('company_id', company.id)
-        .like('account_number', '19%')
-        .order('account_number', { ascending: true })
+        .eq('superseded_by', connectionId)
+      if (cancelled) return
+      if (!supersededError && supersededRows) {
+        probeConnectionIds = [
+          connectionId,
+          ...(supersededRows as Array<{ id: string }>).map((r) => r.id),
+        ]
+      }
+      const { data, error } = await supabase
+        .from('transactions')
+        .select('date')
+        .eq('company_id', company.id)
+        .in('bank_connection_id', probeConnectionIds)
+        .order('date', { ascending: false })
+        .limit(1)
+        .maybeSingle()
       if (cancelled) return
       if (error) {
-        // Surface the failure: without the 19xx chart the ledger picker is
-        // silently empty, which reads as "no bank accounts exist".
-        setChartError(true)
+        // A failed probe must not read as "first connect": deriving the
+        // fiscal-year default from an unknown state is the flood case itself.
+        console.warn('[enable-banking] latest-import probe failed', error.message)
         return
       }
-      setChartError(false)
-      setChartAccounts((data as ChartAccount[] | null) || [])
+      const date = (data as { date?: string } | null)?.date || null
+      setLatestImported({ connectionId, date })
+      if (date && !lookbackTouched.current) setLookbackMode('gap-fill')
     })()
     return () => { cancelled = true }
-  }, [open, company?.id, supabase])
+  }, [open, isInitialSelection, company?.id, connectionId, supabase, accounts])
 
-  const allSelected = accounts.length > 0 && selected.size === accounts.length
+  // "Alla" means this company's accounts: a claimed account is only ever
+  // selected by an explicit tick inside the disclosure. Vacuously true when
+  // there are no own accounts, so "Markera alla" is disabled instead of
+  // being a live button that does nothing.
+  const allSelected = ownAccounts.every((a) => selected.has(a.uid))
   const noneSelected = selected.size === 0
+  // Claimed accounts the user deliberately ticked inside the disclosure. They
+  // count in "x av y valda" and are named on the disclosure line even while
+  // it is collapsed, so the counter never exceeds what the user can see.
+  const selectedClaimedCount = claimedElsewhere.filter((a) => selected.has(a.uid)).length
+  const selectableCount = ownAccounts.length + selectedClaimedCount
 
-  const sortedAccounts = useMemo(
-    () => [...accounts].sort((a, b) => (a.name || a.iban || '').localeCompare(b.name || b.iban || '')),
-    [accounts]
-  )
+  const byDisplayName = (a: StoredAccount, b: StoredAccount) =>
+    (a.name || a.iban || '').localeCompare(b.name || b.iban || '')
+  const sortedAccounts = useMemo(() => [...ownAccounts].sort(byDisplayName), [ownAccounts])
+  const sortedClaimed = useMemo(() => [...claimedElsewhere].sort(byDisplayName), [claimedElsewhere])
 
   // Detect cases where the user routed two enabled accounts with different
   // currencies to the same BAS account, usually a mistake, but allowed.
@@ -272,7 +355,12 @@ export function AccountPickerDialog({
   }
 
   function selectAll() {
-    setSelected(new Set(accounts.map(a => a.uid)))
+    // Own accounts only; a claimed account already ticked stays ticked.
+    setSelected(prev => {
+      const next = new Set(prev)
+      for (const a of ownAccounts) next.add(a.uid)
+      return next
+    })
   }
 
   function selectNone() {
@@ -301,13 +389,13 @@ export function AccountPickerDialog({
       return
     }
 
-    // Block save when the user picked "Anpassat datum" but left the date blank.
-    // Without this guard, lookback.body is null and the PATCH would silently
-    // fall back to the backend's 120-day default, not what the user asked for.
+    // Block save when the chosen mode resolved to no request body: a blank
+    // custom date, or gap-fill whose suggestion vanished. Without this guard,
+    // lookback.body is null and the PATCH would silently fall back to the
+    // backend's 120-day default, not what the user asked for.
     if (
       isInitialSelection &&
-      lookbackMode === 'custom' &&
-      customSubMode === 'date' &&
+      ((lookbackMode === 'custom' && customSubMode === 'date') || lookbackMode === 'gap-fill') &&
       !lookback.body
     ) {
       toast({
@@ -418,6 +506,13 @@ export function AccountPickerDialog({
     [lastBookedDate],
   )
 
+  const gapFill = useMemo(
+    () => (latestImported?.connectionId === connectionId
+      ? resolveGapFillStart(latestImported.date)
+      : null),
+    [latestImported, connectionId],
+  )
+
   const fiscalYearStart = useMemo(
     () => resolveFiscalYearStart(currentPeriodStart, companySettings),
     [currentPeriodStart, companySettings],
@@ -430,6 +525,19 @@ export function AccountPickerDialog({
 
   // Resolve mode → concrete request payload and a "resolved from-date" for display.
   const lookback = useMemo(() => {
+    if (lookbackMode === 'gap-fill') {
+      // The gap-fill radio only renders when gapFill resolved, but guard the
+      // body anyway: a null body falls into the same save-block as a blank
+      // custom date instead of silently syncing the server's 120-day default.
+      if (gapFill) {
+        return {
+          body: { initial_lookback_from_date: gapFill.suggestedStartDate },
+          fromDate: gapFill.suggestedStartDate,
+          days: daysBetween(gapFill.suggestedStartDate),
+        }
+      }
+      return { body: null as Record<string, string | number> | null, fromDate: null as string | null, days: 0 }
+    }
     if (lookbackMode === 'fast') {
       return { body: { initial_lookback_days: 90 }, fromDate: null as string | null, days: 90 }
     }
@@ -442,9 +550,116 @@ export function AccountPickerDialog({
       return { body: { initial_lookback_from_date: date }, fromDate: date, days: daysBetween(date) }
     }
     return { body: null as Record<string, string | number> | null, fromDate: null as string | null, days: 0 }
-  }, [lookbackMode, customSubMode, customDate, fiscalYearStart, previousFiscalYearStart])
+  }, [lookbackMode, customSubMode, customDate, fiscalYearStart, previousFiscalYearStart, gapFill])
 
   const showLongRangeHelper = lookback.days > 90
+
+  // On a renewal, a lookback reaching past what the connection already
+  // delivered re-imports periods that may already be bookkept: with a fresh
+  // consent the bank often releases history the first connect never returned.
+  const reimportsFetchedPeriod = Boolean(
+    gapFill &&
+    lookbackMode !== 'gap-fill' &&
+    (lookback.fromDate
+      ? lookback.fromDate < gapFill.latestImportedDate
+      : lookback.days > daysBetween(gapFill.latestImportedDate)),
+  )
+
+  // One account row; shared by the main list and the claimed-elsewhere
+  // disclosure so the two can never drift apart.
+  function renderAccountRow(account: StoredAccount) {
+    const isChecked = selected.has(account.uid)
+    const ledger = ledgerByUid[account.uid] || ''
+    const ledgerExistsInChart = chartAccounts.some(c => c.account_number === ledger)
+    return (
+      <div
+        key={account.uid}
+        className="flex items-center gap-3 p-3 hover:bg-muted/50"
+      >
+        {/* Toggle area: label + Checkbox (a Radix Checkbox renders as
+            its own <button role="checkbox">, so wrapping it in another
+            <button> would be nested interactive elements: invalid HTML
+            that browsers silently flatten and breaks event routing). */}
+        <label className="flex flex-1 min-w-0 cursor-pointer items-center gap-3">
+          <Checkbox
+            checked={isChecked}
+            onCheckedChange={() => toggle(account.uid)}
+            disabled={isSaving}
+          />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium truncate">
+              {account.name || account.iban || 'Okänt konto'}
+              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                {account.currency}
+              </span>
+            </p>
+            {account.iban && (
+              <p className="text-xs text-muted-foreground tabular-nums">
+                {account.iban.replace(/(.{4})/g, '$1 ').trim()}
+              </p>
+            )}
+            {/* The callback found this IBAN already booked by another
+                of the user's companies (one consent can cover several
+                companies' accounts at e.g. SEB). Unchecked by default;
+                naming the claimant is what stops a reflexive
+                select-all from booking it here too. */}
+            {account.claimed_by_company_id && (
+              <p className="text-xs text-muted-foreground">
+                Synkas redan i{' '}
+                <span data-ph-mask="">
+                  {account.claimed_by_company_name || 'ett annat bolag'}
+                </span>
+              </p>
+            )}
+            {/* Carried deselection: the user said "Synkas ej" to this
+                IBAN on another connection. An unexplained unchecked
+                box reads as a glitch; a silent one hides a sync gap. */}
+            {!account.claimed_by_company_id && account.deselected_elsewhere && (
+              <p className="text-xs text-muted-foreground">
+                Tidigare bortvald: markera för att synka i detta bolag
+              </p>
+            )}
+          </div>
+          {account.balance !== undefined && (
+            <p className="text-sm font-medium tabular-nums shrink-0">
+              {new Intl.NumberFormat('sv-SE', {
+                style: 'currency',
+                currency: account.currency,
+              }).format(account.balance)}
+            </p>
+          )}
+        </label>
+        {/* Ledger picker is a sibling of the label, not inside it:
+            otherwise clicking the Select would also toggle the checkbox. */}
+        <div className="w-44 shrink-0">
+          {isChecked && (
+            <Select
+              value={ledger}
+              onValueChange={(v) => setLedgerByUid(prev => ({ ...prev, [account.uid]: v }))}
+              disabled={isSaving}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Välj konto…" />
+              </SelectTrigger>
+              <SelectContent>
+                {/* Surface a non-existent default so the user can see/correct it. */}
+                {ledger && !ledgerExistsInChart && (
+                  <SelectItem value={ledger} disabled>
+                    {ledger}: finns ej i kontoplan
+                  </SelectItem>
+                )}
+                {chartAccounts.map(acc => (
+                  <SelectItem key={acc.account_number} value={acc.account_number}>
+                    <span className="tabular-nums">{acc.account_number}</span> {acc.account_name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <>
@@ -476,7 +691,7 @@ export function AccountPickerDialog({
     <Dialog open={open && !progressOpen} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Välj konton att synka: {bankName}</DialogTitle>
+          <DialogTitle>Välj konton att synka: <span data-ph-mask="">{bankName}</span></DialogTitle>
           <DialogDescription>
             {isInitialSelection
               ? 'Banken har gett åtkomst till följande konton. Avmarkera de konton du inte vill synka transaktioner från, och välj vilket bokföringskonto varje konto ska bokföras mot. Inga transaktioner hämtas innan du sparar.'
@@ -507,7 +722,65 @@ export function AccountPickerDialog({
               </p>
             </div>
 
-            {bookedCoverage && (
+            {sieCoverageStart ? (
+              <div className="space-y-2 rounded-md border border-border bg-background/60 p-3">
+                {/* Migrator flow: a completed SIE import exists, so the booked
+                    overlap is exactly what the post-sync sweep matches bank
+                    rows against. Pulling from the SIE year's start is the
+                    recommended move; skipping the overlap (the non-migrator
+                    nudge) would leave the imported verifikat unreconciled. */}
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-xs text-muted-foreground">
+                    Du har importerat bokföring. Hämta bankhistorik från{' '}
+                    <span className="font-medium tabular-nums text-foreground">{sieCoverageStart}</span>{' '}
+                    (importens början) så matchar vi transaktionerna automatiskt mot din importerade
+                    bokföring i stället för att bokföra dem igen.
+                  </p>
+                  <button
+                    type="button"
+                    className="shrink-0 text-xs text-foreground underline underline-offset-2"
+                    onClick={() => {
+                      // Explicit choice: the async gap-fill probe must not
+                      // override it if it resolves after this click.
+                      lookbackTouched.current = true
+                      setLookbackMode('custom')
+                      setCustomSubMode('date')
+                      setCustomDate(sieCoverageStart)
+                    }}
+                    disabled={isSaving}
+                  >
+                    Hämta från detta datum
+                  </button>
+                </div>
+                {daysBetween(sieCoverageStart) > 90 && (
+                  <p className="text-xs text-muted-foreground">
+                    De flesta banker lämnar bara ut ca 90 dagars historik via bankkopplingen. Når
+                    hämtningen inte hela vägen tillbaka kan du ladda upp kontoutdrag (CSV) under{' '}
+                    <span className="font-medium">Importera</span> för den äldre perioden, matchningen
+                    fungerar likadant.
+                  </p>
+                )}
+                {bookedCoverage && (
+                  <p className="text-xs text-muted-foreground">
+                    Vill du ändå hoppa över det som redan är bokfört kan du{' '}
+                    <button
+                      type="button"
+                      className="text-foreground underline underline-offset-2"
+                      onClick={() => {
+                        lookbackTouched.current = true
+                        setLookbackMode('custom')
+                        setCustomSubMode('date')
+                        setCustomDate(bookedCoverage.suggestedStartDate)
+                      }}
+                      disabled={isSaving}
+                    >
+                      börja från {bookedCoverage.suggestedStartDate}
+                    </button>{' '}
+                    i stället.
+                  </p>
+                )}
+              </div>
+            ) : bookedCoverage && (
               <div className="flex items-start justify-between gap-3 rounded-md border border-border bg-background/60 p-3">
                 {/* Stated as a fact with an opt-in shortcut, not as "vi
                     föreslår": the selected default below is the fiscal-year
@@ -526,6 +799,7 @@ export function AccountPickerDialog({
                   type="button"
                   className="shrink-0 text-xs text-foreground underline underline-offset-2"
                   onClick={() => {
+                    lookbackTouched.current = true
                     setLookbackMode('custom')
                     setCustomSubMode('date')
                     setCustomDate(bookedCoverage.suggestedStartDate)
@@ -538,18 +812,41 @@ export function AccountPickerDialog({
             )}
 
             <div className="space-y-2">
+              {gapFill && (
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="radio"
+                    name="lookback-mode"
+                    value="gap-fill"
+                    checked={lookbackMode === 'gap-fill'}
+                    onChange={() => { lookbackTouched.current = true; setLookbackMode('gap-fill') }}
+                    disabled={isSaving}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="block">Fortsätt där förra hämtningen slutade <span className="text-muted-foreground">(rekommenderas)</span></span>
+                    <span className="text-xs text-muted-foreground tabular-nums">
+                      från {gapFill.suggestedStartDate}; redan hämtade transaktioner hoppas över automatiskt
+                    </span>
+                  </span>
+                </label>
+              )}
+
               <label className="flex cursor-pointer items-start gap-2">
                 <input
                   type="radio"
                   name="lookback-mode"
                   value="fast"
                   checked={lookbackMode === 'fast'}
-                  onChange={() => setLookbackMode('fast')}
+                  onChange={() => { lookbackTouched.current = true; setLookbackMode('fast') }}
                   disabled={isSaving}
                   className="mt-1"
                 />
                 <span>
-                  <span className="block">Senaste 90 dagar <span className="text-muted-foreground">(snabbt)</span></span>
+                  <span className="block">Senaste 90 dagar{!gapFill && <span className="text-muted-foreground"> (rekommenderas)</span>}</span>
+                  <span className="text-xs text-muted-foreground">
+                    det längsta de flesta banker lämnar ut utan extra godkännande
+                  </span>
                 </span>
               </label>
 
@@ -559,7 +856,7 @@ export function AccountPickerDialog({
                   name="lookback-mode"
                   value="fiscal-year"
                   checked={lookbackMode === 'fiscal-year'}
-                  onChange={() => setLookbackMode('fiscal-year')}
+                  onChange={() => { lookbackTouched.current = true; setLookbackMode('fiscal-year') }}
                   disabled={isSaving}
                   className="mt-1"
                 />
@@ -567,6 +864,7 @@ export function AccountPickerDialog({
                   <span className="block">Sedan räkenskapsårets början</span>
                   <span className="text-xs text-muted-foreground tabular-nums">
                     från {settingsLoaded ? fiscalYearStart : '…'}
+                    {settingsLoaded && daysBetween(fiscalYearStart) > 90 && ': vissa banker avbryter kopplingen vid så långa förfrågningar'}
                   </span>
                 </span>
               </label>
@@ -577,7 +875,7 @@ export function AccountPickerDialog({
                   name="lookback-mode"
                   value="custom"
                   checked={lookbackMode === 'custom'}
-                  onChange={() => setLookbackMode('custom')}
+                  onChange={() => { lookbackTouched.current = true; setLookbackMode('custom') }}
                   disabled={isSaving}
                   className="mt-1"
                 />
@@ -617,14 +915,25 @@ export function AccountPickerDialog({
               </label>
             </div>
 
+            {reimportsFetchedPeriod && gapFill && (
+              <p className="attn text-[12.5px]">
+                Du har redan hämtat transaktioner till och med {gapFill.latestImportedDate}. Ett
+                tidigare startdatum kan hämta mer historik från banken, och dagar som redan är
+                bokförda kan då dyka upp som ohanterade.
+              </p>
+            )}
+
             {showLongRangeHelper && (
-              <p className="text-xs text-muted-foreground">
-                Din bank returnerar oftast max 90 dagar. Behöver du äldre transaktioner kan du{' '}
+              <p className="attn text-[12.5px]">
+                De flesta banker lämnar bara ut cirka 90 dagar utan extra godkännande, och vissa
+                (till exempel Swedbank) avbryter hela kopplingen vid längre förfrågningar: då hämtas
+                inget alls och banken måste kopplas om. Säkrast är 90 dagar här och äldre historik
+                via{' '}
                 <Link
                   href="/import?mode=sie"
                   className="text-foreground underline underline-offset-2"
                 >
-                  importera via SIE eller bankfil
+                  SIE eller kontoutdrag (CSV)
                 </Link>
                 . Vi visar exakt vad banken returnerade efter sparat val.
               </p>
@@ -634,7 +943,7 @@ export function AccountPickerDialog({
 
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span>
-            {selected.size} av {accounts.length} valda
+            {selected.size} av {selectableCount} valda
           </span>
           <div className="flex gap-2">
             <button
@@ -681,79 +990,49 @@ export function AccountPickerDialog({
         )}
 
         <div className="max-h-[50vh] overflow-y-auto rounded-lg border border-border divide-y divide-border">
-          {sortedAccounts.map(account => {
-            const isChecked = selected.has(account.uid)
-            const ledger = ledgerByUid[account.uid] || ''
-            const ledgerExistsInChart = chartAccounts.some(c => c.account_number === ledger)
-            return (
-              <div
-                key={account.uid}
-                className="flex items-center gap-3 p-3 hover:bg-muted/50"
-              >
-                {/* Toggle area: label + Checkbox (a Radix Checkbox renders as
-                    its own <button role="checkbox">, so wrapping it in another
-                    <button> would be nested interactive elements: invalid HTML
-                    that browsers silently flatten and breaks event routing). */}
-                <label className="flex flex-1 min-w-0 cursor-pointer items-center gap-3">
-                  <Checkbox
-                    checked={isChecked}
-                    onCheckedChange={() => toggle(account.uid)}
-                    disabled={isSaving}
-                  />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate">
-                      {account.name || account.iban || 'Okänt konto'}
-                      <span className="ml-2 text-xs font-normal text-muted-foreground">
-                        {account.currency}
-                      </span>
-                    </p>
-                    {account.iban && (
-                      <p className="text-xs text-muted-foreground tabular-nums">
-                        {account.iban.replace(/(.{4})/g, '$1 ').trim()}
-                      </p>
-                    )}
-                  </div>
-                  {account.balance !== undefined && (
-                    <p className="text-sm font-medium tabular-nums shrink-0">
-                      {new Intl.NumberFormat('sv-SE', {
-                        style: 'currency',
-                        currency: account.currency,
-                      }).format(account.balance)}
-                    </p>
-                  )}
-                </label>
-                {/* Ledger picker is a sibling of the label, not inside it:
-                    otherwise clicking the Select would also toggle the checkbox. */}
-                <div className="w-44 shrink-0">
-                  {isChecked && (
-                    <Select
-                      value={ledger}
-                      onValueChange={(v) => setLedgerByUid(prev => ({ ...prev, [account.uid]: v }))}
-                      disabled={isSaving}
-                    >
-                      <SelectTrigger className="w-full">
-                        <SelectValue placeholder="Välj konto…" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {/* Surface a non-existent default so the user can see/correct it. */}
-                        {ledger && !ledgerExistsInChart && (
-                          <SelectItem value={ledger} disabled>
-                            {ledger}: finns ej i kontoplan
-                          </SelectItem>
-                        )}
-                        {chartAccounts.map(acc => (
-                          <SelectItem key={acc.account_number} value={acc.account_number}>
-                            <span className="tabular-nums">{acc.account_number}</span> {acc.account_name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
-                </div>
-              </div>
-            )
-          })}
+          {sortedAccounts.map(renderAccountRow)}
+          {/* Two distinct empty states: every account in the consent belongs
+              to another company (the text below says so and points at the
+              disclosure), or the consent simply carries no accounts (a failed
+              connect, or nothing ticked at the bank), where a claim would be
+              a false statement. */}
+          {sortedAccounts.length === 0 && (
+            <p className="p-3 text-xs text-muted-foreground">
+              {claimedElsewhere.length > 0
+                ? 'Inga konton att välja: alla konton i den här bankkopplingen synkas redan i andra bolag.'
+                : 'Bankkopplingen innehåller inga konton. Förnya anslutningen och välj konton hos banken.'}
+            </p>
+          )}
         </div>
+
+        {/* Accounts another of the user's companies already books (one SEB
+            consent covers every company the signer represents). Collapsed by
+            default so this company's picker shows this company's accounts;
+            expandable because a claim is a strong hint, not proof, and an
+            account that belongs here must stay reachable. */}
+        {claimedElsewhere.length > 0 && (
+          <div>
+            <button
+              type="button"
+              onClick={() => setClaimedOpen((v) => !v)}
+              aria-expanded={claimedOpen}
+              className="flex min-h-9 items-center gap-1 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground"
+            >
+              <ChevronRight
+                className={cn('h-3.5 w-3.5 transition-transform duration-150', claimedOpen && 'rotate-90')}
+              />
+              <span className="tabular-nums" data-ph-mask="">
+                {describeClaimedElsewhere(claimedElsewhere)}
+                {selectedClaimedCount > 0 && ` (${selectedClaimedCount} valt här)`}
+              </span>
+            </button>
+            {claimedOpen && (
+              <div className="max-h-[30vh] overflow-y-auto rounded-lg border border-border divide-y divide-border">
+                {sortedClaimed.map(renderAccountRow)}
+              </div>
+            )}
+          </div>
+        )}
 
         <DialogFooter>
           <Button

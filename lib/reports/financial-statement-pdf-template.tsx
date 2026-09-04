@@ -5,6 +5,8 @@ import {
   View,
   StyleSheet,
 } from '@react-pdf/renderer'
+import { formatDateSv, pdfAmount } from '@/lib/pdf/number-text'
+import { formatOrgNumber } from '@/lib/utils'
 import type { CompanySettings } from '@/types'
 
 const styles = StyleSheet.create({
@@ -208,26 +210,6 @@ const styles = StyleSheet.create({
   },
 })
 
-function formatAmount(amount: number): string {
-  return new Intl.NumberFormat('sv-SE', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount)
-}
-
-function formatOrgNumber(orgNumber: string): string {
-  const cleaned = orgNumber.replace(/\D/g, '')
-  if (cleaned.length === 10) {
-    return `${cleaned.slice(0, 6)}-${cleaned.slice(6)}`
-  }
-  return orgNumber
-}
-
-function formatDateSv(iso: string): string {
-  if (!iso) return ''
-  return new Date(iso).toLocaleDateString('sv-SE')
-}
-
 export interface FinancialStatementSection {
   title: string
   rows: { account_number: string; account_name: string; amount: number }[]
@@ -316,7 +298,7 @@ export function FinancialStatementPDF({
                       <View key={ri} style={styles.row}>
                         <Text style={styles.colAccount}>{row.account_number}</Text>
                         <Text style={styles.colName}>{row.account_name}</Text>
-                        <Text style={styles.colAmount}>{formatAmount(displayAmount)}</Text>
+                        <Text style={styles.colAmount}>{pdfAmount(displayAmount)}</Text>
                       </View>
                     )
                   })}
@@ -324,7 +306,7 @@ export function FinancialStatementPDF({
                     <View style={styles.sectionSubtotalRow}>
                       <Text style={styles.sectionSubtotalLabel}>Summa {section.title.toLowerCase()}</Text>
                       <Text style={styles.sectionSubtotalAmount}>
-                        {formatAmount(group.negate ? -section.subtotal : section.subtotal)}
+                        {pdfAmount(group.negate ? -section.subtotal : section.subtotal)}
                       </Text>
                     </View>
                   )}
@@ -335,7 +317,7 @@ export function FinancialStatementPDF({
             <View style={styles.groupTotalRow}>
               <Text style={styles.groupTotalLabel}>{group.totalLabel}</Text>
               <Text style={styles.groupTotalAmount}>
-                {formatAmount(group.negate ? -group.total : group.total)}
+                {pdfAmount(group.negate ? -group.total : group.total)}
               </Text>
             </View>
           </View>
@@ -349,7 +331,7 @@ export function FinancialStatementPDF({
                   {row.label}
                 </Text>
                 <Text style={row.emphasis ? styles.summaryEmphasisAmount : styles.summaryAmount}>
-                  {formatAmount(row.amount)}
+                  {pdfAmount(row.amount)}
                 </Text>
               </View>
             ))}

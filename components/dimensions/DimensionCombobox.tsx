@@ -1,14 +1,15 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { Loader2, Plus } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import {
   DIMENSION_CODE_PATTERN,
-  fetchDimensions,
   type DimensionValueDto,
 } from '@/components/dimensions/types'
+import { useDimensions } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 
 interface DimensionComboboxProps {
   /** SIE dimension number as a string ('1' = kostnadsställe, '6' = projekt). */
@@ -47,9 +48,30 @@ export default function DimensionCombobox({
   const [search, setSearch] = useState(value ?? '')
   const [isOpen, setIsOpen] = useState(false)
   const [highlightedIndex, setHighlightedIndex] = useState(0)
-  const [loadState, setLoadState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle')
-  const [dimensionId, setDimensionId] = useState<string | null>(null)
-  const [values, setValues] = useState<DimensionValueDto[]>([])
+  // Registry from the session cache (lib/reference-data): every combobox on
+  // the page shares one entry, so opening a picker costs no request.
+  const { dimensions, isLoading: registryLoading, error: registryError } = useDimensions()
+  const loadState: 'loading' | 'loaded' | 'error' = registryLoading
+    ? 'loading'
+    : registryError
+      ? 'error'
+      : 'loaded'
+  const dimension = useMemo(
+    () => dimensions.find((d) => String(d.sie_dim_no) === sieDimNo) ?? null,
+    [dimensions, sieDimNo],
+  )
+  const dimensionId = dimension?.id ?? null
+  const values = useMemo(
+    () => dimension?.values.filter((v) => v.is_active) ?? [],
+    [dimension],
+  )
+  // The committed value's registry row, looked up in the FULL list: an
+  // archived code stays readable in history even though it is never offered.
+  const selected = useMemo(
+    () => (value ? dimension?.values.find((v) => v.code === value) ?? null : null),
+    [dimension, value],
+  )
+  const selectedNameId = useId()
   const [isCreating, setIsCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -72,24 +94,10 @@ export default function DimensionCombobox({
     valuesRef.current = values
   }, [values])
 
-  const loadValues = useCallback(async () => {
-    setLoadState('loading')
-    try {
-      const dims = await fetchDimensions()
-      const dim = dims.find((d) => String(d.sie_dim_no) === sieDimNo)
-      setDimensionId(dim?.id ?? null)
-      setValues(dim?.values.filter((v) => v.is_active) ?? [])
-      setLoadState('loaded')
-    } catch {
-      setLoadState('error')
-    }
-  }, [sieDimNo])
-
   const openDropdown = useCallback(() => {
     setIsOpen(true)
     setCreateError(null)
-    if (loadState === 'idle') void loadValues()
-  }, [loadState, loadValues])
+  }, [])
 
   const filteredValues = useMemo(() => {
     const term = search.trim().toLowerCase()
@@ -169,7 +177,8 @@ export default function DimensionCombobox({
           start_date: null,
           end_date: null,
         }
-        setValues((prev) => [...prev, created].sort((a, b) => a.code.localeCompare(b.code, 'sv')))
+        // Refresh the shared registry so every picker offers the new value.
+        await invalidateReferenceData('ref:dimensions')
         selectValue(created.code)
       } finally {
         setIsCreating(false)
@@ -247,6 +256,14 @@ export default function DimensionCombobox({
     }, 150)
   }
 
+  // After a pick the field holds only the code ("1"), which told the user
+  // nothing (issue #2219). Write the value's full name under it, exactly as
+  // AccountCombobox does for the account name, whenever the field shows the
+  // committed code and the name adds something beyond the code itself.
+  const showSelectedName = Boolean(
+    selected && selected.name !== selected.code && value !== null && search === value,
+  )
+
   return (
     <div ref={containerRef} className="relative">
       <Input
@@ -259,13 +276,24 @@ export default function DimensionCombobox({
         disabled={disabled}
         className={`font-mono ${className ?? ''}`.trim()}
         autoComplete="off"
+        aria-describedby={showSelectedName ? selectedNameId : undefined}
       />
+
+      {showSelectedName && selected ? (
+        <p
+          id={selectedNameId}
+          data-ph-mask=""
+          className="mt-1 break-words px-1 text-xs leading-snug text-muted-foreground"
+        >
+          {selected.name}
+        </p>
+      ) : null}
 
       {/* Dropdown */}
       {isOpen && !disabled && (
         <div
           ref={listRef}
-          className="absolute z-50 top-full left-0 mt-1 min-w-[16rem] w-[max(100%,20rem)] max-h-[300px] overflow-y-auto rounded-md border border-input bg-card shadow-md"
+          className="absolute z-50 top-full left-0 mt-1 min-w-[16rem] w-[max(100%,20rem)] max-h-[300px] overflow-y-auto rounded-lg border border-input bg-card shadow-md"
         >
           {loadState === 'loading' && (
             <div className="flex items-center gap-2 px-2 py-2 text-sm text-muted-foreground">

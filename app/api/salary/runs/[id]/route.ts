@@ -4,6 +4,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { formatRedovisare } from '@/lib/skatteverket/format'
 import { maskEmployeeForResponse } from '@/lib/salary/personnummer'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { ISO_DATE_RE } from '@/lib/invariants'
 
 ensureInitialized()
 
@@ -175,7 +176,7 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     // Only allow updates on draft runs
     const { data: run, error: fetchError } = await supabase
       .from('salary_runs')
-      .select('id, status')
+      .select('id, status, payment_date, period_year, period_month')
       .eq('id', id)
       .eq('company_id', companyId)
       .single()
@@ -189,6 +190,11 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     }
 
     const body = await request.json()
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      return NextResponse.json({ error: 'Ogiltig förfrågan' }, { status: 400 })
+    }
+    // Whitelist keys AND values: only these three fields, with the same value
+    // rules as the v1 UpdateSalaryRunSchema, ever reach the DB.
     const allowedFields = ['payment_date', 'voucher_series', 'notes']
     const updates: Record<string, unknown> = {}
     for (const field of allowedFields) {
@@ -196,17 +202,72 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
         updates[field] = body[field]
       }
     }
+    if (
+      updates.payment_date !== undefined &&
+      (typeof updates.payment_date !== 'string' || !ISO_DATE_RE.test(updates.payment_date))
+    ) {
+      return NextResponse.json({ error: 'Ogiltigt datum (ÅÅÅÅ-MM-DD)' }, { status: 400 })
+    }
+    if (
+      updates.voucher_series !== undefined &&
+      (typeof updates.voucher_series !== 'string' || !/^[A-Z]$/.test(updates.voucher_series))
+    ) {
+      return NextResponse.json(
+        { error: 'Verifikationsserie måste vara en bokstav A-Z' },
+        { status: 400 },
+      )
+    }
+    if (
+      updates.notes !== undefined &&
+      updates.notes !== null &&
+      (typeof updates.notes !== 'string' || updates.notes.length > 2000)
+    ) {
+      return NextResponse.json({ error: 'Anteckningen får vara högst 2000 tecken' }, { status: 400 })
+    }
 
+    // The payment date may leave the run's period month: the AGI
+    // redovisningsperiod follows payment_date (kontantprincipen, #2191), so a
+    // run for August paid 25 September is declared in September, and the
+    // verifikat books on the same date. Same rule as lib/salary/update-run.ts
+    // and the v1 PATCH.
+
+    // Optimistic lock on status='draft': a concurrent step advancing the run
+    // (Beräkna → Till granskning in another tab) between the fetch above and
+    // this write must fail the write, not slip a frozen-field edit through
+    // (same guard as the v1 PATCH and lib/salary/update-run.ts).
     const { data: updated, error } = await supabase
       .from('salary_runs')
       .update(updates)
       .eq('id', id)
       .eq('company_id', companyId)
+      .eq('status', 'draft')
       .select()
-      .single()
+      .maybeSingle()
 
     if (error) {
       return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    }
+    if (!updated) {
+      // Race: the run advanced past draft between fetch and update.
+      return NextResponse.json({ error: 'Kan bara redigera utkast' }, { status: 400 })
+    }
+
+    // A supplied payment_date invalidates any existing calculation:
+    // skatteavdrag follows the payment date, so clearing calculation_breakdown
+    // makes both book preflights refuse the roster until a recalculation has
+    // run against the new date (same invariant as setRunEmployeeSalary in
+    // lib/salary/run-employees.ts and lib/salary/update-run.ts). Gated on
+    // SUPPLIED, not on changed, so a retry after a partial failure re-clears
+    // instead of comparing against the already-updated date and skipping.
+    if (updates.payment_date !== undefined) {
+      const { error: clearError } = await supabase
+        .from('salary_run_employees')
+        .update({ calculation_breakdown: null })
+        .eq('salary_run_id', id)
+        .eq('company_id', companyId)
+      if (clearError) {
+        return NextResponse.json({ error: getUserErrorMessage(clearError) }, { status: 500 })
+      }
     }
 
     return NextResponse.json({ data: updated })

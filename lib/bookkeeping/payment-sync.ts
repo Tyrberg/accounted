@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createLogger } from '@/lib/logger'
 import { roundOre } from '@/lib/money'
+import { invoiceCustomerOutstanding } from '@/lib/invoices/customer-share'
 import type { JournalEntry } from '@/types'
 
 const log = createLogger('payment-sync')
@@ -152,7 +153,7 @@ export async function syncInvoiceStatusFromPaymentEntry(
 
     const { data: customerInvoice } = await supabase
       .from('invoices')
-      .select('paid_amount, total, due_date')
+      .select('paid_amount, total, due_date, deduction_total')
       .eq('id', entry.source_id)
       .eq('company_id', companyId)
       .single()
@@ -172,7 +173,27 @@ export async function syncInvoiceStatusFromPaymentEntry(
       // .in('status', …) guard below can leave status/remaining un-updated if
       // the invoice isn't paid/partially_paid: only reachable on a non-storno
       // path; the payment-row delete + tx release still run, freeing the line.)
-      const newRemaining = roundOre(customerInvoice.total - safePaidAmount)
+      //
+      // remaining_amount is the CUSTOMER share: net of the ROT/RUT deduction,
+      // exactly as build-invoice-write stores it at creation (total -
+      // deduction_total) and as the invoices_remaining_amount_guard trigger
+      // derives it. Recomputing gross here inflated remaining on ROT/RUT
+      // invoices after a storno, which made them permanently un-settleable
+      // once mark-paid started comparing the net customer settlement against
+      // remaining (a net payment can never reach a gross remaining, and the
+      // cash-partial block rejects the "partial"). The share comes from the
+      // one shared definition (lib/invoices/customer-share.ts); the
+      // Math.max(0, ...) mirrors the guard's GREATEST(0, ...) because this
+      // value is persisted into the column.
+      const deductionTotal =
+        (customerInvoice as { deduction_total?: number | null }).deduction_total ?? 0
+      const newRemaining = Math.max(
+        0,
+        invoiceCustomerOutstanding(
+          { total: customerInvoice.total, deduction_total: deductionTotal },
+          safePaidAmount,
+        ),
+      )
       const revertStatus = newPaidAmount > 0
         ? 'partially_paid'
         : customerInvoice.due_date && new Date(customerInvoice.due_date) < new Date()

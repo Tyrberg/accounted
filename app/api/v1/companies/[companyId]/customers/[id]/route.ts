@@ -18,9 +18,29 @@ import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { parseExpand } from '@/lib/api/v1/expand'
 import { registerEndpoint, dataEnvelope, NoBodyResponse } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { UpdateCustomerSchema } from '@/lib/api/schemas'
 import { validateVatNumber } from '@/lib/vat/vies-client'
+import { COUNTRY_CONSISTENCY_MESSAGES, checkCountryConsistency } from '@/lib/vat/country-codes'
+
+/** The stored fields the country-vs-type rule and the personnummer guards read. */
+interface ExistingCountryRow {
+  customer_type?: string
+  country?: string | null
+  vat_number?: string | null
+}
+import {
+  encryptCustomerPersonalNumber,
+  maskCustomerRow,
+} from '@/lib/customers/protect-personal-number'
+import { isMaskedPersonalNumber } from '@/lib/customers/mask-personal-number'
+import {
+  looksLikeSwedishPersonalNumber,
+  normalizeReroutedPersonalNumber,
+  orgNumberHoldsPersonalNumber,
+  personalNumberDigits,
+} from '@/lib/customers/personal-number-shape'
 
 // v1-only extension: allow PATCH to set archived_at back to null to
 // un-archive a customer. Restricted to literal `null` so the caller can't
@@ -34,8 +54,11 @@ const CustomerDetail = z.object({
   name: z.string(),
   customer_type: z.string(),
   customer_number: z.string().nullable(),
+  contact_person: z.string().nullable(),
   email: z.string().nullable(),
   phone: z.string().nullable(),
+  invoice_email_cc_addresses: z.array(z.string()).nullable(),
+  invoice_email_bcc_addresses: z.array(z.string()).nullable(),
   address_line1: z.string().nullable(),
   address_line2: z.string().nullable(),
   postal_code: z.string().nullable(),
@@ -44,6 +67,8 @@ const CustomerDetail = z.object({
   org_number: z.string().nullable(),
   vat_number: z.string().nullable(),
   vat_number_validated: z.boolean(),
+  // Always the masked display form ('********-1234'), never the stored value.
+  personal_number: z.string().nullable(),
   default_payment_terms: z.number(),
   notes: z.string().nullable(),
   archived_at: z.string().nullable(),
@@ -57,7 +82,7 @@ const OPEN_INVOICE_STATUSES = ['sent', 'partially_paid', 'overdue']
 // Explicit projection. Excludes user_id, company_id (internal scoping),
 // and vat_number_validated_at (internal timestamp not in the public schema).
 const CUSTOMER_DETAIL_COLUMNS =
-  'id, name, customer_type, customer_number, email, phone, address_line1, address_line2, postal_code, city, country, org_number, vat_number, vat_number_validated, default_payment_terms, notes, archived_at, created_at, updated_at'
+  'id, name, customer_type, customer_number, contact_person, email, phone, invoice_email_cc_addresses, invoice_email_bcc_addresses, address_line1, address_line2, postal_code, city, country, org_number, vat_number, vat_number_validated, personal_number, default_payment_terms, notes, archived_at, created_at, updated_at'
 
 const OPEN_INVOICE_COLUMNS =
   'id, invoice_number, invoice_date, due_date, status, currency, total, remaining_amount'
@@ -76,6 +101,7 @@ registerEndpoint({
   pitfalls: [
     'archived_at is non-null when the customer has been soft-deleted; the customer is still queryable by id but excluded from default lists.',
     'vat_number_validated reflects the last successful VIES check; it can become stale if the EU registry revokes a number.',
+    'personal_number is always returned in the masked form ********-1234; the stored value is encrypted and never leaves the API.',
   ],
   example: {
     response: {
@@ -87,7 +113,7 @@ registerEndpoint({
         org_number: '556677-8899',
         vat_number: 'SE556677889901',
         vat_number_validated: true,
-        country: 'Sweden',
+        country: 'SE',
         default_payment_terms: 30,
         archived_at: null,
         created_at: '2025-04-12T08:30:00Z',
@@ -165,6 +191,8 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
         .select(OPEN_INVOICE_COLUMNS)
         .eq('company_id', ctx.companyId!)
         .eq('customer_id', customerId)
+        // Proformas, delivery notes and quotes are never open receivables.
+        .eq('document_type', 'invoice')
         .in('status', OPEN_INVOICE_STATUSES)
         .order('invoice_date', { ascending: false })
 
@@ -199,7 +227,9 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     }
 
     return ok(
-      { ...customer, ...(invoices !== undefined ? { invoices } : {}) },
+      // The selected row carries personal_number ciphertext; mask before it
+      // leaves the server.
+      { ...maskCustomerRow(customer as { personal_number?: string | null }), ...(invoices !== undefined ? { invoices } : {}) },
       {
         requestId: ctx.requestId,
         partialExpansions: partialExpansions.length > 0 ? partialExpansions : undefined,
@@ -227,6 +257,8 @@ registerEndpoint({
     'Idempotency-Key is mandatory; calls without it return 400.',
     'org_number uniqueness is enforced at DB level: 23505 → 409 CUSTOMER_DUPLICATE_ORG_NUMBER.',
     'VIES re-validation is best-effort and runs only on commit. A VIES timeout does not fail the update.',
+    'personal_number: a plaintext value is stored encrypted (individual customers only); the masked form a read returned (********-1234) means "leave unchanged" and is never stored; null clears it. Changing customer_type away from individual clears any stored personal_number.',
+    'An org_number shaped like a Swedish personnummer is rejected for business customer_types (400 CUSTOMER_ORG_NUMBER_IS_PERSONAL). On an individual it is the personnummer in the wrong field: it is stored encrypted as personal_number and org_number is cleared; next to a different personal_number in the same body it is 400 CUSTOMER_PERSONAL_NUMBER_CONFLICT.',
   ],
   example: {
     request: { default_payment_terms: 14, notes: 'New payment terms agreed 2026-05-12.' },
@@ -265,29 +297,110 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     }
     const customerId = idParse.data
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
+
+    const parsed = V1PatchCustomerSchema.safeParse(rawBody)
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
+    const body = parsed.data
+
+    // Mirrors the internal PATCH route: every read path returns the masked
+    // form ('********-1234', or '********-????' when undecryptable), so a
+    // client PATCHing back what it read carries no new value. A mask must
+    // not be validated, stored, or treated as a clear.
+    const personalNumberSubmitted =
+      body.personal_number !== undefined && !isMaskedPersonalNumber(body.personal_number)
+
+    // The individual-only rule for personal_number, the personnummer guard
+    // on org_number and the country-vs-type check all depend on the row as
+    // it will be after the update; read the stored values when the body
+    // touches any of the fields involved.
+    let effectiveType: string | undefined = body.customer_type
+    let existing: ExistingCountryRow | null = null
+    if (
+      (personalNumberSubmitted && body.personal_number)
+      || body.org_number
+      || body.customer_type !== undefined
+      || body.country !== undefined
+      || body.vat_number !== undefined
+    ) {
+      const { data } = await ctx.supabase
+        .from('customers')
+        .select('customer_type, country, vat_number')
+        .eq('company_id', ctx.companyId!)
+        .eq('id', customerId)
+        .maybeSingle()
+      existing = data as ExistingCountryRow | null
+      effectiveType ??= existing?.customer_type
+    }
+
+    // Country vs type vs VAT prefix on the row as it will END UP (#2025): a
+    // type change alone can make the stored country wrong, and a country
+    // change alone can contradict the stored VAT number. Judged only when one
+    // of the three is in the body, so a contradictory legacy row can still
+    // change its email.
+    const countryRuleTouched =
+      body.customer_type !== undefined || body.country !== undefined || body.vat_number !== undefined
+    if (countryRuleTouched && existing && effectiveType) {
+      const countryIssue = checkCountryConsistency({
+        partyType: effectiveType,
+        country: body.country ?? existing.country,
+        vatNumber: body.vat_number ?? existing.vat_number,
+      })
+      if (countryIssue) {
+        return v1ErrorResponseFromCode('CUSTOMER_COUNTRY_MISMATCH', ctx.log, {
+          requestId: ctx.requestId,
+          details: {
+            field: 'country',
+            issue: countryIssue,
+            message_sv: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].sv,
+            message_en: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].en,
+          },
+        })
+      }
+    }
+
+    if (personalNumberSubmitted && body.personal_number && effectiveType !== 'individual') {
+      return v1ErrorResponseFromCode('CUSTOMER_PERSONAL_NUMBER_NOT_ALLOWED', ctx.log, {
         requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
+        details: { field: 'personal_number' },
       })
     }
 
-    const parsed = V1PatchCustomerSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+    // GDPR art. 5.1 c: only customer_type='individual' rows get their
+    // identifiers masked, so a personnummer accepted as a business
+    // org_number would be displayed unmasked everywhere.
+    if (
+      body.org_number &&
+      effectiveType !== 'individual' &&
+      looksLikeSwedishPersonalNumber(body.org_number)
+    ) {
+      return v1ErrorResponseFromCode('CUSTOMER_ORG_NUMBER_IS_PERSONAL', ctx.log, {
         requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
+        details: { field: 'org_number' },
       })
     }
-    const body = parsed.data
+
+    // The mirror image for individuals: a personnummer submitted as
+    // org_number is the personnummer in the wrong field. It is stored
+    // encrypted in personal_number and org_number is cleared, same as
+    // CreateCustomerSchema does on create. Next to a DIFFERENT plaintext
+    // personal_number in the same body the two conflict.
+    const reroutedPersonalNumber = orgNumberHoldsPersonalNumber(effectiveType, body.org_number)
+      ? normalizeReroutedPersonalNumber(body.org_number!)
+      : null
+    if (
+      reroutedPersonalNumber
+      && personalNumberSubmitted
+      && body.personal_number
+      && personalNumberDigits(body.personal_number) !== personalNumberDigits(reroutedPersonalNumber)
+    ) {
+      return v1ErrorResponseFromCode('CUSTOMER_PERSONAL_NUMBER_CONFLICT', ctx.log, {
+        requestId: ctx.requestId,
+        details: { field: 'org_number' },
+      })
+    }
 
     // Build the partial update set. Fields explicitly set to undefined in
     // the body are not in the resulting object (Zod strips undefined). null
@@ -296,8 +409,11 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     for (const key of [
       'name',
       'customer_type',
+      'contact_person',
       'email',
       'phone',
+      'invoice_email_cc_addresses',
+      'invoice_email_bcc_addresses',
       'address_line1',
       'address_line2',
       'postal_code',
@@ -316,6 +432,18 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     // (matches the internal /api/customers route).
     if (body.customer_number !== undefined) {
       updateData.customer_number = body.customer_number || null
+    }
+    if (reroutedPersonalNumber) updateData.org_number = null
+    if (reroutedPersonalNumber && !(personalNumberSubmitted && body.personal_number)) {
+      updateData.personal_number = encryptCustomerPersonalNumber(reroutedPersonalNumber)
+    } else if (personalNumberSubmitted) {
+      // Stored as ciphertext; customers_personal_number_check accepts that
+      // shape only (20260726110000).
+      updateData.personal_number = encryptCustomerPersonalNumber(body.personal_number)
+    } else if (body.customer_type !== undefined && body.customer_type !== 'individual') {
+      // The row is becoming a business customer: a personnummer may not
+      // remain stored on it (matches the internal PATCH route).
+      updateData.personal_number = null
     }
 
     if (Object.keys(updateData).length === 0) {
@@ -346,7 +474,7 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
         })
       }
 
-      return dryRunPreview({ ...current, ...updateData }, { requestId: ctx.requestId, log: ctx.log })
+      return dryRunPreview(maskCustomerRow({ ...(current as Record<string, unknown> & { personal_number?: string | null }), ...updateData }), { requestId: ctx.requestId, log: ctx.log })
     }
 
     // Best-effort VIES re-validation if vat_number is changing on an
@@ -412,7 +540,7 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
       })
     }
 
-    return ok(data, { requestId: ctx.requestId })
+    return ok(maskCustomerRow(data as Record<string, unknown> & { personal_number?: string | null }), { requestId: ctx.requestId })
   },
   { requireIdempotencyKey: true },
 )
@@ -503,7 +631,7 @@ export const DELETE = withApiV1<{ params: Promise<{ companyId: string; id: strin
       }
 
       return dryRunPreview(
-        { ...current, archived_at: new Date().toISOString() },
+        maskCustomerRow({ ...(current as Record<string, unknown> & { personal_number?: string | null }), archived_at: new Date().toISOString() }),
         { requestId: ctx.requestId, log: ctx.log },
       )
     }

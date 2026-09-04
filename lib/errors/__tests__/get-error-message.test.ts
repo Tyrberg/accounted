@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { getErrorMessage } from '../get-error-message'
+import {
+  getErrorMessage,
+  getProviderResourceForbiddenMessage,
+  isSwedishUserMessage,
+  looksLikeUserFacingSwedish,
+} from '../get-error-message'
+import { getErrorEntry, listErrorCodes } from '../structured-errors'
 import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
@@ -284,7 +290,7 @@ describe('getErrorMessage: payment-file route messages surface (issue #945)', ()
 
   it('surfaces a "... krävs ..." message instead of the generic 400', () => {
     const msg = getErrorMessage(
-      { error: 'Momsregistreringsnummer krävs när företaget är momsregistrerat (ML 11 kap. 8§)' },
+      { error: 'Momsregistreringsnummer krävs när företaget är momsregistrerat (ML 17 kap. 24 §)' },
       { context: 'settings', statusCode: 400 },
     )
     expect(msg).toContain('krävs')
@@ -374,6 +380,17 @@ describe('getErrorMessage: API response body vs new Error(body.error)', () => {
     expect(msg).not.toBe('Något gick fel. Försök igen.')
   })
 
+  // A body the platform rejects never reaches a route, and the 413 it answers
+  // with is plain text: the status is the only thing left to translate.
+  it('a payload-too-large rejection says so, with no body to read', () => {
+    expect(getErrorMessage(null, { statusCode: 413 })).toBe(
+      'Filen är för stor för att skickas. Försök igen med en mindre fil.',
+    )
+    expect(getErrorMessage(null, { statusCode: 413, locale: 'en' })).toBe(
+      'The file is too large to send. Try again with a smaller file.',
+    )
+  })
+
   it('new Error(body.error) stringifies the envelope to "[object Object]"', () => {
     // The defect in one line: the Error constructor calls String() on the object.
     expect(new Error(envelope.error as unknown as string).message).toBe('[object Object]')
@@ -398,6 +415,28 @@ describe('getErrorMessage: API response body vs new Error(body.error)', () => {
     expect(getErrorMessage(body, { statusCode: 403 })).toBe(
       'Du har endast läsbehörighet i detta företag.',
     )
+  })
+
+  // #1996: the envelope a missing PERSONNUMMER_ENCRYPTION_KEY now produces.
+  it('a typed configuration-gap envelope yields the registry text per locale', () => {
+    const configGap = {
+      error: {
+        code: 'PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED',
+        message:
+          'Lönemodulen är inte konfigurerad: krypteringsnyckeln för personnummer (PERSONNUMMER_ENCRYPTION_KEY) saknas i driftmiljön. Kontakta supporten.',
+        message_en:
+          'Payroll is not configured: the personal-number encryption key (PERSONNUMMER_ENCRYPTION_KEY) is missing from the deployment environment. Contact support.',
+        requestId: 'req_00000000-0000-4000-8000-000000000001',
+      },
+    }
+    const sv = getErrorMessage(configGap, { context: 'salary', statusCode: 503, locale: 'sv' })
+    expect(sv).toBe(configGap.error.message)
+    const en = getErrorMessage(configGap, { context: 'salary', statusCode: 503, locale: 'en' })
+    expect(en).toBe(configGap.error.message_en)
+    // Neither locale falls back to the generic 503 "temporarily unavailable"
+    // text: this failure is permanent until an operator sets the variable.
+    expect(sv).not.toMatch(/tillfälligt/i)
+    expect(en).not.toMatch(/temporarily/i)
   })
 
   it('the same call handles an unparseable body via statusCode', () => {
@@ -459,5 +498,174 @@ describe('getErrorMessage: Swedish heuristic covers real route sentences', () =>
     expect(getErrorMessage({ error: 'Extension context required' }, { statusCode: 500 })).toBe(
       'Ett oväntat serverfel uppstod. Försök igen senare.',
     )
+  })
+
+  // The CashLeads Fortnox migration (2026-08-06): the sie-import finalizer's
+  // guard message reached the wizard as a thrown Error, matched none of the
+  // patterns, and the user saw the generic fallback instead of the reason the
+  // migration stopped. Pins the added patterns: verifikation / importen.
+  it('the 0-verifikationer import guard sentence passes through verbatim', () => {
+    const thrown = new Error(
+      'Importen skapade 0 verifikationer: markerar som misslyckad så filen kan importeras om utan replace/undo. Granska varningarna för att se vilka konton som behöver mappas.',
+    )
+    const msg = getErrorMessage(thrown)
+    expect(msg).toContain('0 verifikationer')
+    expect(msg).not.toBe('Något gick fel. Försök igen.')
+  })
+})
+
+describe('getErrorMessage: GoTrue auth error patterns', () => {
+  it('maps "Signups not allowed for this instance" to the closed-installation message', () => {
+    // Shape mirrors a real AuthApiError: an Error instance carrying a GoTrue
+    // error code that the structured registry does not know.
+    const authError = Object.assign(new Error('Signups not allowed for this instance'), {
+      code: 'signup_disabled',
+      status: 422,
+    })
+    const msg = getErrorMessage(authError, { context: 'auth' })
+    expect(msg).toBe(
+      'Kontoregistrering är avstängd på den här installationen. Kontakta den som bjöd in dig eller din administratör för att få ett konto.',
+    )
+  })
+
+  it('maps a plain "Signups not allowed" string as well', () => {
+    const msg = getErrorMessage('Signups not allowed for this instance', { context: 'auth' })
+    expect(msg).toContain('avstängd på den här installationen')
+  })
+
+  it('maps GoTrue "Error sending invite email" to the SMTP guidance message', () => {
+    const authError = Object.assign(new Error('Error sending invite email'), {
+      code: 'unexpected_failure',
+      status: 500,
+    })
+    const msg = getErrorMessage(authError, { context: 'auth', statusCode: 502 })
+    expect(msg).toBe(
+      'E-postmeddelandet kunde inte skickas av autentiseringstjänsten. Kontrollera installationens SMTP-inställningar och försök igen.',
+    )
+  })
+})
+
+describe('getProviderResourceForbiddenMessage', () => {
+  it('builds on the registry copy and appends the provider\'s own sentence', () => {
+    const entry = getErrorEntry('PROVIDER_RESOURCE_FORBIDDEN')!
+    const msg = getProviderResourceForbiddenMessage('Saknar behörighet för leverantörsregister.')
+
+    // One copy of the sentence, in the registry: the toast, the API envelope
+    // and the public error catalogue all have to say the same thing.
+    expect(msg.startsWith(entry.message_sv)).toBe(true)
+    // The provider's own words are the only part that names the register.
+    expect(msg).toContain('Leverantörens svar: "Saknar behörighet för leverantörsregister."')
+  })
+
+  it('falls back to the base sentence alone when the provider sent an opaque body', () => {
+    const entry = getErrorEntry('PROVIDER_RESOURCE_FORBIDDEN')!
+    expect(getProviderResourceForbiddenMessage(null)).toBe(entry.message_sv)
+    expect(getProviderResourceForbiddenMessage('   ')).toBe(entry.message_sv)
+    expect(getProviderResourceForbiddenMessage(null, 'en')).toBe(entry.message_en)
+  })
+
+  it('never tells the user to reconnect: the same grant meets the same 403', () => {
+    expect(getProviderResourceForbiddenMessage(null)).not.toMatch(/återanslut för att fortsätta/i)
+  })
+})
+
+describe('getErrorMessage: INVOICE_SEND_PAYMENT_ACCOUNT_MISSING (#2126)', () => {
+  const envelope = (currency?: unknown) => ({
+    error: {
+      code: 'INVOICE_SEND_PAYMENT_ACCOUNT_MISSING',
+      message: getErrorEntry('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')!.message_sv,
+      message_en: getErrorEntry('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')!.message_en,
+      ...(currency !== undefined ? { details: { currency } } : {}),
+    },
+  })
+
+  it('SEK invoice: names bankgiro/plusgiro/Swish, not a currency account', () => {
+    const msg = getErrorMessage(envelope('SEK'), { statusCode: 400 })
+    expect(msg).toContain('bankgiro')
+    expect(msg).toContain('Inställningar → Fakturering')
+    expect(msg).not.toMatch(/valuta/i)
+  })
+
+  it('EUR invoice: asks for an IBAN account for EUR', () => {
+    const msg = getErrorMessage(envelope('EUR'), { statusCode: 400 })
+    expect(msg).toContain('EUR')
+    expect(msg).toContain('IBAN')
+  })
+
+  it('English locale gets the currency-specific English text, not the registry fallback', () => {
+    const msg = getErrorMessage(envelope('SEK'), { statusCode: 400, locale: 'en' })
+    expect(msg).toContain('bankgiro')
+    expect(msg).toContain('Settings → Invoicing')
+    expect(msg).not.toMatch(/currency/i)
+  })
+
+  it('without a currency in details, falls back to the registry text', () => {
+    const msg = getErrorMessage(envelope(), { statusCode: 400 })
+    expect(msg).toBe(getErrorEntry('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')!.message_sv)
+    const unknown = getErrorMessage(envelope('JPY'), { statusCode: 400 })
+    expect(unknown).toBe(getErrorEntry('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')!.message_sv)
+  })
+})
+
+
+// Issue #2086: the keyword heuristic dropped correct Swedish route messages
+// that happened to lack one of its ~30 keywords and replaced them with generic
+// HTTP text whose advice was sometimes wrong. A sentence that reads as Swedish
+// and shows no sign of a technical leak now passes through.
+describe('getErrorMessage: Swedish route messages without a keyword pass through (#2086)', () => {
+  it('shows the skattekonto sync reason instead of the generic 500 text', () => {
+    const msg = getErrorMessage(
+      { error: 'Inget skattekonto är registrerat hos Skatteverket.' },
+      { statusCode: 500 },
+    )
+    expect(msg).toBe('Inget skattekonto är registrerat hos Skatteverket.')
+  })
+
+  it.each([
+    'Datumet ligger utanför det valda räkenskapsåret.',
+    'Rättelsen motsvarar ingen ekonomisk händelse: det finns inget att rätta.',
+    'Funktionen är inte implementerad ännu.',
+  ])('passes through %s', (text) => {
+    expect(getErrorMessage({ error: text }, { statusCode: 400 })).toBe(text)
+    expect(getErrorMessage({ message: text }, { statusCode: 400 })).toBe(text)
+  })
+
+  it('still hides English and technical text behind the status/context fallback', () => {
+    expect(getErrorMessage({ error: 'Failed to fetch customer' }, { statusCode: 500 })).toBe(
+      'Ett oväntat serverfel uppstod. Försök igen senare.',
+    )
+    expect(
+      getErrorMessage({ error: 'TypeError: Cannot read properties of undefined (reading "id")' }, { statusCode: 500 }),
+    ).toBe('Ett oväntat serverfel uppstod. Försök igen senare.')
+    // Swedish words next to a leak are still a leak.
+    expect(
+      getErrorMessage({ error: 'Kontot är trasigt: TypeError: x is not a function' }, { statusCode: 500 }),
+    ).toBe('Ett oväntat serverfel uppstod. Försök igen senare.')
+    expect(
+      getErrorMessage({ error: 'Det gick inte att läsa relation "public.invoices"' }, { statusCode: 500 }),
+    ).toBe('Ett oväntat serverfel uppstod. Försök igen senare.')
+  })
+
+  it('looksLikeUserFacingSwedish scores on å/ä/ö, a strong Swedish word, or two weak ones, never on English', () => {
+    expect(looksLikeUserFacingSwedish('Inget skattekonto är registrerat hos Skatteverket.')).toBe(true)
+    expect(looksLikeUserFacingSwedish('Det finns inget att rätta.')).toBe(true)
+    expect(looksLikeUserFacingSwedish('Kopplingen misslyckades.')).toBe(true)
+    expect(looksLikeUserFacingSwedish('Ingen fil bifogad.')).toBe(true)
+    expect(looksLikeUserFacingSwedish('Kan hittas med den.')).toBe(true) // two weak words
+    expect(looksLikeUserFacingSwedish('Not found')).toBe(false)
+    expect(looksLikeUserFacingSwedish('Request failed with status 500')).toBe(false)
+    expect(looksLikeUserFacingSwedish('Invalid input: expected string, received undefined')).toBe(false)
+    expect(looksLikeUserFacingSwedish('')).toBe(false)
+    // A lone weak word is not enough ("till" is also English).
+    expect(looksLikeUserFacingSwedish('Redirect till /login')).toBe(false)
+    expect(looksLikeUserFacingSwedish('Set the value for det')).toBe(false)
+  })
+
+  it('every message_sv in the structured-error registry passes the combined test', () => {
+    const failing = listErrorCodes().filter((code) => {
+      const entry = getErrorEntry(code)
+      return entry ? !isSwedishUserMessage(entry.message_sv) : false
+    })
+    expect(failing).toEqual([])
   })
 })

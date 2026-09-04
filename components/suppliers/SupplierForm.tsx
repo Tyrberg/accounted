@@ -1,17 +1,20 @@
 'use client'
 
 import { useMemo } from 'react'
+import { useAccounts } from '@/lib/reference-data/hooks'
 import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { useTranslations } from 'next-intl'
+import { useLocale, useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Loader2, Lock } from 'lucide-react'
+import { Loader2, Lock, X } from 'lucide-react'
+import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { getCountryOptions, normalizeCountryCode } from '@/lib/vat/country-codes'
 import type { CreateSupplierInput } from '@/types'
 
 interface SupplierFormProps {
@@ -27,6 +30,24 @@ export default function SupplierForm({
 }: SupplierFormProps) {
   const { canWrite } = useCanWrite()
   const t = useTranslations('form_supplier')
+  const locale = useLocale() === 'en' ? 'en' : 'sv'
+  const countryOptions = useMemo(() => getCountryOptions(locale), [locale])
+  // Chart of accounts from the session cache (lib/reference-data): the
+  // konto combobox is populated on the first paint; without the chart it
+  // still accepts a typed 4-digit number.
+  const { accounts } = useAccounts()
+
+  // The default account seeds expense lines on supplier invoices, so the
+  // browsable list is cost classes 4-7. Any other 4-digit number can still be
+  // typed in; the API only enforces the format.
+  const expenseAccounts = useMemo(
+    () => accounts.filter((a) => a.account_class >= 4 && a.account_class <= 7),
+    [accounts]
+  )
+  const accountNameByNumber = useMemo(
+    () => new Map(accounts.map((a) => [a.account_number, a.account_name])),
+    [accounts]
+  )
 
   const schema = useMemo(() => z.object({
     name: z.string().min(1, t('name_required')),
@@ -37,15 +58,24 @@ export default function SupplierForm({
     address_line2: z.string().optional(),
     postal_code: z.string().optional(),
     city: z.string().optional(),
-    country: z.string().optional(),
+    // ISO 3166-1 alpha-2; an unmapped legacy name is shown as-is and has to
+    // be replaced before the form saves.
+    country: z.string().refine((v) => normalizeCountryCode(v) !== null, t('country_invalid')),
     org_number: z.string().optional(),
     vat_number: z.string().optional(),
     bankgiro: z.string().optional(),
     plusgiro: z.string().optional(),
     iban: z.string().optional(),
     bic: z.string().optional(),
+    clearing_number: z.string().optional(),
+    account_number: z.string().optional(),
     default_expense_account: z.string().optional(),
-    default_payment_terms: z.number().min(1).optional(),
+    // Whole days 0-365; 0 = betalning direkt (issue #2070, same as CustomerForm).
+    default_payment_terms: z
+      .number({ message: t('default_payment_terms_invalid') })
+      .int(t('default_payment_terms_invalid'))
+      .min(0, t('default_payment_terms_invalid'))
+      .max(365, t('default_payment_terms_invalid')),
     default_currency: z.string().optional(),
     notes: z.string().optional(),
   }), [t])
@@ -56,6 +86,7 @@ export default function SupplierForm({
     register,
     handleSubmit,
     control,
+    watch,
     formState: { errors },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
@@ -67,25 +98,34 @@ export default function SupplierForm({
       address_line1: initialData?.address_line1 || '',
       postal_code: initialData?.postal_code || '',
       city: initialData?.city || '',
-      country: initialData?.country || 'SE',
+      country: normalizeCountryCode(initialData?.country) ?? initialData?.country ?? 'SE',
       org_number: initialData?.org_number || '',
       vat_number: initialData?.vat_number || '',
       bankgiro: initialData?.bankgiro || '',
       plusgiro: initialData?.plusgiro || '',
       iban: initialData?.iban || '',
       bic: initialData?.bic || '',
+      clearing_number: initialData?.clearing_number || '',
+      account_number: initialData?.account_number || '',
       default_expense_account: initialData?.default_expense_account || '',
-      default_payment_terms: initialData?.default_payment_terms || 30,
+      // ?? not ||: a stored 0 (betalning direkt) must not reopen as 30.
+      default_payment_terms: initialData?.default_payment_terms ?? 30,
       default_currency: initialData?.default_currency || 'SEK',
       notes: initialData?.notes || '',
     },
   })
 
+  const countryValue = watch('country')
+  // A stored value the picker does not list (an unmapped legacy name, or a
+  // code outside the curated list) still has to be visible, or the field
+  // would look empty while holding something.
+  const countryValueUnlisted =
+    countryValue && !countryOptions.some((option) => option.code === countryValue)
+
+  // Empty strings go through as-is: the API schemas normalize them (dropped on
+  // create, null on update so a cleared field actually clears the column).
   const onFormSubmit = (data: FormData) => {
-    onSubmit({
-      ...data,
-      email: data.email || undefined,
-    })
+    onSubmit(data)
   }
 
   return (
@@ -150,7 +190,7 @@ export default function SupplierForm({
 
       {/* Business info */}
       <div className="space-y-4 pt-4 border-t">
-        <h3 className="font-medium">{t('business_section')}</h3>
+        <h3>{t('business_section')}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-2">
             <Label htmlFor="org_number">{t('org_number_label')}</Label>
@@ -173,7 +213,7 @@ export default function SupplierForm({
 
       {/* Address */}
       <div className="space-y-4 pt-4 border-t">
-        <h3 className="font-medium">{t('address_section')}</h3>
+        <h3>{t('address_section')}</h3>
         <div className="space-y-2">
           <Label htmlFor="address_line1">{t('street_label')}</Label>
           <Input
@@ -193,14 +233,41 @@ export default function SupplierForm({
           </div>
           <div className="space-y-2">
             <Label htmlFor="country">{t('country_label')}</Label>
-            <Input id="country" placeholder="SE" {...register('country')} />
+            <Controller
+              name="country"
+              control={control}
+              render={({ field }) => (
+                <Select value={field.value} onValueChange={(v) => { if (v) field.onChange(v) }}>
+                  <SelectTrigger id="country">
+                    <SelectValue placeholder={t('country_placeholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {countryValueUnlisted && (
+                      <SelectItem value={countryValue}>
+                        {normalizeCountryCode(countryValue)
+                          ? countryValue
+                          : t('country_unknown_option', { value: countryValue })}
+                      </SelectItem>
+                    )}
+                    {countryOptions.map((option) => (
+                      <SelectItem key={option.code} value={option.code}>
+                        {locale === 'en' ? option.nameEn : option.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            />
+            {errors.country && (
+              <p className="text-sm text-destructive">{errors.country.message}</p>
+            )}
           </div>
         </div>
       </div>
 
       {/* Payment details */}
       <div className="space-y-4 pt-4 border-t">
-        <h3 className="font-medium">{t('payment_section')}</h3>
+        <h3>{t('payment_section')}</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-2">
             <Label htmlFor="bankgiro">{t('bankgiro_label')}</Label>
@@ -209,6 +276,16 @@ export default function SupplierForm({
           <div className="space-y-2">
             <Label htmlFor="plusgiro">{t('plusgiro_label')}</Label>
             <Input id="plusgiro" placeholder="XXXXXXX-X" {...register('plusgiro')} />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="clearing_number">{t('clearing_label')}</Label>
+            <Input id="clearing_number" placeholder="XXXX" {...register('clearing_number')} />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="account_number">{t('account_number_label')}</Label>
+            <Input id="account_number" placeholder="XXXXXXXXX" {...register('account_number')} />
           </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -227,11 +304,33 @@ export default function SupplierForm({
       <div className="space-y-4 pt-4 border-t">
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="space-y-2">
-            <Label htmlFor="default_expense_account">{t('default_account_label')}</Label>
-            <Input
-              id="default_expense_account"
-              placeholder={t('default_account_placeholder')}
-              {...register('default_expense_account')}
+            <Label>{t('default_account_label')}</Label>
+            <Controller
+              name="default_expense_account"
+              control={control}
+              render={({ field }) => (
+                <div className="flex items-start gap-1">
+                  <div className="min-w-0 flex-1">
+                    <AccountCombobox
+                      value={field.value || ''}
+                      accounts={expenseAccounts}
+                      onChange={field.onChange}
+                      selectedName={accountNameByNumber.get(field.value || '')}
+                    />
+                  </div>
+                  {field.value ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label={t('default_account_clear')}
+                      onClick={() => field.onChange('')}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  ) : null}
+                </div>
+              )}
             />
           </div>
           <div className="space-y-2">
@@ -239,8 +338,15 @@ export default function SupplierForm({
             <Input
               id="payment_terms"
               type="number"
+              min={0}
+              max={365}
+              step={1}
               {...register('default_payment_terms', { valueAsNumber: true })}
             />
+            <p className="text-xs text-muted-foreground">{t('default_payment_terms_help')}</p>
+            {errors.default_payment_terms && (
+              <p className="text-sm text-destructive">{errors.default_payment_terms.message}</p>
+            )}
           </div>
           <div className="space-y-2">
             <Label htmlFor="default_currency">{t('default_currency_label')}</Label>

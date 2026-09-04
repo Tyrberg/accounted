@@ -20,7 +20,7 @@ function item(overrides: Partial<InvoiceItem> = {}): InvoiceItem {
 }
 
 describe('buildCreditNoteItem', () => {
-  it('negates amounts and preserves ROT/RUT, account, accrual, and dimension metadata', () => {
+  it('negates amounts, keeps the deduction magnitude positive, and preserves ROT/RUT, account, accrual, and dimension metadata', () => {
     const result = buildCreditNoteItem('credit-1', item({
       deduction_type: 'rot',
       deduction_amount: 600,
@@ -40,7 +40,8 @@ describe('buildCreditNoteItem', () => {
       line_total: -2000,
       vat_amount: -500,
       deduction_type: 'rot',
-      deduction_amount: -600,
+      // Positive magnitude: invoice_items has CHECK (deduction_amount >= 0).
+      deduction_amount: 600,
       labor_hours: 2,
       work_type: 'BYGG',
       housing_designation: 'Test 1:2',
@@ -50,5 +51,20 @@ describe('buildCreditNoteItem', () => {
       accrual_balance_account: '2970',
       dimensions: { '6': 'P001' },
     })
+  })
+
+  it('carries discount_percent so the kreditfaktura face arithmetic multiplies out', () => {
+    // Original: 2 x 1000 with 10% rabatt → net 1800. The credit row must keep
+    // the discount, or -2 x 1000 next to Summa -1800 prints with no visible
+    // prisnedsättning (ML 17 kap 24 §) and violates the stored net invariant.
+    const result = buildCreditNoteItem('credit-1', item({ discount_percent: 10, line_total: 1800, vat_amount: 450 }))
+    expect(result).toMatchObject({
+      quantity: -2,
+      discount_percent: 10,
+      line_total: -1800,
+      vat_amount: -450,
+    })
+    // Legacy rows without the column default to 0.
+    expect(buildCreditNoteItem('credit-1', item()).discount_percent).toBe(0)
   })
 })

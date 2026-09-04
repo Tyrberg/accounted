@@ -19,6 +19,8 @@ import { tools } from '../server'
 import { decryptPersonnummer } from '@/lib/salary/personnummer'
 
 const updatePayslipLine = tools.find((t) => t.name === 'gnubok_update_payslip_line')!
+const setRunSalary = tools.find((t) => t.name === 'gnubok_set_run_salary')!
+const updateSalaryRun = tools.find((t) => t.name === 'gnubok_update_salary_run')!
 const registerAbsence = tools.find((t) => t.name === 'gnubok_register_absence')!
 const bookSalaryRun = tools.find((t) => t.name === 'gnubok_book_salary_run')!
 const deleteAbsence = tools.find((t) => t.name === 'gnubok_delete_absence')!
@@ -133,6 +135,208 @@ describe('gnubok_update_payslip_line', () => {
         'company-1', 'user-1', supabase as never, { type: 'agent_chat' },
       ),
     ).rejects.toThrow(/At least one/)
+  })
+})
+
+describe('gnubok_set_run_salary', () => {
+  const SRE_ROW = {
+    id: 'sre-1',
+    employee_id: 'emp-1',
+    salary_type: 'monthly',
+    employment_degree: 100,
+    monthly_salary: 30000,
+  }
+
+  it('stages with old/new salary preview and a recalculate next-hint', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'run-1', status: 'draft' } }) // service draft gate (dry-run preflight)
+    enqueue({ data: SRE_ROW }) // service sre lookup
+    enqueue({ data: { payment_date: '2026-03-25', period_year: 2026, period_month: 3 } }) // run for period check
+    enqueue({ data: { first_name: 'Anna', last_name: 'Andersson' } }) // name for preview
+    enqueue({ data: null }) // resolvePeriodStatusForDate: company_settings
+    enqueue({ data: null }) // resolvePeriodStatusForDate: fiscal_periods
+    enqueue({ data: { id: 'op-1' }, error: null }) // pending_operations insert
+
+    const result = (await setRunSalary.execute(
+      { salary_run_id: 'run-1', employee_id: 'emp-1', monthly_salary: 45000 },
+      'company-1', 'user-1', supabase as never, { type: 'user' },
+    )) as {
+      staged: boolean
+      risk_level: string
+      preview: Record<string, unknown>
+      next?: { tool: string }
+    }
+
+    expect(result.staged).toBe(true)
+    expect(result.risk_level).toBe('medium')
+    expect(result.preview.previous_monthly_salary).toBe(30000)
+    expect(result.preview.new_monthly_salary).toBe(45000)
+    expect(result.preview.employee_name).toBe('Anna Andersson')
+    expect(result.next?.tool).toBe('gnubok_calculate_salary_run')
+  })
+
+  it('throws when the run has advanced past draft (preflight)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'run-1', status: 'review' } })
+
+    await expect(
+      setRunSalary.execute(
+        { salary_run_id: 'run-1', employee_id: 'emp-1', monthly_salary: 45000 },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/SALARY_RUN_EMPLOYEES_NOT_DRAFT/)
+  })
+
+  it('rejects a negative salary', async () => {
+    const { supabase } = createQueuedMockSupabase()
+    await expect(
+      setRunSalary.execute(
+        { salary_run_id: 'run-1', employee_id: 'emp-1', monthly_salary: -100 },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/monthly_salary/)
+  })
+})
+
+describe('gnubok_update_salary_run', () => {
+  const RUN_ROW = {
+    id: 'run-1',
+    status: 'draft',
+    period_year: 2026,
+    period_month: 3,
+    payment_date: '2026-03-25',
+    voucher_series: 'L',
+    notes: null,
+  }
+
+  it('stages a payment_date change with old/new preview and a recalculate next-hint', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: RUN_ROW }) // service draft gate + current values (dry-run preflight)
+    enqueue({ data: null }) // resolvePeriodStatusForDate: company_settings
+    enqueue({ data: null }) // resolvePeriodStatusForDate: fiscal_periods
+    enqueue({ data: { id: 'op-1' }, error: null }) // pending_operations insert
+
+    const result = (await updateSalaryRun.execute(
+      { salary_run_id: 'run-1', payment_date: '2026-03-23' },
+      'company-1', 'user-1', supabase as never, { type: 'user' },
+    )) as {
+      staged: boolean
+      risk_level: string
+      message: string
+      preview: Record<string, unknown>
+      next?: { tool: string }
+    }
+
+    expect(result.staged).toBe(true)
+    expect(result.risk_level).toBe('low')
+    expect((result.preview.previous as Record<string, unknown>).payment_date).toBe('2026-03-25')
+    expect(result.preview.new_payment_date).toBe('2026-03-23')
+    expect(result.preview.salary_run_id).toBe('run-1')
+    expect(result.preview.invalidates_calculation).toBe(true)
+    expect(result.next?.tool).toBe('gnubok_calculate_salary_run')
+  })
+
+  it('stages a notes-only change without the recalculate next-hint', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: RUN_ROW }) // service draft gate (dry-run preflight)
+    enqueue({ data: null }) // resolvePeriodStatusForDate: company_settings
+    enqueue({ data: null }) // resolvePeriodStatusForDate: fiscal_periods
+    enqueue({ data: { id: 'op-1' }, error: null }) // pending_operations insert
+
+    const result = (await updateSalaryRun.execute(
+      { salary_run_id: 'run-1', notes: 'Extra utbetalning i mars' },
+      'company-1', 'user-1', supabase as never, { type: 'user' },
+    )) as { staged: boolean; preview: Record<string, unknown>; next?: { tool: string } }
+
+    expect(result.staged).toBe(true)
+    expect(result.preview.new_notes).toBe('Extra utbetalning i mars')
+    expect(result.preview.invalidates_calculation).toBe(false)
+    // Payment date untouched: no recalculation hint.
+    expect(result.next).toBeUndefined()
+  })
+
+  it('throws when the run has advanced past draft (preflight)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { ...RUN_ROW, status: 'review' } })
+
+    await expect(
+      updateSalaryRun.execute(
+        { salary_run_id: 'run-1', payment_date: '2026-03-23' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/SALARY_RUN_PATCH_NOT_DRAFT/)
+  })
+
+  it('grandfathers day adjustments for a run whose current date is already outside the period', async () => {
+    // Creation does not enforce the period coupling, so a legally created
+    // out-of-period date must stay correctable within its own month.
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-04-05' } }) // period 2026-03, paid in April
+    enqueue({ data: null }) // resolvePeriodStatusForDate: company_settings
+    enqueue({ data: null }) // resolvePeriodStatusForDate: fiscal_periods
+    enqueue({ data: { id: 'op-1' }, error: null }) // pending_operations insert
+
+    const result = (await updateSalaryRun.execute(
+      { salary_run_id: 'run-1', payment_date: '2026-04-07' },
+      'company-1', 'user-1', supabase as never, { type: 'user' },
+    )) as { staged: boolean; preview: Record<string, unknown> }
+
+    expect(result.staged).toBe(true)
+    expect(result.preview.new_payment_date).toBe('2026-04-07')
+  })
+
+  it('stages a payment_date in the month after the period (lön i efterskott, #2191)', async () => {
+    // The AGI redovisningsperiod follows payment_date, so a March run paid
+    // in April is declared for April; no period guard refuses it.
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: RUN_ROW }) // draft gate passes; period is 2026-03
+    enqueue({ data: null }) // resolvePeriodStatusForDate: company_settings
+    enqueue({ data: null }) // resolvePeriodStatusForDate: fiscal_periods
+    enqueue({ data: { id: 'op-1' }, error: null }) // pending_operations insert
+
+    const result = (await updateSalaryRun.execute(
+      { salary_run_id: 'run-1', payment_date: '2026-04-05' },
+      'company-1', 'user-1', supabase as never, { type: 'user' },
+    )) as { staged: boolean; preview: Record<string, unknown> }
+
+    expect(result.staged).toBe(true)
+    expect(result.preview.new_payment_date).toBe('2026-04-05')
+  })
+
+  it('throws SALARY_RUN_NOT_FOUND for a foreign or unknown run', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    // company_id-scoped lookup misses: another tenant's run id looks identical
+    // to a nonexistent one.
+    enqueue({ data: null })
+
+    await expect(
+      updateSalaryRun.execute(
+        { salary_run_id: 'run-foreign', payment_date: '2026-03-23' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/SALARY_RUN_NOT_FOUND/)
+  })
+
+  it('rejects a malformed payment_date before touching the run', async () => {
+    const { supabase } = createQueuedMockSupabase()
+
+    await expect(
+      updateSalaryRun.execute(
+        { salary_run_id: 'run-1', payment_date: '23/03/2026' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/VALIDATION_ERROR/)
+  })
+
+  it('rejects a call with no updatable field', async () => {
+    const { supabase } = createQueuedMockSupabase()
+
+    await expect(
+      updateSalaryRun.execute(
+        { salary_run_id: 'run-1' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/At least one of payment_date, voucher_series, notes/)
   })
 })
 
@@ -356,6 +560,16 @@ describe('gnubok_create_employee', () => {
     ).rejects.toThrow(/Invalid employee/)
   })
 
+  it('rejects a jämkning percentage without an end date (#2058)', async () => {
+    const { supabase } = createQueuedMockSupabase()
+    await expect(
+      createEmployee.execute(
+        { ...validArgs, jamkning_percentage: 15, jamkning_valid_from: '2026-01-01' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/jamkning_valid_to/)
+  })
+
   it('blocks EF owners on payroll (entity-type preflight)', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { entity_type: 'ef' } }) // company_settings
@@ -418,6 +632,35 @@ describe('gnubok_update_employee', () => {
       params: { patch: Record<string, unknown> }
     }
     expect(inserted.params.patch.default_dimensions).toEqual({})
+  })
+
+  it('rejects a jämkning percentage without an end date at staging time (#2058)', async () => {
+    // Preflight on the merged row: the agent gets the error now, not at
+    // approval. The executor runs the same shared validator again.
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { ...EXISTING, jamkning_percentage: null, jamkning_valid_from: null, jamkning_valid_to: null } })
+    await expect(
+      updateEmployee.execute(
+        { employee_id: 'emp-1', jamkning_percentage: 15, jamkning_valid_from: '2026-01-01' },
+        'company-1', 'user-1', supabase as never, { type: 'user' },
+      ),
+    ).rejects.toThrow(/jamkning_valid_to/)
+  })
+
+  it('stages an unrelated edit on a legacy row that lacks valid_to (touched gate)', async () => {
+    const supabaseMock = makeCapturingSupabase({
+      employees: { data: { ...EXISTING, jamkning_percentage: 15, jamkning_valid_from: '2026-01-01', jamkning_valid_to: null } },
+      fiscal_periods: { data: null },
+      company_settings: { data: null },
+      pending_operations: { data: { id: 'op-legacy' }, error: null },
+    })
+
+    const result = (await updateEmployee.execute(
+      { employee_id: 'emp-1', monthly_salary: 38000 },
+      'company-1', 'user-1', supabaseMock as never, { type: 'user' },
+    )) as { staged: boolean }
+
+    expect(result.staged).toBe(true)
   })
 
   it('rejects personnummer changes at the tool boundary', async () => {

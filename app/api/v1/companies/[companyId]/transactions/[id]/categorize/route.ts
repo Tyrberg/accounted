@@ -10,6 +10,12 @@
  * entry, only the is_business / category flags are updated. The JE is left
  * intact (it's immutable post-commit per BFL 5 kap 6 §).
  *
+ * Fail-closed (issue #1947): if the verifikat cannot be created (locked
+ * period, unbalanced entry, engine error) the request is refused with 409
+ * TX_CATEGORIZE_JOURNAL_ENTRY_FAILED and the transaction is left untouched,
+ * so it stays in the unbooked queue. journal_entry_error in the 200 body is
+ * therefore always null and kept only for response-shape compatibility.
+ *
  * Dry-runnable: returns the resolved mapping (debit/credit + VAT lines)
  * without inserting the journal entry or mutating the transaction.
  */
@@ -18,7 +24,8 @@ import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
 import { CategorizeTransactionSchema } from '@/lib/api/schemas'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
@@ -32,13 +39,15 @@ import {
   buildMappingResultFromCounterpartyTemplate,
 } from '@/lib/bookkeeping/counterparty-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { recordVoucherGapExplanation } from '@/lib/bookkeeping/cancel-orphaned-entry'
-import { reverseEntry } from '@/lib/bookkeeping/engine'
+import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { guardCounterLegs } from '@/lib/cash-accounts/service'
+import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
+import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { getStructuredError } from '@/lib/errors/get-structured-error'
 import { eventBus } from '@/lib/events'
 import type {
   CategorizationTemplate,
@@ -51,7 +60,12 @@ const CategorizeResponse = z.object({
   success: z.boolean(),
   journal_entry_created: z.boolean(),
   journal_entry_id: z.string().uuid().nullable(),
-  journal_entry_error: z.string().nullable(),
+  journal_entry_error: z
+    .string()
+    .nullable()
+    .describe(
+      'Always null: a verifikat that cannot be created is refused with 409 TX_CATEGORIZE_JOURNAL_ENTRY_FAILED and nothing is written (issue #1947). Kept for response-shape compatibility.',
+    ),
   document_link_warning: z.string().nullable().optional(),
   category: z.string(),
   already_had_journal_entry: z.boolean().optional(),
@@ -107,27 +121,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     }
     const txId = idParse.data
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
     const parsed = CategorizeTransactionSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const body = parsed.data
     const { is_business, category } = body
 
@@ -154,7 +152,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         : 'private'
       const { error: updateErr } = await ctx.supabase
         .from('transactions')
-        .update({ is_business, category: finalCat })
+        .update({ is_business, category: finalCat, is_ignored: false })
         .eq('id', txId)
         .eq('company_id', ctx.companyId!)
       if (updateErr) return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
@@ -255,6 +253,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       ctx.companyId!,
       transaction.cash_account_id,
       txLog,
+      transaction.currency,
     )
     mappingResult = applySettlementAccount(mappingResult, settlementAccount)
 
@@ -300,6 +299,28 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // counterparty-template bag; omitted = the learned bag (if any) applies.
     if (body.dimensions && Object.keys(body.dimensions).length > 0) {
       mappingResult.dimensions = body.dimensions
+    }
+
+    // Issue #1643 problem 4: same guard as the dashboard route. A learned
+    // counterparty template or an account_override must never book the
+    // COUNTER leg onto an orphaned cash-account ledger or a twin ledger of the
+    // transaction's own bank account; the agent doors have no human looking
+    // at a running-balance preview, so the refusal has to live here too.
+    {
+      const guarded = await guardCounterLegs(
+        ctx.supabase,
+        ctx.companyId!,
+        mappingResult,
+        settlementAccount,
+        transaction.cash_account_id,
+      )
+      if (guarded.refusedLedger) {
+        return v1ErrorResponseFromCode('TX_CATEGORIZE_ORPHANED_COUNTER_ACCOUNT', txLog, {
+          requestId: ctx.requestId,
+          details: { accountNumber: guarded.refusedLedger },
+        })
+      }
+      mappingResult = guarded.mappingResult
     }
 
     if (!mappingResult.debit_account || !mappingResult.credit_account) {
@@ -361,14 +382,23 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       transaction.date,
     )
     if (periodLock.locked) {
-      return v1ErrorResponseFromCode('PERIOD_LOCKED', txLog, {
-        requestId: ctx.requestId,
-        details: {
-          transaction_date: transaction.date,
-          reason: periodLock.reason,
-          fiscal_period_id: periodLock.fiscal_period_id,
+      // Issue #1661: a private marking is a real booking (eget uttag /
+      // insättning), so the lock applies, but a row that is not a business
+      // event should be ignored, not booked: answer with the code whose
+      // remediation names the ignore verb instead of unlock.
+      return v1ErrorResponseFromCode(
+        is_business ? 'PERIOD_LOCKED' : 'TX_CATEGORIZE_PRIVATE_PERIOD_LOCKED',
+        txLog,
+        {
+          requestId: ctx.requestId,
+          details: {
+            transaction_date: transaction.date,
+            reason: periodLock.reason,
+            fiscal_period_id: periodLock.fiscal_period_id,
+            ...(is_business ? {} : { suggested_action: 'ignore' }),
+          },
         },
-      })
+      )
     }
 
     // Live path: create the journal entry. The internal route runs a
@@ -376,7 +406,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // suggestions; we preserve that behavior so v1 and the dashboard
     // diverge on neither booking outcomes nor compliance.
     let journalEntryId: string | null = null
-    let journalEntryError: string | null = null
     try {
       const journalEntry = await createTransactionJournalEntry(
         ctx.supabase,
@@ -396,17 +425,36 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       if (err instanceof AccountsNotInChartError) {
         return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
       }
-      if (isBookkeepingError(err)) {
-        journalEntryError = getErrorMessage(err, { context: 'transaction' })
-      } else {
-        journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-      }
+      // Fail closed (issue #1947): the verifikat IS the booking. Persisting
+      // is_business/category without one dropped the row out of the worklist
+      // predicate (is_business IS NULL) while still unbooked. Nothing is
+      // written; the Swedish reason travels in details.message because the
+      // v1 envelope keeps the registry text as the top-level message.
+      return v1ErrorResponseFromCode('TX_CATEGORIZE_JOURNAL_ENTRY_FAILED', txLog, {
+        requestId: ctx.requestId,
+        details: {
+          cause: getStructuredError(err).code,
+          message: getErrorMessage(err, { context: 'transaction' }),
+        },
+      })
+    }
+
+    // createTransactionJournalEntry returns null (no throw) when no fiscal
+    // period covers the date and the pre-FY clamp does not apply. Same
+    // fail-closed rule: refuse rather than mark the row categorized-but-unbooked.
+    if (!journalEntryId) {
+      return v1ErrorResponseFromCode('NO_OPEN_PERIOD_FOR_DATE', txLog, {
+        requestId: ctx.requestId,
+        details: { transaction_date: transaction.date },
+      })
     }
 
     // Best-effort: save mapping rule + upsert counterparty template. These
     // are user-experience polish (faster future categorization) and never
-    // fail the request. direction_mismatch = a mirrored refund/repayment
-    // booking; learning it as a rule would store backwards accounts.
+    // fail the request. They run only after a posted verifikat, so they never
+    // learn from a booking that did not happen. direction_mismatch = a
+    // mirrored refund/repayment booking; learning it as a rule would store
+    // backwards accounts.
     if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
       try {
         await saveUserMappingRule(
@@ -442,77 +490,64 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       .update({
         is_business,
         category: finalCategory,
+        is_ignored: false,
         journal_entry_id: journalEntryId,
       })
       .eq('id', txId)
       .eq('company_id', ctx.companyId!)
       .is('journal_entry_id', null)
-      .select('id')
+      .select('*')
 
-    if (updateErr) return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
+    if (updateErr) {
+      if (journalEntryId) {
+        await reverseOrphanedJournalEntry(
+          ctx.supabase,
+          ctx.companyId!,
+          ctx.userId,
+          journalEntryId,
+          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+        )
+      }
+      return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
+    }
 
-    if ((!updateResult || updateResult.length === 0) && journalEntryId) {
-      // Lost the race. The orphan JE was created with status='posted' by the
-      // engine, so the immutability trigger blocks a direct status flip to
-      // 'cancelled'. BFL 5 kap 5 § requires corrections via a reversing
-      // entry (storno): issue one. The pair (orphan + storno) keeps the
-      // verifikationsnummer series unbroken; no voucher_gap_explanations row
-      // is needed because there's no gap.
-      try {
-        await reverseEntry(ctx.supabase, ctx.companyId!, ctx.userId, journalEntryId)
-      } catch (revErr) {
-        // Storno failure on the orphan is rare but creates an unreconcilable
-        // ledger state (posted JE with no reversal). BFL 5 kap 5 § requires
-        // every correction be traceable. Document the gap explicitly so a
-        // human can reconcile manually rather than losing the trail to logs.
-        txLog.error('TX_CATEGORIZE_RACE: failed to storno orphaned JE', revErr as Error, {
-          orphanJournalEntryId: journalEntryId,
-        })
-        try {
-          const { data: orphan } = await ctx.supabase
-            .from('journal_entries')
-            .select('fiscal_period_id, voucher_series, voucher_number')
-            .eq('id', journalEntryId)
-            .eq('company_id', ctx.companyId!)
-            .single()
-          if (orphan && orphan.voucher_series) {
-            // Skip the gap row when the engine didn't tag a series on the
-            // orphan. Filing under a fallback series (previously 'A') would
-            // index the gap explanation under the wrong key, hiding it from
-            // series-specific audit queries (BFL 5 kap 6 §). A missing series
-            // is logged above already; a human will reconcile via that trail.
-            //
-            // The insert itself lives in the shared helper: it owns the real
-            // voucher_gap_explanations column set (gap_start/gap_end/user_id)
-            // and logs a failed insert loudly instead of swallowing it.
-            await recordVoucherGapExplanation(ctx.supabase, {
-              companyId: ctx.companyId!,
-              userId: ctx.userId,
-              fiscalPeriodId: orphan.fiscal_period_id,
-              voucherSeries: orphan.voucher_series,
-              voucherNumber: orphan.voucher_number,
-              explanation:
-                'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
-            })
-          }
-        } catch (gapErr) {
-          txLog.error(
-            'TX_CATEGORIZE_RACE: failed to look up the orphan for its gap explanation',
-            gapErr as Error,
-            { orphanJournalEntryId: journalEntryId },
-          )
-        }
+    if (!updateResult || updateResult.length === 0) {
+      if (journalEntryId) {
+        await reverseOrphanedJournalEntry(
+          ctx.supabase,
+          ctx.companyId!,
+          ctx.userId,
+          journalEntryId,
+          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+        )
       }
       return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
         requestId: ctx.requestId,
       })
     }
 
+    const updatedTransaction = updateResult[0] as Transaction
+
+    // Propagate the underlag onto the new verifikat: anchor the transaction's
+    // pinned document and stamp matched inbox items so they leave the active
+    // inbox. Same shared step the dashboard categorize, /book and bulk-book
+    // paths run; without it a v1 booking of a tx with attached underlag reads
+    // "Underlag saknas" forever. Best-effort by contract (logged inside),
+    // never fails the booking. Runs only when THIS request won the CAS write.
+    if (journalEntryId) {
+      await propagateUnderlagForBookedTransaction(
+        ctx.supabase,
+        ctx.companyId!,
+        txId,
+        journalEntryId,
+      )
+    }
+
     try {
       await eventBus.emit({
         type: 'transaction.categorized',
         payload: {
-          transaction: transaction as Transaction,
+          transaction: updatedTransaction,
           account: mappingResult.debit_account,
           taxCode: mappingResult.vat_lines[0]?.account_number || '',
           userId: ctx.userId,
@@ -523,12 +558,15 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       txLog.warn('transaction.categorized emit failed (non-critical)', err as Error)
     }
 
+    // journal_entry_error is always null here: a failed verifikat returns a
+    // typed 409 TX_CATEGORIZE_JOURNAL_ENTRY_FAILED above (issue #1947). The
+    // field stays for response-shape compatibility.
     return ok(
       {
         success: true,
         journal_entry_created: !!journalEntryId,
         journal_entry_id: journalEntryId,
-        journal_entry_error: journalEntryError,
+        journal_entry_error: null,
         category: finalCategory,
       },
       { requestId: ctx.requestId },

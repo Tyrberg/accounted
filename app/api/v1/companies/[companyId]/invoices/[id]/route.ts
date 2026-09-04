@@ -14,6 +14,12 @@
  *         invoice is not in draft status.
  *
  *         Idempotent (mandatory Idempotency-Key) and dry-runnable.
+ * DELETE: remove a DRAFT invoice. Unnumbered drafts are hard deleted (no
+ *         F-series number was consumed, so no gap arises); numbered drafts
+ *         are makulerade (status flips to 'cancelled', the number is
+ *         retained so the F-series stays gap-free). Non-drafts return 409
+ *         INVOICE_DELETE_NOT_DRAFT: sent / paid invoices are immutable and
+ *         must be reversed via POST /:id/credit instead.
  */
 
 import { z } from 'zod'
@@ -22,12 +28,17 @@ import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { parseExpand } from '@/lib/api/v1/expand'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { INVOICE_FULL_COLUMNS, INVOICE_ITEM_FULL_COLUMNS } from '@/lib/api/v1/invoice-columns'
 import { DimensionsBagSchema } from '@/lib/bookkeeping/dimension-resolver'
 import { CreateInvoiceItemSchema } from '@/lib/api/schemas'
 import { buildInvoiceWriteData } from '@/lib/invoices/build-invoice-write'
+import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
+import { effectiveQuoteStatus } from '@/lib/invoices/quote-status'
+import { deleteDraftInvoice } from '@/lib/invoices/delete-draft-invoice'
 import { replaceInvoiceItems } from '@/lib/invoices/replace-invoice-items'
+import { resolveInvoicePayeeChoice } from '@/lib/invoices/invoice-payee'
 import type { Currency, Customer, InvoiceDocumentType } from '@/types'
 
 // Allowed PATCH fields for a draft invoice. Excludes customer_id / currency /
@@ -48,6 +59,10 @@ const V1PatchDraftInvoiceSchema = z.object({
   // Send {} to clear all tags. Codes are validated against the dimension
   // registry when the invoice posts at :send, not here.
   default_dimensions: DimensionsBagSchema.optional(),
+  // Which of the company's bank accounts the invoice asks the customer to
+  // pay to. null = back to the per-currency default. Must be one of the
+  // company's payee accounts, usable for the invoice currency.
+  payment_cash_account_id: z.union([z.string().uuid(), z.null()]).optional(),
   // FULL REPLACE when present. Same item shape as POST /invoices (article
   // linkage, ROT/RUT lines, accrual periods, per-line dimensions included).
   items: z.array(CreateInvoiceItemSchema).min(1, 'At least one item is required').optional(),
@@ -64,6 +79,12 @@ const InvoiceDetail = z.object({
   due_date: z.string(),
   status: z.string(),
   document_type: z.string(),
+  // Quotes only (null otherwise). quote_status is the EFFECTIVE decision:
+  // open | accepted | declined | expired, where expired is derived from
+  // valid_until and never stored.
+  valid_until: z.string().nullable().optional(),
+  quote_status: z.string().nullable().optional(),
+  quote_decided_at: z.string().nullable().optional(),
   currency: z.string(),
   total: z.number(),
   remaining_amount: z.number(),
@@ -185,7 +206,13 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
       })
     }
 
-    return ok(data, { requestId: ctx.requestId })
+    // Quotes: report the effective decision (expired is derived from
+    // valid_until, never stored). Null for every other document type.
+    const row = data as unknown as Record<string, unknown> & {
+      quote_status?: string | null
+      valid_until?: string | null
+    }
+    return ok({ ...row, quote_status: effectiveQuoteStatus(row) }, { requestId: ctx.requestId })
   },
 )
 
@@ -206,7 +233,7 @@ registerEndpoint({
     'Updating a sent / paid / credited invoice (those are immutable per ML 17 kap; issue a credit note via POST /:id:credit in PR-B-2b). Changing currency or customer: drafts are cheap to delete and recreate.',
   pitfalls: [
     'Idempotency-Key is mandatory.',
-    'A 409 INVOICE_UPDATE_NOT_DRAFT means the invoice has been sent / paid / credited / cancelled. The error code name is shared with the DELETE handler.',
+    'A 409 INVOICE_UPDATE_NOT_DRAFT means the invoice has been sent / paid / credited / cancelled. The DELETE handler on this path uses its own code, INVOICE_DELETE_NOT_DRAFT.',
     'items is a FULL REPLACE (no per-line merge): send the complete new line set, minimum one item. Omitting items keeps the current lines untouched. VAT rates are re-validated against the customer type and totals are recomputed server-side.',
     'items are always built against the invoice\'s EXISTING customer: customer_id cannot change on PATCH.',
     'default_dimensions replaces the entire bag (no per-key merge): read the current value first if you want to add a tag. Send {} to clear all tags. Codes are validated against the dimension registry at :send, not at PATCH time.',
@@ -248,28 +275,12 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     }
     const invoiceId = idParse.data
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
 
     const parsed = V1PatchDraftInvoiceSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const body = parsed.data
 
     const updateData: Record<string, unknown> = {}
@@ -285,7 +296,7 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
       if (body[key] !== undefined) updateData[key] = body[key]
     }
 
-    if (Object.keys(updateData).length === 0 && !body.items) {
+    if (Object.keys(updateData).length === 0 && body.payment_cash_account_id === undefined && !body.items) {
       return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
         requestId: ctx.requestId,
         details: { field: 'body', message: 'At least one field must be supplied for update.' },
@@ -312,10 +323,36 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
         details: { resource: 'invoice' },
       })
     }
-    if ((current as { status: string }).status !== 'draft') {
+    // Payee choice (null = back to the per-currency default): validated
+    // against the company's payee accounts for the invoice's own currency.
+    if (body.payment_cash_account_id !== undefined) {
+      const payeeChoice = await resolveInvoicePayeeChoice(
+        ctx.supabase,
+        ctx.companyId!,
+        (current as { currency: Currency }).currency,
+        body.payment_cash_account_id,
+      )
+      if (!payeeChoice.ok) {
+        return v1ErrorResponseFromCode(payeeChoice.code, ctx.log, {
+          requestId: ctx.requestId,
+          details: payeeChoice.details,
+        })
+      }
+      updateData.payment_cash_account_id = payeeChoice.fields.payment_cash_account_id
+      updateData.payment_details = payeeChoice.fields.payment_details
+    }
+
+    // Shared predicate with the dashboard PATCH: draft, no verifikat, not a
+    // received self-billing document, not a credit-note draft, and for a
+    // quote not accepted or declined (a recorded decision must be reopened
+    // before the offer itself is edited).
+    if (!isEditableInvoiceDraft(current as Parameters<typeof isEditableInvoiceDraft>[0])) {
       return v1ErrorResponseFromCode('INVOICE_UPDATE_NOT_DRAFT', ctx.log, {
         requestId: ctx.requestId,
-        details: { current_status: (current as { status: string }).status },
+        details: {
+          current_status: (current as { status: string }).status,
+          quote_status: (current as { quote_status?: string | null }).quote_status ?? null,
+        },
       })
     }
 
@@ -472,6 +509,9 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
       // cookie route and the update_invoice commit executor).
       const replaced = await replaceInvoiceItems(ctx.supabase, invoiceId, build.items)
       if (!replaced.ok) {
+        if (replaced.stage === 'guard') {
+          return v1ErrorResponseFromCode(replaced.code, ctx.log, { requestId: ctx.requestId })
+        }
         ctx.log.error(`invoice items ${replaced.stage} failed on v1 update`, replaced.error, {
           invoiceId,
           companyId: ctx.companyId,
@@ -527,6 +567,148 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     }
 
     return ok(data, { requestId: ctx.requestId })
+  },
+  { requireIdempotencyKey: true },
+)
+
+// ──────────────────────────────────────────────────────────────────
+// DELETE: remove a DRAFT invoice (hard delete or makulering)
+// ──────────────────────────────────────────────────────────────────
+
+const InvoiceDeleteResult = z.object({
+  // Unnumbered draft: hard deleted.
+  deleted: z.boolean().optional(),
+  // Numbered draft: makulerad; the F-series number is retained.
+  cancelled: z.boolean().optional(),
+  invoice_number: z.string().optional(),
+})
+
+registerEndpoint({
+  operation: 'invoices.delete',
+  method: 'DELETE',
+  path: '/api/v1/companies/:companyId/invoices/:id',
+  summary: 'Delete a draft invoice (hard delete if unnumbered, makulering if numbered).',
+  description:
+    'Removes an invoice in draft status. An unnumbered draft (never finalized: no F-series number was consumed) is hard deleted and responds { deleted: true }; its line items cascade. A numbered draft is makulerad: the row and its number are retained, status flips to cancelled, and the response is { cancelled: true, invoice_number } so the F-series stays gap-free per ML 17 kap 24 and BFNAR 2013:2. Returns 409 INVOICE_DELETE_NOT_DRAFT for any non-draft status: sent / paid / credited invoices are immutable and must be reversed via a credit note. Requires Idempotency-Key; dry-runnable.',
+  useWhen:
+    'You created a draft by mistake, or want to discard a draft instead of sending it. Check the response shape: deleted means the row is gone, cancelled means it survives as makulerad with its number.',
+  doNotUseFor:
+    'Withdrawing a sent / paid invoice (issue a credit note via POST /:id/credit). Editing a draft (use PATCH). Cancelling recurring schedules.',
+  pitfalls: [
+    'Idempotency-Key is mandatory. A repeated DELETE with a fresh key returns 404 for a hard-deleted draft (the row is gone) and 409 INVOICE_DELETE_NOT_DRAFT for a makulerad one (status is now cancelled).',
+    '409 INVOICE_DELETE_NOT_DRAFT means the invoice left draft status: it is immutable and can only be reversed via a credit note.',
+    '409 INVOICE_CANCEL_RACE means the invoice was finalized or sent concurrently: re-read the invoice before retrying.',
+    'The hard-delete path emits an invoice.draft_deleted audit event; the makulering path leaves its trail in the invoice row itself.',
+  ],
+  example: {
+    response: {
+      data: { cancelled: true, invoice_number: '2026-0042' },
+      meta: { request_id: 'req_…', api_version: '2026-05-12' },
+    },
+  },
+  scope: 'invoices:write',
+  // 'high', matching the delete_draft_invoice pending-op tier: both outcomes
+  // are irreversible (row gone, or the F-series number permanently consumed).
+  risk: 'high',
+  idempotent: false,
+  reversible: false,
+  dryRunSupported: true,
+  response: { success: dataEnvelope(InvoiceDeleteResult) },
+})
+
+export const DELETE = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(
+  'invoices.delete',
+  async (_request, ctx, params) => {
+    const { id } = await params.params
+
+    const idParse = z.string().uuid().safeParse(id)
+    if (!idParse.success) {
+      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+        requestId: ctx.requestId,
+        details: { field: 'id', message: 'Invoice id must be a UUID.' },
+      })
+    }
+    const invoiceId = idParse.data
+
+    // Dry-run: pre-flight the same guards without writing, and report which
+    // of the two outcomes the commit would take.
+    if (ctx.dryRun) {
+      const { data: current, error: fetchErr } = await ctx.supabase
+        .from('invoices')
+        .select('id, status, invoice_number')
+        .eq('company_id', ctx.companyId!)
+        .eq('id', invoiceId)
+        .maybeSingle()
+
+      if (fetchErr) {
+        return v1ErrorResponse(fetchErr, ctx.log, { requestId: ctx.requestId })
+      }
+      if (!current) {
+        ctx.log.warn('invoices.delete: not found', { invoiceId, companyId: ctx.companyId })
+        return v1ErrorResponseFromCode('NOT_FOUND', ctx.log, {
+          requestId: ctx.requestId,
+          details: { resource: 'invoice' },
+        })
+      }
+      if (current.status !== 'draft') {
+        return v1ErrorResponseFromCode('INVOICE_DELETE_NOT_DRAFT', ctx.log, {
+          requestId: ctx.requestId,
+          status: 409,
+          details: { current_status: current.status },
+        })
+      }
+      return dryRunPreview(
+        current.invoice_number
+          ? { cancelled: true, invoice_number: current.invoice_number }
+          : { deleted: true },
+        { requestId: ctx.requestId, log: ctx.log },
+      )
+    }
+
+    const result = await deleteDraftInvoice({
+      supabase: ctx.supabase,
+      companyId: ctx.companyId!,
+      // Explicit actor: the service-role client nulls auth.uid(), so the
+      // audit event's userId must come from the API-key context.
+      userId: ctx.userId,
+      invoiceId,
+      log: ctx.log,
+    })
+
+    if (!result.ok) {
+      switch (result.code) {
+        case 'INVOICE_NOT_FOUND':
+          // Generic NOT_FOUND: same shape as GET, no existence leak.
+          ctx.log.warn('invoices.delete: not found', { invoiceId, companyId: ctx.companyId })
+          return v1ErrorResponseFromCode('NOT_FOUND', ctx.log, {
+            requestId: ctx.requestId,
+            details: { resource: 'invoice' },
+          })
+        case 'INVOICE_DELETE_NOT_DRAFT':
+          // Registry maps this code to 400 for the cookie route; on v1 a
+          // state-machine refusal is a conflict, aligned with
+          // INVOICE_UPDATE_NOT_DRAFT.
+          return v1ErrorResponseFromCode('INVOICE_DELETE_NOT_DRAFT', ctx.log, {
+            requestId: ctx.requestId,
+            status: 409,
+            details: { current_status: result.currentStatus },
+          })
+        case 'INVOICE_CANCEL_RACE':
+          return v1ErrorResponseFromCode('INVOICE_CANCEL_RACE', ctx.log, {
+            requestId: ctx.requestId,
+          })
+        case 'INVOICE_DELETE_FAILED':
+          return v1ErrorResponseFromCode('INVOICE_DELETE_FAILED', ctx.log, {
+            requestId: ctx.requestId,
+            details: { pg_code: result.cause.code },
+          })
+      }
+    }
+
+    if (result.outcome === 'deleted') {
+      return ok({ deleted: true }, { requestId: ctx.requestId })
+    }
+    return ok({ cancelled: true, invoice_number: result.invoiceNumber }, { requestId: ctx.requestId })
   },
   { requireIdempotencyKey: true },
 )
