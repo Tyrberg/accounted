@@ -27,8 +27,18 @@ describe('the compose override template', () => {
   it('sets no feature toggle that upstream reads to weaken authentication', () => {
     // Derived from upstream's own source rather than hard-coded, so a rename
     // upstream cannot leave this test guarding a variable nobody reads.
-    const authSources = ['lib/auth/mfa.ts', 'lib/auth/bankid.ts'].map(read).join('\n')
-    const toggles = [...authSources.matchAll(/process\.env\.(NEXT_PUBLIC_[A-Z0-9_]+)/g)].map((match) => match[1])
+    // Upstream flyttade NEXT_PUBLIC_SELF_HOSTED fran mfa/bankid till
+    // require-auth/session-timeout i lyftet 2026-09-05; listan foljer med
+    // sa att kanariefageln nedan fortsatter vaka over ratt filer.
+    const authSources = [
+      'lib/auth/mfa.ts',
+      'lib/auth/bankid.ts',
+      'lib/auth/require-auth.ts',
+      'lib/auth/session-timeout.ts',
+    ].map(read).join('\n')
+    // Upstream laser numera toggles bade som process.env.X och via sitt
+    // validerade env-objekt (env.X); regexen fangar bada formerna.
+    const toggles = [...authSources.matchAll(/\benv\.(NEXT_PUBLIC_[A-Z0-9_]+)/g)].map((match) => match[1])
 
     expect(toggles).toContain('NEXT_PUBLIC_SELF_HOSTED')
 
