@@ -33,6 +33,32 @@ const workingTree: Tree = {
 
 const manifest = parseManifest(readFileSync(join(REPO_ROOT, 'fork/adaptations.json'), 'utf8'))
 
+// Shared by both the allowlist test and its own regression test below, so
+// that reverting the filter logic (or the allowlist data) to something looser
+// (e.g. keying by adaptation id alone instead of exact paths) fails both
+// tests together instead of leaving a hand-copied regression test green.
+const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
+  'sie-migration-validation': [
+    'lib/import/sie-migration-validation.ts',
+    'lib/import/__tests__/sie-migration-validation.test.ts',
+  ],
+  'docker-cron-entrypoint-hardening': [
+    'docker/cron.Dockerfile',
+    'scripts/__tests__/generate-crontabs.test.ts',
+  ],
+}
+
+function findUnreviewedPaths(adaptations: typeof manifest.adaptations): string[] {
+  return adaptations
+    .filter((adaptation) => adaptation.tracked)
+    .flatMap((adaptation) =>
+      adaptation.paths
+        .filter((path) => !path.startsWith('fork/'))
+        .filter((path) => !(REVIEWED_OUTSIDE_FORK[adaptation.id] ?? []).includes(path))
+        .map((path) => `${adaptation.id}: ${path}`),
+    )
+}
+
 describe('the committed manifest', () => {
   it('declares at least one adaptation, so a vacuous pass is impossible', () => {
     expect(manifest.adaptations.length).toBeGreaterThan(0)
@@ -85,6 +111,56 @@ describe('the committed manifest', () => {
     expect(forkLayer?.tracked).toBe(true)
   })
 
+  it('guards wholly-new-file adaptations against a future upstream file landing at the same path', () => {
+    // fork-maintenance-layer and sie-migration-validation both add files at
+    // paths upstream does not currently use. A local-* check alone only
+    // catches an accidental revert; it says nothing if upstream later creates
+    // a file at that same path, which is exactly the collision each
+    // adaptation's `why` claims to guard against. Every such adaptation needs
+    // an `upstream-absent` check, not just a `local-*` one.
+    const wholesaleNewFileIds = ['fork-maintenance-layer', 'sie-migration-validation']
+
+    for (const id of wholesaleNewFileIds) {
+      const adaptation = manifest.adaptations.find((candidate) => candidate.id === id)
+      expect(adaptation, `adaptation "${id}" should exist`).toBeDefined()
+      expect(
+        adaptation?.checks.some((check) => check.kind === 'upstream-absent'),
+        `adaptation "${id}" should carry an upstream-absent check`,
+      ).toBe(true)
+    }
+  })
+
+  it('gives every declared path of a multi-path adaptation its own check, not just the adaptation overall', () => {
+    // sie-migration-validation declares two paths (the instrument and its
+    // test file). A check that only ever looks at the instrument would leave
+    // a revert of the test file, or an upstream file landing at that exact
+    // test path, invisible to both this suite and the weekly sync, exactly
+    // the gap a prior review round already found and fixed once for
+    // docker-cron-entrypoint-hardening's guard test (scripts/__tests__/
+    // generate-crontabs.test.ts). That adaptation is included here too: it
+    // is not a wholesale-new-file adaptation, but it is still multi-path,
+    // and this is precisely the check whose narrower scope let that guard
+    // test's absence go undetected before.
+    const multiPathAdaptationIds = [
+      'fork-maintenance-layer',
+      'sie-migration-validation',
+      'docker-cron-entrypoint-hardening',
+    ]
+
+    for (const id of multiPathAdaptationIds) {
+      const adaptation = manifest.adaptations.find((candidate) => candidate.id === id)
+      expect(adaptation, `adaptation "${id}" should exist`).toBeDefined()
+      if (!adaptation) continue
+
+      for (const path of adaptation.paths.filter((candidate) => !candidate.endsWith('/'))) {
+        expect(
+          adaptation.checks.some((check) => check.path === path),
+          `adaptation "${id}" should have a check anchored on "${path}"`,
+        ).toBe(true)
+      }
+    }
+  })
+
   it('declares the host-local compose override as untracked, since it is never committed', () => {
     const override = manifest.adaptations.find((adaptation) =>
       adaptation.paths.includes('docker-compose.override.yml'),
@@ -94,15 +170,44 @@ describe('the committed manifest', () => {
     expect(existsSync(join(REPO_ROOT, 'fork/templates/docker-compose.override.example.yml'))).toBe(true)
   })
 
-  it('modifies no file upstream owns: every declared tracked path lives under fork/', () => {
+  it('touches no upstream-owned path outside a short, reviewed allowlist', () => {
     // The strategy in fork/README.md is "tier 1 first, and keep the merge
-    // surface at zero". If a tracked adaptation ever needs a path outside
-    // fork/, that is a tier 2 patch and has to be a deliberate, reviewed change
-    // to this expectation, not something that slips in.
-    const trackedPaths = manifest.adaptations
-      .filter((adaptation) => adaptation.tracked)
-      .flatMap((adaptation) => adaptation.paths)
+    // surface at zero". Most tracked adaptations live entirely under fork/.
+    // A tracked adaptation that needs a path outside fork/ has to be a
+    // deliberate, reviewed change, not something that slips in. Allowlisting
+    // by id alone would let a future path added to either adaptation (e.g. an
+    // app/api/** file dropped into sie-migration-validation's `paths`) escape
+    // the check with no review signal, so this allowlists the exact path sets
+    // instead: naming the paths, not just the ids, is the whole point.
+    //
+    // - sie-migration-validation: adds new files upstream does not have.
+    //   Zero merge surface (nothing existing is modified), but the paths are
+    //   outside fork/, so they need to be named here on purpose.
+    // - docker-cron-entrypoint-hardening: the fork's first real tier 2 patch,
+    //   which by definition modifies an upstream file (docker/cron.Dockerfile),
+    //   plus the guard test added in the same commit
+    //   (scripts/__tests__/generate-crontabs.test.ts) that asserts the
+    //   ENTRYPOINT literal: without it declared too, a future upstream merge
+    //   that drops the guard goes undetected while the Dockerfile check alone
+    //   stays green.
+    expect(findUnreviewedPaths(manifest.adaptations)).toEqual([])
+  })
 
-    expect(trackedPaths.filter((path) => !path.startsWith('fork/'))).toEqual([])
+  it('would flag a new path added to an already-reviewed id, not just a new id', () => {
+    // Regression check for the allowlist itself: allowlisting by id alone
+    // would silently pass a future path added under a reviewed id (e.g. an
+    // app/api/** file dropped into sie-migration-validation's `paths`). Reuses
+    // findUnreviewedPaths/REVIEWED_OUTSIDE_FORK from module scope (not a
+    // hand-copy) so a regression in either one fails this test too, and
+    // simulates the addition here to confirm it still goes red.
+    const withExtraPath = manifest.adaptations.map((adaptation) =>
+      adaptation.id === 'sie-migration-validation'
+        ? { ...adaptation, paths: [...adaptation.paths, 'app/api/import/sie-migration/route.ts'] }
+        : adaptation,
+    )
+
+    expect(findUnreviewedPaths(withExtraPath)).toEqual([
+      'sie-migration-validation: app/api/import/sie-migration/route.ts',
+    ])
   })
 })

@@ -79,6 +79,69 @@
           "reason": "Upstream stopped loading .env into the app service, so environment-variable adaptations (our tier 1 default) no longer reach the container."
         }
       ]
+    },
+    {
+      "id": "sie-migration-validation",
+      "tier": 1,
+      "summary": "Standalone SIE 8-year migration validation instrument (lib/import/sie-migration-validation.ts) used to check the Fortnox-to-Accounted migration, plus its tests.",
+      "why": "Wholly new files that touch no existing upstream file, so they carry no merge surface of their own. They are still a real difference from upstream and need both a local check and an upstream-absent check: an accidental revert and a future upstream file landing at the same path should both go red instead of silently disappearing.",
+      "paths": ["lib/import/sie-migration-validation.ts", "lib/import/__tests__/sie-migration-validation.test.ts"],
+      "tracked": true,
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "lib/import/sie-migration-validation.ts",
+          "pattern": "export function validateEightYearMigration",
+          "reason": "The migration validation instrument is gone or renamed; the Q2 control-point check it backs has nothing behind it any more."
+        },
+        {
+          "kind": "upstream-absent",
+          "path": "lib/import/sie-migration-validation.ts",
+          "pattern": "[\\s\\S]",
+          "reason": "Upstream has created its own file at this path, so our instrument collides with theirs and has to move."
+        },
+        {
+          "kind": "local-contains",
+          "path": "lib/import/__tests__/sie-migration-validation.test.ts",
+          "pattern": "describe\\('SIE migration validation'",
+          "reason": "The test suite backing the migration validation instrument is gone, so a regression in it would go unnoticed."
+        },
+        {
+          "kind": "upstream-absent",
+          "path": "lib/import/__tests__/sie-migration-validation.test.ts",
+          "pattern": "[\\s\\S]",
+          "reason": "Upstream has created its own file at this test path, so our test suite collides with theirs and has to move."
+        }
+      ]
+    },
+    {
+      "id": "docker-cron-entrypoint-hardening",
+      "tier": 2,
+      "summary": "docker/cron.Dockerfile invokes supercronic by its installed absolute path in ENTRYPOINT instead of relying on PATH.",
+      "why": "Container hardening, not a bug fix on the current image (see fork/DECISIONS.md, 2026-09-05): the image supplies a working PATH today, but an absolute ENTRYPOINT removes that runtime dependency entirely. Modifies an upstream file, so it is a genuine tier 2 patch. It landed directly on main rather than on a dedicated fork/patches branch, which is a documented deviation from the tier 2 procedure in fork/README.md section 4, not a template for future patches.",
+      "paths": ["docker/cron.Dockerfile", "scripts/__tests__/generate-crontabs.test.ts"],
+      "tracked": true,
+      "branch": "main",
+      "upstream": {
+        "status": "planned"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "docker/cron.Dockerfile",
+          "pattern": "ENTRYPOINT \\[\"/usr/local/bin/supercronic\"\\]",
+          "reason": "The absolute-path ENTRYPOINT hardening was reverted, so the image is back to depending on PATH to find supercronic."
+        },
+        {
+          "kind": "local-contains",
+          "path": "scripts/__tests__/generate-crontabs.test.ts",
+          "pattern": "describe\\('cron container'",
+          "reason": "The guard test for the absolute ENTRYPOINT is gone, so a future upstream merge could silently drop the hardening it exists to catch."
+        }
+      ]
     }
   ]
 }
