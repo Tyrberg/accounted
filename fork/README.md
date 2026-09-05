@@ -57,10 +57,14 @@ sitting at `ed9bdc4` from 2026-05-11), not on the fork itself.
 
 The distinction matters, because it changes what "catching up" means:
 
-- **The fork has no commits of its own.** Catching up is therefore a
-  fast-forward, not a merge. There is no conflict resolution to do and nothing
-  to document as "broken on the way", because no two versions of any file ever
-  had to be reconciled.
+- **The fork had no commits of its own when this was written.** Catching up
+  was therefore a fast-forward, not a merge. That stopped being true on
+  2026-08-29: three commits landed on `main` (the fork maintenance layer
+  itself, the SIE 8-year migration validation instrument, and three
+  contributed-back self-hosting bug fixes), so `git merge --ff-only
+  upstream/main` is no longer guaranteed to succeed. It failed for exactly
+  that reason during the 2026-09-05 catch-up; see step 3 of section 6 and
+  [`fork/DECISIONS.md`](DECISIONS.md).
 - The working clone on the box (`/opt/projects/accounted`) was created fresh
   from the fork on 2026-07-30, so it starts at upstream's tip rather than at
   the 2026-05-11 snapshot.
@@ -76,7 +80,7 @@ The distinction matters, because it changes what "catching up" means:
 | `npm run check:lint`                     | Green: 0 errors against a baseline of 0.                         |
 | `npm run check:guards`                   | Green.                                                           |
 | `npx tsc --noEmit`                       | No diagnostics under `fork/`. The repo-wide run reports 505 pre-existing errors in `app/**/__tests__`, untouched by this change and not part of any CI gate. |
-| Migration inventory 2026-05-11 to now    | 370 files, see section 3.                                        |
+| Migration inventory 2026-05-11 to now    | 611 files, see section 3.                                        |
 
 **Not verified here, and why:**
 
@@ -103,20 +107,29 @@ running the 2026-05-11 schema has this much to apply:
 | ---------------------------- | --------------- |
 | 2026-05 (from the 11th)      | 135             |
 | 2026-06                      | 67              |
-| 2026-07                      | 168             |
-| 2026-08                      | 0               |
-| **Total from 2026-05-11**    | **370**         |
-| Total in `supabase/migrations/` | 546          |
+| 2026-07                      | 171             |
+| 2026-08                      | 182             |
+| 2026-09 (through the 4th)    | 56              |
+| **Total from 2026-05-11**    | **611**         |
+| Total in `supabase/migrations/` | 786          |
 
 First in the window: `20260511120000_bank_connections_pending_selection.sql`.
-Last in the window: `20260730090000_kpi_monthly_exclude_year_end.sql`.
+Last in the window: `20260904163000_fiscal_year_reset_next_year_dependency.sql`.
 
 Regenerate this inventory at any time with:
 
 ```bash
-ls supabase/migrations | awk '$0 >= "20260511"' | wc -l
-ls supabase/migrations | awk '$0 >= "20260511"' | cut -c1-6 | sort | uniq -c
+ls supabase/migrations | grep '\.sql$' | awk '$0 >= "20260511"' | wc -l
+ls supabase/migrations | grep '\.sql$' | awk '$0 >= "20260511"' | cut -c1-6 | sort | uniq -c
 ```
+
+The `grep '\.sql$'` matters: `supabase/migrations/` also contains a
+`__tests__/` subdirectory, and string comparison sorts `_` after digits, so
+`"__tests__" >= "20260511"` is true and an unfiltered `ls` silently counts
+that directory as a phantom migration. (The command above did exactly that
+the first time this table was regenerated, reporting 612 rather than 611 from
+2026-05-11, with a bogus `1 __test` line in the by-month breakdown. Filed here
+so nobody re-derives it from scratch.)
 
 Rules that apply to every one of those files, from [CLAUDE.md](../CLAUDE.md):
 an existing migration is never edited, the enforcement triggers in migration
@@ -138,7 +151,7 @@ repo.
 schema, there are two ways out: pin the Docker image to the version matching
 the current schema and stay there, or take the migrations and move forward. The
 recommendation from this side is to move forward, because pinning accumulates
-the same 370-file jump plus interest and there is no supported path that
+the same 611-file jump plus interest and there is no supported path that
 skips migrations. But it is a production decision about a live database, it is
 not made by this repository, and nothing in `fork/` performs it: the sync
 routine is read-only and cannot touch a database at all.
@@ -201,7 +214,12 @@ When something genuinely cannot be expressed as configuration:
   to `merged`, and once upstream ships it the weekly run tells us to delete our
   copy.
 
-There are zero tier 2 patches today. That is the target state, not an accident.
+There is one tier 2 patch today, `docker-cron-entrypoint-hardening` (see
+[`fork/adaptations.json`](adaptations.json)), and it is already a deviation
+from the procedure above: it landed directly on `main` instead of on
+`fork/patches`, before this rule was being enforced. Zero tier 2 patches
+remains the target state; new ones follow the procedure above, on
+`fork/patches`.
 
 ### The rule that keeps this honest
 
@@ -343,20 +361,52 @@ cd /opt/projects/accounted
 2. **See the distance.** `git fetch upstream && git log --oneline HEAD..upstream/main`.
    Skim the migration filenames in the range: that is the risky part.
 3. **Fast-forward `main`.** `git checkout main && git merge --ff-only upstream/main`.
-   If that fails, something has been committed to `main` that should not have
-   been. Find it before going further; do not make a merge commit to get past it.
+   If that fails, check first whether it is one of the fork's own commits on
+   `main` (`fork/`, `lib/import/sie-migration-validation.ts`,
+   `docker/cron.Dockerfile`; see [`fork/adaptations.json`](adaptations.json))
+   rather than something that should not have been committed at all. If it is
+   a declared adaptation, a real merge is the correct move: `git merge
+   upstream/main` on a dedicated branch (never straight onto `main`), so the
+   fork's commits are preserved rather than discarded. Expect the only
+   conflicts to be append-only doc files upstream and the fork both write to
+   (the root `DECISIONS.md` is the known case; keep both sides' lines). If the
+   failure is anything else, something has been committed to `main` that
+   should not have been; find it before going further.
+
+   The dedicated branch still has to land on `main` before steps 4-8 mean
+   anything: open a PR from it, get it reviewed and merged through the normal
+   process (this repo has no direct-push exception for fork syncs), then
+   `git checkout main && git pull` to pick up the merge before continuing.
+   Steps 4-8 below run against `main` after that merge has landed, not
+   against the dedicated branch. (Precedent: the 2026-09-05 catch-up hit this
+   exact fallback, on branch `fork-sync/upstream-2026-09-05`, merged via
+   accounted#5.)
 4. **Reinstall and re-verify.** `npm ci`, then `npm test`, `npm run check:lint`,
    `npm run check:guards`.
 5. **Check the adaptations.** `npx tsx fork/cli.ts sync`. Exit 2 means an
    adaptation broke, and the report names it, says what changed upstream, and
    quotes the reason recorded in the manifest.
-6. **Rebase tier 2, if any exists.** `git rebase upstream/main fork/patches`,
-   then re-run step 5. Drop any patch whose upstream PR has been merged, and
-   delete its manifest entry in the same commit.
+6. **Rebase tier 2, if any exists.** Check each tier 2 adaptation's declared
+   `branch` in [`fork/adaptations.json`](adaptations.json) first, they are not
+   all on `fork/patches`: `docker-cron-entrypoint-hardening` declares
+   `"branch": "main"` (the documented section-4 deviation), and a patch
+   declared on `main` travels with step 3's merge, there is nothing to rebase
+   for it, just re-run step 5 to confirm its checks still hold. For any
+   adaptation actually declared on `fork/patches`, run `git rebase
+   upstream/main fork/patches`, then re-run step 5. Either way, drop any patch
+   whose upstream PR has been merged, and delete its manifest entry in the
+   same commit.
 7. **Do the database.** Section 3. Backup restore, scratch database,
    `npm run test:pg`, then live.
-8. **Push and deploy.** `git push origin main`, then the deployment's own
-   procedure ([docs/SELF-HOSTING.md](../docs/SELF-HOSTING.md)).
+8. **Push and deploy.** Steps 4-7 routinely leave local commits on `main`
+   regardless of which path step 3 took: an adaptation fix from a step 5 exit
+   2, the step 6 rebase of `fork/patches` and the manifest-entry deletion
+   that goes with it. Run `git status` and `git log origin/main..HEAD`; if
+   either shows anything, `git push origin main` before deploying. This holds
+   even in the merge-fallback path, where `main` was only caught up to
+   `origin` as of the PR merge in step 3, not after steps 4-7 ran. Either way,
+   finish with the deployment's own procedure
+   ([docs/SELF-HOSTING.md](../docs/SELF-HOSTING.md)).
 
 `npm run check:lint` and `npm run check:guards` are ratchets, not absolutes:
 they compare against a committed baseline of known-legacy findings. A jump that
@@ -492,6 +542,6 @@ it cannot be mistaken for done.
 | Create the external heartbeat check and set `FORK_SYNC_HEARTBEAT_URL` | Same                  |
 | First real `sync` run against a checkout that has the `upstream` remote | Same. Until then the upstream half of the routine has never executed end to end |
 | Decide q657-1 (pin the image vs take the migrations) | Mattias, per section 3                     |
-| The 370-migration schema jump, if any environment is still on the old schema | Follows from q657-1  |
+| The 611-migration schema jump, if any environment is still on the old schema | Follows from q657-1  |
 | Revoke and remove the GitLab `glpat-` token       | Whoever has GitLab admin, per section 9       |
 | Archive the GitLab project as read-only           | Same                                          |

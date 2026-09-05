@@ -141,3 +141,63 @@ describe('the /etc/cron.d entry in fork/README.md', () => {
     expect(lines.some((line) => line.startsWith('FORK_SYNC_HEARTBEAT_URL='))).toBe(true)
   })
 })
+
+describe('the upgrade walkthrough in fork/README.md', () => {
+  const readme = read('fork/README.md')
+  const step8 = readme.match(/8\. \*\*Push and deploy\.\*\*([\s\S]*?)(?=\n---)/)?.[1] ?? ''
+
+  it('never tells the operator the merge-fallback path has nothing local to push', () => {
+    // Steps 5-7 run on main after the PR merge and routinely produce local
+    // commits there (an adaptation fix, the fork/patches rebase and its
+    // manifest-entry deletion), so a blanket "nothing local to push" for the
+    // merge-fallback path leaves those commits stranded on the box.
+    expect(step8).not.toMatch(/nothing local\s*\n?\s*to push/)
+  })
+
+  it('tells the operator to check for and push commits left by steps 4-7', () => {
+    expect(step8).toMatch(/git status/)
+    expect(step8).toMatch(/git push origin main/)
+  })
+})
+
+describe('the migration inventory in fork/README.md section 3', () => {
+  const readme = read('fork/README.md')
+  const section3 = readme.match(/## 3\. The database is the real gap([\s\S]*?)(?=\n## 4\.)/)?.[1] ?? ''
+
+  it('regenerates the count with the .sql filter, not a bare ls', () => {
+    // supabase/migrations/ also contains a __tests__/ subdirectory. String
+    // comparison sorts "_" after digits, so an unfiltered
+    // `ls | awk '$0 >= "20260511"'` silently counts that directory as a
+    // phantom migration (it did, the first time this table was generated).
+    // The printed command must filter to real migration files first.
+    const commands = section3.match(/```bash\n([\s\S]*?)\n```/)?.[1] ?? ''
+    for (const line of commands.split('\n').filter(Boolean)) {
+      expect(line).toContain("grep '\\.sql$'")
+    }
+  })
+
+  it('states a total that is consistent with the two window rows it is built from', () => {
+    const total = Number(section3.match(/\*\*Total from 2026-05-11\*\*\s*\|\s*\*\*(\d+)\*\*/)?.[1])
+    const monthly = [...section3.matchAll(/\|\s*2026-0\d[^|]*\|\s*(\d+)\s*\|/g)].map((match) =>
+      Number(match[1]),
+    )
+
+    expect(monthly.length).toBeGreaterThan(0)
+    expect(total).toBe(monthly.reduce((sum, count) => sum + count, 0))
+  })
+
+  it('quotes the same total in section 2\'s verification table, which cross-references this section', () => {
+    // Section 3 was regenerated after a schema jump and this row was missed:
+    // it still said "370 files" (the pre-catch-up count) while section 3 had
+    // moved on to 611. A number that only lives in one place cannot drift out
+    // of sync with itself, so this check ties the two together.
+    const section2 = readme.match(/## 2\. Catch-up status and what was verified([\s\S]*?)(?=\n## 3\.)/)?.[1] ?? ''
+    const section2Count = Number(
+      section2.match(/Migration inventory 2026-05-11 to now\s*\|\s*(\d+) files, see section 3\./)?.[1],
+    )
+    const section3Total = Number(section3.match(/\*\*Total from 2026-05-11\*\*\s*\|\s*\*\*(\d+)\*\*/)?.[1])
+
+    expect(section2Count).toBeGreaterThan(0)
+    expect(section2Count).toBe(section3Total)
+  })
+})
