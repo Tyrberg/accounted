@@ -8,6 +8,7 @@
  * extensions/general/mcp-server/__tests__/payroll-staged-tools.test.ts.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { JAMKNING_ROW_INCOMPLETE } from '@/lib/salary/jamkning-rules'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
 import type { PendingOperation } from '@/types'
@@ -131,6 +132,243 @@ describe('commitPendingOperation: update_payslip_line', () => {
   })
 })
 
+describe('commitPendingOperation: set_run_salary', () => {
+  const SRE_ROW = {
+    id: 'sre-1',
+    employee_id: 'emp-1',
+    salary_type: 'monthly',
+    employment_degree: 100,
+    monthly_salary: 30000,
+  }
+
+  it('writes the per-run salary through the shared service (happy path)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: { id: 'run-1', status: 'draft' } }) // service draft gate
+    enqueue({ data: SRE_ROW }) // service sre lookup
+    enqueue({ data: null }) // sre update
+    enqueue({ data: null }) // display-line update
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'set_run_salary',
+      params: { salary_run_id: 'run-1', employee_id: 'emp-1', monthly_salary: 45000 },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    expect(result.data).toMatchObject({
+      salary_run_id: 'run-1',
+      employee_id: 'emp-1',
+      previous_monthly_salary: 30000,
+      monthly_salary: 45000,
+    })
+  })
+
+  it('fails cleanly when the run advanced between staging and approval', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: { id: 'run-1', status: 'review' } }) // draft gate trips
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'set_run_salary',
+      params: { salary_run_id: 'run-1', employee_id: 'emp-1', monthly_salary: 45000 },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+  })
+
+  it('rejects missing params with 400', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'set_run_salary',
+      params: { salary_run_id: 'run-1', employee_id: 'emp-1' },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+  })
+})
+
+describe('commitPendingOperation: update_salary_run', () => {
+  const RUN_ROW = {
+    id: 'run-1',
+    status: 'draft',
+    period_year: 2026,
+    period_month: 3,
+    payment_date: '2026-03-25',
+    voucher_series: 'L',
+    notes: null,
+  }
+
+  it('applies the header patch through the shared service (happy path)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: RUN_ROW }) // service draft gate + current values
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-03-23' } }) // optimistic-locked update
+    enqueue({ data: null, error: null }) // roster calculation_breakdown clear
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    expect(result.data).toMatchObject({
+      salary_run_id: 'run-1',
+      payment_date: '2026-03-23',
+      changes: { payment_date: '2026-03-23' },
+    })
+  })
+
+  it('re-clears breakdowns when retried with the already-applied date (partial-failure retry)', async () => {
+    // After a partial failure (header committed, clear failed) a retry sees
+    // the new date as current. The clear must run anyway: it is gated on the
+    // date being SUPPLIED, never on it differing from the stored value.
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-03-23' } }) // run already carries the new date
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-03-23' } }) // header update no-ops successfully
+    enqueue({ data: null, error: null }) // roster calculation_breakdown clear
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    expect(findCall('salary_run_employees', 'update')).toEqual([{ calculation_breakdown: null }])
+  })
+
+  it('commits a payment_date in the month after the period (lön i efterskott, #2191)', async () => {
+    // The AGI redovisningsperiod follows payment_date, so a March run paid
+    // in April is declared for April; no period guard refuses it.
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: RUN_ROW }) // draft gate passes; period is 2026-03
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-04-05' } }) // optimistic-locked update
+    enqueue({ data: null, error: null }) // roster calculation_breakdown clear
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-04-05' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+    expect(result.data).toMatchObject({ payment_date: '2026-04-05' })
+  })
+
+  it('fails when the calculation-invalidation clear errors (guard is not best-effort)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: RUN_ROW }) // service draft gate + current values
+    enqueue({ data: { ...RUN_ROW, payment_date: '2026-03-23' } }) // optimistic-locked update
+    enqueue({ data: null, error: { message: 'connection reset' } }) // breakdown clear fails
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+  })
+
+  it('fails cleanly when the run advanced between staging and approval', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: { ...RUN_ROW, status: 'review' } }) // draft gate trips
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.error).toMatch(/utkast/)
+    expect(result.http_status).toBe(400)
+  })
+
+  it('fails cleanly when the optimistic lock loses the race (update matches no row)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: RUN_ROW }) // draft gate passes
+    enqueue({ data: null }) // status flipped mid-flight: locked update hits nothing
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.error).toMatch(/utkast/)
+  })
+
+  it('auto-rejects with 404 when the run does not exist for this company', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: null }) // company-scoped lookup misses
+    enqueue({ data: null, error: null }) // finalize (rejected)
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-foreign', patch: { payment_date: '2026-03-23' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    // 404s are auto-rejected by the dispatcher (the run is gone; re-stage).
+    expect(result.status).toBe('rejected')
+    expect(result.http_status).toBe(404)
+  })
+
+  it('rejects a missing patch with 400', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: null, error: null }) // finalize (failed)
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1' },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+  })
+
+  it('rejects an invalid voucher_series with 400 before any write', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: null, error: null }) // finalize (failed): validation trips pre-query
+
+    const op = makePendingOp({
+      operation_type: 'update_salary_run',
+      params: { salary_run_id: 'run-1', patch: { voucher_series: 'AB' } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+  })
+})
+
 describe('commitPendingOperation: register_absence', () => {
   it('upserts the expanded range through the shared service (happy path)', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
@@ -183,6 +421,49 @@ describe('commitPendingOperation: register_absence', () => {
     // day's hours and re-stage) rather than marking it transiently failed.
     expect(result.status).toBe('rejected')
     expect(result.http_status).toBe(409)
+  })
+
+  it('logs the PG details and persists a sanitized error_code when the upsert fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+      enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+      enqueue({ data: { id: 'emp-1' } }) // assertEmployee
+      enqueue({
+        data: null,
+        error: {
+          code: '42501',
+          message:
+            'new row violates row-level security policy for table "salary_absence_franvaro_audit"',
+        },
+      }) // upsert denied (the franvaro audit-trigger bug)
+      enqueue({ data: null, error: null }) // finalize (failed)
+
+      const op = makePendingOp({
+        operation_type: 'register_absence',
+        params: { employee_id: 'emp-1', from: '2026-03-02', to: '2026-03-02', absence_type: 'parental' },
+      })
+      const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+      expect(result.status).toBe('failed')
+      expect(result.http_status).toBe(500)
+      expect(result.code).toBe('DB_PERMISSION_DENIED')
+      // The op row keeps the structured code so the failure mode is
+      // diagnosable later, but never the raw PG text.
+      const updates = findCalls('pending_operations', 'update')
+      const finalize = updates[updates.length - 1]![0] as { result_data?: Record<string, unknown> }
+      expect(finalize.result_data).toMatchObject({
+        error_code: 'DB_PERMISSION_DENIED',
+        http_status: 500,
+      })
+      expect(JSON.stringify(finalize.result_data)).not.toContain('row-level security')
+      // The raw PG message goes to the log: it is persisted nowhere else.
+      const logged = consoleError.mock.calls.map((c) => c.join(' ')).join('\n')
+      expect(logged).toContain('register_absence commit failed')
+      expect(logged).toContain('row-level security')
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 })
 
@@ -279,6 +560,34 @@ describe('commitPendingOperation: delete_absence', () => {
     expect(result.status).not.toBe('committed')
     expect(result.error).toBeDefined()
   })
+
+  it('logs the PG details and persists a sanitized error_code when the delete fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+      enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+      enqueue({ data: { id: 'emp-1' } }) // assertEmployee
+      enqueue({ data: null, error: { code: '57014', message: 'canceling statement due to statement timeout' } }) // delete fails
+      enqueue({ data: null, error: null }) // finalize (failed)
+
+      const op = makePendingOp({
+        operation_type: 'delete_absence',
+        params: { employee_id: 'emp-1', from: '2026-03-02', to: '2026-03-06' },
+      })
+      const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+      expect(result.status).toBe('failed')
+      expect(result.code).toBe('INTERNAL_ERROR')
+      const updates = findCalls('pending_operations', 'update')
+      const finalize = updates[updates.length - 1]![0] as { result_data?: Record<string, unknown> }
+      expect(finalize.result_data).toMatchObject({ error_code: 'INTERNAL_ERROR' })
+      const logged = consoleError.mock.calls.map((c) => c.join(' ')).join('\n')
+      expect(logged).toContain('delete_absence commit failed')
+      expect(logged).toContain('statement timeout')
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
 })
 
 describe('commitPendingOperation: create_employee', () => {
@@ -324,6 +633,36 @@ describe('commitPendingOperation: create_employee', () => {
     // Result data never carries the plaintext or ciphertext.
     expect(JSON.stringify(result.data)).not.toContain('190001010000')
     expect(JSON.stringify(result.data)).not.toContain(encrypted)
+  })
+
+  it('rejects a jämkning percentage without an end date before inserting (#2058)', async () => {
+    const { encryptPersonnummer } = await import('@/lib/salary/personnummer')
+    const { supabase, enqueue, calls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: { entity_type: 'ab' } }) // entity type
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'create_employee',
+      params: {
+        first_name: 'Anna',
+        last_name: 'Andersson',
+        personnummer_encrypted: encryptPersonnummer('190001010000'),
+        personnummer_last4: '0000',
+        employment_start: '2026-01-15',
+        salary_type: 'monthly',
+        monthly_salary: 35000,
+        tax_table_number: 33,
+        jamkning_percentage: 15,
+        jamkning_valid_from: '2026-01-01',
+        jamkning_valid_to: null,
+      },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).not.toBe('committed')
+    expect(result.error).toMatch(/slutdatum/)
+    expect(calls.some((c) => c.table === 'employees' && c.method === 'insert')).toBe(false)
   })
 
   it('maps duplicate personnummer to a clean rejection', async () => {
@@ -507,6 +846,78 @@ describe('commitPendingOperation: update_employee', () => {
     expect(result.http_status).toBe(409)
   })
 
+  it('rejects a jämkning percentage without an end date on the merged row (#2058)', async () => {
+    const { supabase, enqueue, calls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: {
+        id: 'emp-1',
+        first_name: 'Anna',
+        last_name: 'Andersson',
+        salary_type: 'monthly',
+        monthly_salary: 35000,
+        tax_table_number: 33,
+        is_sidoinkomst: false,
+        f_skatt_status: 'a_skatt',
+        vaxa_stod_eligible: false,
+        jamkning_percentage: null,
+        jamkning_valid_from: null,
+        jamkning_valid_to: null,
+      },
+    }) // fetch existing
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_employee',
+      params: {
+        employee_id: 'emp-1',
+        patch: { jamkning_percentage: 15, jamkning_valid_from: '2026-01-01' },
+      },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).not.toBe('committed')
+    expect(result.error).toMatch(/slutdatum/)
+    expect(calls.some((c) => c.table === 'employees' && c.method === 'update')).toBe(false)
+  })
+
+  it('leaves a legacy row without valid_to editable in unrelated ways (touched gate)', async () => {
+    const { encryptPersonnummer } = await import('@/lib/salary/personnummer')
+    const encrypted = encryptPersonnummer('190001010000')
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: {
+        id: 'emp-1',
+        first_name: 'Anna',
+        last_name: 'Andersson',
+        personnummer: encrypted,
+        salary_type: 'monthly',
+        monthly_salary: 35000,
+        tax_table_number: 33,
+        is_sidoinkomst: false,
+        f_skatt_status: 'a_skatt',
+        vaxa_stod_eligible: false,
+        jamkning_percentage: 15,
+        jamkning_valid_from: '2026-01-01',
+        jamkning_valid_to: null,
+        is_active: true,
+      },
+    }) // fetch existing
+    enqueue({
+      data: { id: 'emp-1', first_name: 'Anna', last_name: 'Andersson', personnummer: encrypted, is_active: true },
+    }) // update
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_employee',
+      params: { employee_id: 'emp-1', patch: { monthly_salary: 38000 } },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('committed')
+  })
+
   it('fails merged validation when clearing salary below zero-state', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
@@ -534,5 +945,53 @@ describe('commitPendingOperation: update_employee', () => {
 
     expect(result.status).not.toBe('committed')
     expect(result.error).toMatch(/Månadslön/)
+  })
+
+  it('answers the CHECK constraint (concurrent-update race, #2256) as a validation failure, not INTERNAL_ERROR', async () => {
+    const { encryptPersonnummer } = await import('@/lib/salary/personnummer')
+    const encrypted = encryptPersonnummer('190001010000')
+
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: {
+        id: 'emp-1',
+        first_name: 'Anna',
+        last_name: 'Andersson',
+        personnummer: encrypted,
+        salary_type: 'monthly',
+        monthly_salary: 35000,
+        tax_table_number: 33,
+        is_sidoinkomst: false,
+        f_skatt_status: 'a_skatt',
+        vaxa_stod_eligible: false,
+        jamkning_percentage: null,
+        jamkning_valid_from: null,
+        jamkning_valid_to: null,
+        is_active: true,
+      },
+    }) // fetch existing: the snapshot the merged check passes against
+    enqueue({
+      data: null,
+      error: {
+        code: '23514',
+        message: 'new row for relation "employees" violates check constraint "employees_jamkning_dates_check"',
+        details: 'Failing row contains (...).',
+        hint: null,
+      },
+    }) // update: the constraint checked the row another request changed in between
+    enqueue({ data: null, error: null }) // finalize
+
+    const op = makePendingOp({
+      operation_type: 'update_employee',
+      params: {
+        employee_id: 'emp-1',
+        patch: { jamkning_percentage: 15, jamkning_valid_from: '2026-01-01', jamkning_valid_to: '2026-12-31' },
+      },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).not.toBe('committed')
+    expect(result.error).toBe(JAMKNING_ROW_INCOMPLETE)
   })
 })

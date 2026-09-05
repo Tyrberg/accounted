@@ -1,11 +1,15 @@
 import { describe, it, expect } from 'vitest'
 import {
+  FALLBACK_CONFIDENCE_FACTOR,
   levenshteinDistance,
   normalizeMerchantName,
+  normalizeForMatch,
   calculateMerchantSimilarity,
   calculateMatchConfidence,
   amountVarianceForMatch,
+  bestProminentAmountVariance,
 } from '../core-receipt-matcher'
+import { roundOre } from '@/lib/money'
 
 describe('levenshteinDistance', () => {
   it('returns 0 for identical strings', () => {
@@ -159,5 +163,159 @@ describe('amountVarianceForMatch', () => {
 
   it('treats currency codes case-insensitively', () => {
     expect(amountVarianceForMatch(100, 'eur', null, -100, 'EUR', -1150)).toBe(0)
+  })
+})
+
+describe('bestProminentAmountVariance', () => {
+  it('picks the closest of several printed amounts and names it', () => {
+    // An agreement listing both a monthly price and a one-off price: the
+    // one-off 2500 matches the -2500 AVGIFT charge exactly.
+    const best = bestProminentAmountVariance(
+      [
+        { amount: 49, label: 'Månadspris' },
+        { amount: 2500, label: 'Engångspris' },
+      ],
+      'SEK',
+      -2500,
+      'SEK',
+      -2500,
+    )
+    expect(best).toEqual({ variance: 0, amount: 2500, label: 'Engångspris' })
+  })
+
+  it('returns null when nothing is comparable', () => {
+    expect(bestProminentAmountVariance([], 'SEK', -2500, 'SEK', -2500)).toBeNull()
+    // Cross-currency without a rate stays incomparable, like a total would.
+    expect(
+      bestProminentAmountVariance([{ amount: 2500, label: null }], 'EUR', -2500, 'SEK', -2500),
+    ).toBeNull()
+    // Zero amounts carry no signal (amountVarianceForMatch drops them).
+    expect(
+      bestProminentAmountVariance([{ amount: 0, label: null }], 'SEK', -2500, 'SEK', -2500),
+    ).toBeNull()
+  })
+
+  it('the discount factor keeps fallback agreement below certainty', () => {
+    // Exact date + exact amount + no merchant normalises to 1.0; a fallback
+    // match must not present that as certainty (this exact geometry scored
+    // "100% säkerhet" on a wrong same-day transaction before the factor).
+    const { confidence } = calculateMatchConfidence(0, 0, 0)
+    const discounted = roundOre(confidence * FALLBACK_CONFIDENCE_FACTOR)
+    expect(confidence).toBe(1)
+    expect(discounted).toBeLessThan(1)
+  })
+
+  it('a disagreeing fallback amount scores no better than a disagreeing total', () => {
+    // Renormalized weights made a wrong fallback amount OUTSCORE a wrong
+    // invoice total (0.67 vs 0.60 with exact date + merchant); the factor
+    // approach scores both at full weight and then discounts the fallback.
+    const asTotal = calculateMatchConfidence(0, 1.4, 0.9).confidence
+    const asFallback = roundOre(asTotal * FALLBACK_CONFIDENCE_FACTOR)
+    expect(asFallback).toBeLessThanOrEqual(asTotal)
+    expect(asFallback).toBeLessThan(0.6)
+  })
+})
+
+describe('normalizeForMatch', () => {
+  it('leaves the frozen key normalizer alone', () => {
+    // normalizeMerchantName feeds a PERSISTED unique key with a SQL mirror.
+    // If this ever fails, the konteringskarta join is about to drift.
+    expect(normalizeMerchantName('Telia AB')).toBe('telia')
+    expect(normalizeMerchantName('Café Överkås!')).toBe('café överkås')
+  })
+
+  it('strips the Swedish card rails', () => {
+    expect(normalizeForMatch('Ryde Sweden AB  K8066 Kortköp/uttag')).toBe('ryde sweden')
+    expect(normalizeForMatch('Kortköp 260612 Prime Video')).toBe('prime video')
+    expect(normalizeForMatch('ELGIGANTEN S/25-07-14')).toBe('elgiganten s')
+  })
+
+  it('folds the three ways banks mangle Swedish letters', () => {
+    // Same merchant, spelled three ways by three feeds.
+    const a = normalizeForMatch('Alviks kött och fisk')
+    expect(normalizeForMatch('Alviks koett och fisk')).toBe(a)
+    expect(normalizeForMatch('Alviks k??tt och fisk')).not.toBe('')
+  })
+
+  it('keeps both sides of a processor marker', () => {
+    // The merchant is second in K*IKEA and first in GOOGLE*PLAY.
+    expect(normalizeForMatch('K*IKEA GALLE')).toContain('ikea')
+    expect(normalizeForMatch('GOOGLE*PLAY')).toContain('google')
+  })
+
+  it('drops legal forms and reference numbers', () => {
+    expect(normalizeForMatch('Adobe Systems Software Ireland Ltd')).toBe('adobe systems software ireland')
+    expect(normalizeForMatch('GOOGLE  ADS8047863617')).toBe('google ads')
+  })
+})
+
+describe('calculateMerchantSimilarity on real confirmed pairs', () => {
+  // Every pair below is one a human actually made in production
+  // (invoice_inbox_items.matched_transaction_id), so these are recall targets,
+  // not invented examples.
+  const CONFIRMED: Array<[string, string]> = [
+    ['APPLE COM/SE', 'APPLE COM/SE/25-02-20'],
+    ['Word and Sound Medien GmbH', 'Word and Sound GmbH'],
+    ['Anomaly', 'ANOMALY,SAN FRANCISCO,US Kortköp'],
+    ['Tradera Marketplace AB', 'TRADERA 1022'],
+    ['DigitalOcean LLC', 'DIGITALOCEAN.COM      AMSTERDAM Kortköp/uttag'],
+    ['Cinode AB', 'WWW.CINODE.COM'],
+    ['Kjell & Company', 'KjellCo Oktober'],
+    ['Hostinger International Ltd.', 'Hostinger Apr JW'],
+    ['OpenAI OpCo, LLC', 'OPENAI *CHATGP'],
+    ['Google Ads', 'GOOGLE  ADS8047863617'],
+    ['Elgiganten', 'ELGIGANTEN S/25-07-14'],
+    ['Hanko GmbH', 'HANKO IO'],
+    ['Panduro', 'PANDURO LUND'],
+    ['Rusta Lindingö 135', 'RUSTA LINDING?? 135'],
+    ['Loopia AB', 'Loopia'],
+    ['Kilo Code', 'KILO CODE INC,SAN FRANCISCO,US Kortköp'],
+    ['DNH GODADDY', 'DNH GODADDY /25-07-06'],
+    ['Adobe Systems Software Ireland Ltd', 'Adobe'],
+    ['Lennart & Bror Kött (Alviks kött och fisk AB)', 'Alviks koett och fisk K3667 Kortköp/uttag'],
+    ['Ryde Sweden AB', 'Ryde Sweden AB  K8066 Kortköp/uttag'],
+    ['IKEA', 'K*IKEA GALLE'],
+    ['Espresso House', 'ESPRESSO HOUSE 1234 STOCKHOLM'],
+  ]
+
+  it.each(CONFIRMED)('recognises %s ↔ %s', (receipt, bank) => {
+    expect(calculateMerchantSimilarity(receipt, bank)).toBeGreaterThanOrEqual(0.6)
+  })
+
+  // Aggressive folding buys recall; these guard the price of it.
+  const DIFFERENT: Array<[string, string]> = [
+    ['Cloudflare', 'Clas Ohlson'],
+    ['SJ AB', 'Skatteverket'],
+    ['Adobe', 'Apple'],
+    ['ICA Maxi Stockholm', 'Coop Solna'],
+    ['Anthropic, PBC', 'Anomaly'],
+    ['Hostinger International Ltd.', 'Hanko GmbH'],
+    ['Google Ads', 'Google Cloud EMEA Limited'],
+  ]
+
+  it.each(DIFFERENT)('keeps %s apart from %s', (a, b) => {
+    expect(calculateMerchantSimilarity(a, b)).toBeLessThan(0.6)
+  })
+})
+
+/**
+ * Swedish bank vocabulary that wraps a merchant name without being part of it.
+ * Drawn from a real ledger, where "Utlägg Norwegian" against "Norwegian Air
+ * Shuttle AOC AS" scored 0.18 and an exact 1 998 kr match was never proposed.
+ */
+describe('payment words are not merchant names', () => {
+  it('sees through an expense reimbursement', () => {
+    expect(calculateMerchantSimilarity('Utlägg Norwegian', 'Norwegian Air Shuttle AOC AS'))
+      .toBeGreaterThan(0.8)
+  })
+
+  it('sees through a transfer', () => {
+    expect(calculateMerchantSimilarity('Kontorsplatser j Bg-bet. via internet', 'Kontorsplatser AB'))
+      .toBeGreaterThan(0.8)
+  })
+
+  it('still tells two different merchants apart', () => {
+    expect(calculateMerchantSimilarity('Utlägg Norwegian', 'Scandinavian Airlines System'))
+      .toBeLessThan(0.5)
   })
 })

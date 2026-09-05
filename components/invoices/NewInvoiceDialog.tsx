@@ -1,9 +1,8 @@
 'use client'
 
-import dynamic from 'next/dynamic'
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslations } from 'next-intl'
-import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogTitle, DialogVeil, useDashShellInert } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import { createClient } from '@/lib/supabase/client'
@@ -16,19 +15,14 @@ import {
   type InvoiceCopySource,
 } from '@/lib/invoices/copy-invoice'
 
-// Deferred: the editor (and its framer-motion dependency) is a large chunk
-// that would otherwise ship with the invoice LIST bundle: it is only needed
-// once this dialog actually opens.
-const InvoiceEditor = dynamic(() => import('@/components/invoices/InvoiceEditor'), {
-  ssr: false,
-  loading: () => (
-    <div className="space-y-4 p-6">
-      <Skeleton className="h-8 w-1/3" />
-      <Skeleton className="h-32 w-full" />
-      <Skeleton className="h-32 w-full" />
-    </div>
-  ),
-})
+// The editor (and its framer-motion dependency) is a large chunk that must
+// not ship with the invoice LIST bundle. This dialog is itself loaded with
+// next/dynamic by app/(dashboard)/invoices/page.tsx, so a static import here
+// keeps the editor in the dialog's deferred chunk: ONE chunk download when
+// "Ny faktura" opens instead of the dialog chunk followed by a second,
+// dependent editor chunk (and then the editor's own data fetches).
+import InvoiceEditor from '@/components/invoices/InvoiceEditor'
+import type { InvoiceDocumentType } from '@/types'
 
 interface Props {
   open: boolean
@@ -36,6 +30,8 @@ interface Props {
   copyFromId?: string | null
   /** Preselect the självfaktura tab (split-button entry on /invoices). */
   selfBilled?: boolean
+  /** Preselect a document type: 'quote' ("Ny offert") or 'proforma' ("Ny proformafaktura") split-button entries. */
+  documentType?: InvoiceDocumentType
 }
 
 /**
@@ -45,11 +41,17 @@ interface Props {
  * (unmounting the host list page and this dialog with it).
  *
  * The accessible title is visually hidden: the bare editor renders its own
- * live heading, which tracks document type (faktura/proforma/följesedel) and
- * shows the invoice-number preview: a static DialogTitle would duplicate or
- * contradict it.
+ * live heading, which tracks document type (faktura/proforma/offert/följesedel)
+ * and shows the invoice-number preview: a static DialogTitle would duplicate
+ * or contradict it.
  */
-export default function NewInvoiceDialog({ open, onOpenChange, copyFromId = null, selfBilled = false }: Props) {
+export default function NewInvoiceDialog({
+  open,
+  onOpenChange,
+  copyFromId = null,
+  selfBilled = false,
+  documentType,
+}: Props) {
   const t = useTranslations('invoice_editor')
   const { company } = useCompany()
   const supabase = useMemo(() => createClient(), [])
@@ -119,10 +121,18 @@ export default function NewInvoiceDialog({ open, onOpenChange, copyFromId = null
   const copyInitial = copyLoad.sourceId === copyFromId ? copyLoad.initial : null
   const copyLoadFailed = copyLoad.sourceId === copyFromId && copyLoad.failed
 
+  // Non-modal dialog (see below): page modality is restored by hand so the
+  // agent sheet stays live. See useDashShellInert in components/ui/dialog.tsx.
+  useDashShellInert(open)
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange} modal={false}>
+      <DialogVeil />
       <DialogContent
-        className="sm:max-w-5xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto"
+        // p-0/gap-0: the bare editor carries its own padding so its sticky
+        // action bar can sit flush against the dialog's bottom edge (position
+        // sticky binds to this DialogContent, the scroll container).
+        className="sm:max-w-2xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto p-0 gap-0"
         // A half-typed invoice must survive an accidental backdrop click or a
         // stray Escape (nested comboboxes and date pickers portal outside the
         // dialog). Closing is explicit: the header X. Same convention as
@@ -132,7 +142,13 @@ export default function NewInvoiceDialog({ open, onOpenChange, copyFromId = null
         onInteractOutside={(e) => e.preventDefault()}
       >
         <DialogTitle className="sr-only">
-          {copyFromId ? t('title_copy') : t('title_invoice')}
+          {copyFromId
+            ? t('title_copy')
+            : documentType === 'quote' && !selfBilled
+              ? t('title_quote')
+              : documentType === 'proforma' && !selfBilled
+                ? t('title_proforma')
+                : t('title_invoice')}
         </DialogTitle>
         {copyFromId ? (
           copyLoadFailed ? (
@@ -153,7 +169,12 @@ export default function NewInvoiceDialog({ open, onOpenChange, copyFromId = null
             </div>
           )
         ) : (
-          <InvoiceEditor mode="create" bare initialSelfBilled={selfBilled} />
+          <InvoiceEditor
+            mode="create"
+            bare
+            initialSelfBilled={selfBilled}
+            initialDocumentType={documentType}
+          />
         )}
       </DialogContent>
     </Dialog>

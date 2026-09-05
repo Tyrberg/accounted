@@ -2,8 +2,9 @@
  * GET /api/v1/companies/{companyId}/transactions
  *
  * Cursor-paginated transaction list. Filters: status (booked/unbooked),
- * date range, currency, search (description ilike). Default sort:
- * (date DESC, id ASC): newest first, deterministic tie-break.
+ * date range, currency, cash_account_id (one bank account), search
+ * (description ilike). Default sort: (date DESC, id ASC): newest first,
+ * deterministic tie-break.
  */
 import { z } from 'zod'
 import { paginated } from '@/lib/api/v1/response'
@@ -14,7 +15,7 @@ import {
 } from '@/lib/api/v1/pagination'
 import { registerEndpoint, listEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ValidationError } from '@/lib/api/v1/errors'
 
 const TransactionSummary = z.object({
   id: z.string().uuid(),
@@ -30,6 +31,7 @@ const TransactionSummary = z.object({
   is_business: z.boolean().nullable(),
   category: z.string().nullable(),
   import_source: z.string().nullable(),
+  cash_account_id: z.string().uuid().nullable(),
   created_at: z.string(),
 })
 
@@ -40,7 +42,7 @@ const TransactionListResponse = listEnvelope(TransactionSummary)
 const TRANSACTION_SUMMARY_COLUMNS =
   'id, date, description, amount, currency, reference, merchant_name, ' +
   'journal_entry_id, invoice_id, supplier_invoice_id, is_business, category, ' +
-  'import_source, created_at'
+  'import_source, cash_account_id, created_at'
 
 registerEndpoint({
   operation: 'transactions.list',
@@ -103,6 +105,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
         .regex(/^\d{4}-\d{2}-\d{2}$/)
         .optional(),
       search: z.string().min(1).max(200).optional(),
+      cash_account_id: z.string().uuid().optional(),
     })
     const filtersResult = FiltersSchema.safeParse({
       status: url.searchParams.get('status') ?? undefined,
@@ -110,18 +113,9 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
       date_from: url.searchParams.get('date_from') ?? undefined,
       date_to: url.searchParams.get('date_to') ?? undefined,
       search: url.searchParams.get('search') ?? undefined,
+      cash_account_id: url.searchParams.get('cash_account_id') ?? undefined,
     })
-    if (!filtersResult.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: filtersResult.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!filtersResult.success) return v1ValidationError(ctx, filtersResult.error)
     const f = filtersResult.data
 
     // Sort by (created_at DESC, id ASC). created_at is the stable cursor
@@ -142,6 +136,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     if (f.status === 'booked') query = query.not('journal_entry_id', 'is', null)
     else if (f.status === 'unbooked') query = query.is('journal_entry_id', null)
     if (f.currency) query = query.eq('currency', f.currency)
+    if (f.cash_account_id) query = query.eq('cash_account_id', f.cash_account_id)
     if (f.date_from) query = query.gte('date', f.date_from)
     if (f.date_to) query = query.lte('date', f.date_to)
     if (f.search) {

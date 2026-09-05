@@ -5,6 +5,12 @@ import { createMockRequest, parseJsonResponse, createQueuedMockSupabase } from '
 const { supabase, enqueue, enqueueMany, reset } = createQueuedMockSupabase()
 
 const requireAuthMock = vi.fn()
+// The payee write-through is its own unit (lib/cash-accounts/__tests__/invoice-payee.test.ts);
+// here it must not consume the queued company_settings results.
+vi.mock('@/lib/cash-accounts/invoice-payee', () => ({
+  propagateLegacyPayeeWrite: vi.fn().mockResolvedValue(['SEK']),
+}))
+
 vi.mock('@/lib/auth/require-auth', () => ({
   requireAuth: (...args: unknown[]) => requireAuthMock(...args),
 }))
@@ -95,6 +101,58 @@ describe('PUT /api/settings', () => {
     expect(status).toBe(200)
     expect(body.data.company_name).toBe('New Name')
     expect(deadlineMocks.regenerate).not.toHaveBeenCalled()
+  })
+
+  it('accepts the mileage_enabled visibility toggle', async () => {
+    enqueueMany([
+      { data: { entity_type: 'enskild_firma', onboarding_complete: true } }, // fetch oldSettings
+      { data: { id: 's1', mileage_enabled: true } },                          // update ... returning
+      { data: null, count: 5 },                                               // deadlines count (has some -> no regen)
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { mileage_enabled: true },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ data: { mileage_enabled: boolean } }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.mileage_enabled).toBe(true)
+    expect(deadlineMocks.regenerate).not.toHaveBeenCalled()
+  })
+
+  it('accepts the data_analysis_opt_in consent toggle', async () => {
+    enqueueMany([
+      { data: { entity_type: 'enskild_firma', onboarding_complete: true } }, // fetch oldSettings
+      { data: { id: 's1', data_analysis_opt_in: true } },                     // update ... returning
+      { data: null, count: 5 },                                               // deadlines count (has some -> no regen)
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { data_analysis_opt_in: true },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ data: { data_analysis_opt_in: boolean } }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.data_analysis_opt_in).toBe(true)
+    expect(deadlineMocks.regenerate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-boolean data_analysis_opt_in value', async () => {
+    enqueueMany([
+      { data: { onboarding_complete: true } }, // oldSettings
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { data_analysis_opt_in: 'yes' },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+
+    expect(response.status).toBe(400)
   })
 
   it('round-trips share capital fields and clears them with null', async () => {
@@ -632,5 +690,180 @@ describe('PUT /api/settings', () => {
       'company_settings',
       'employee_vacation_balances',
     ])
+  })
+
+  it('accepts the öresavrundning toggle', async () => {
+    enqueueMany([
+      { data: { onboarding_complete: true } },                              // oldSettings
+      { data: { company_id: 'company-1', salary_net_rounding: true } },     // update result
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { salary_net_rounding: true },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ data: { salary_net_rounding: boolean } }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.salary_net_rounding).toBe(true)
+  })
+
+  it('rejects a non-boolean öresavrundning value', async () => {
+    enqueueMany([
+      { data: { onboarding_complete: true } }, // oldSettings
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { salary_net_rounding: 'yes' },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+
+    expect(response.status).toBe(400)
+  })
+
+  it('allows a bank-details save when stored VAT state is incomplete (bank dialog)', async () => {
+    // Pre-existing inconsistency: registered without a VAT number. The invoice
+    // bank-details dialog has no VAT fields and must not be blocked by it.
+    const settings = {
+      entity_type: 'aktiebolag',
+      vat_registered: true,
+      vat_number: null,
+      moms_period: 'quarterly',
+      onboarding_complete: true,
+    }
+    enqueueMany([
+      { data: settings },                                         // oldSettings
+      { data: { role: 'owner' } },                                // payment-instructions role gate
+      { data: { id: 's1', bank_name: 'Testbanken', bankgiro: '223-8194' } }, // update
+      { data: null, count: 5 },                                   // deadlines count
+    ])
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { bank_name: 'Testbanken', bankgiro: '223-8194' },
+    }), { params: Promise.resolve({}) })
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+  })
+
+  it('still rejects enabling VAT registration without a VAT number', async () => {
+    enqueue({
+      data: {
+        entity_type: 'aktiebolag',
+        vat_registered: false,
+        vat_number: null,
+        moms_period: 'quarterly',
+        onboarding_complete: true,
+      },
+    })
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { vat_registered: true },
+    }), { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error).toContain('Momsregistreringsnummer')
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects clearing the VAT number while the company stays registered', async () => {
+    enqueue({
+      data: {
+        entity_type: 'aktiebolag',
+        vat_registered: true,
+        vat_number: 'SE556012579001',
+        moms_period: 'quarterly',
+        onboarding_complete: true,
+      },
+    })
+
+    // Explicit null is a clear, not an omission: it must not fall back to the
+    // stored number during validation.
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { vat_number: null },
+    }), { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error).toContain('Momsregistreringsnummer')
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects clearing the moms period while the company stays registered', async () => {
+    enqueue({
+      data: {
+        entity_type: 'aktiebolag',
+        vat_registered: true,
+        vat_number: 'SE556012579001',
+        moms_period: 'quarterly',
+        onboarding_complete: true,
+      },
+    })
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { moms_period: null },
+    }), { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error).toContain('Momsperiod')
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects enabling periodisk sammanställning while the VAT registration is incomplete', async () => {
+    enqueue({
+      data: {
+        entity_type: 'aktiebolag',
+        vat_registered: true,
+        vat_number: null,
+        moms_period: 'quarterly',
+        vat_has_eu_trade: true,
+        onboarding_complete: true,
+      },
+    })
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { periodisk_sammanstallning_enabled: true },
+    }), { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error).toContain('Momsregistreringsnummer')
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows an unrelated save when a stored 40m/period conflict already exists', async () => {
+    // Stored state violates the 40m-monthly rule; a save that touches neither
+    // group must still go through.
+    enqueueMany([
+      {
+        data: {
+          entity_type: 'aktiebolag',
+          vat_registered: true,
+          vat_number: 'SE556012579001',
+          moms_period: 'quarterly',
+          vat_taxable_base_over_40m: true,
+          onboarding_complete: true,
+        },
+      },
+      { data: { id: 's1', company_name: 'Testbolaget AB' } }, // update
+      { data: null, count: 5 },                               // deadlines count
+    ])
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { company_name: 'Testbolaget AB' },
+    }), { params: Promise.resolve({}) })
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
   })
 })

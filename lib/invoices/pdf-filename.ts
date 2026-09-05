@@ -30,6 +30,7 @@ function safeFilenamePart(value: string | null | undefined, fallback: string, ma
 function documentLabel(documentType: InvoiceDocumentType, isCreditNote: boolean): string {
   if (isCreditNote) return 'Kreditfaktura'
   if (documentType === 'proforma') return 'Proformafaktura'
+  if (documentType === 'quote') return 'Offert'
   if (documentType === 'delivery_note') return 'Följesedel'
   return 'Faktura'
 }
@@ -82,4 +83,17 @@ export function invoicePdfFilename({
   const suffix = [label, number, compactDate].filter(Boolean).join(' ') + '.pdf'
 
   return fitFilename(company, customer, suffix)
+}
+
+/**
+ * Filename for the betalningsbekräftelse (#1693): the paid re-render of a
+ * settled faktura. Deliberately not the invoice filename shape above, so the
+ * file can never be mistaken for the invoice that was sent. ASCII on purpose
+ * (no ä): the name travels as an email attachment to arbitrary mail clients.
+ *
+ * Example: `Betalningsbekraftelse-2621.pdf`.
+ */
+export function paymentConfirmationPdfFilename(invoiceNumber: string | null | undefined): string {
+  const number = safeFilenamePart(invoiceNumber, 'okand', MAX_NUMBER_PART_LENGTH).replace(/\s+/g, '-')
+  return `Betalningsbekraftelse-${number}.pdf`
 }

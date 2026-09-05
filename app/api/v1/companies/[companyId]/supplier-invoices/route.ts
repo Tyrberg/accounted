@@ -31,7 +31,8 @@ import {
 } from '@/lib/api/v1/pagination'
 import { registerEndpoint, listEnvelope, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
 import { CreateSupplierInvoiceSchema } from '@/lib/api/schemas'
 import {
@@ -39,6 +40,8 @@ import {
   supplierInvoiceSekAmounts,
 } from '@/lib/currency/supplier-invoice-rate'
 import { createSupplierInvoiceRegistrationEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
+import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
+import { isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
 import { reverseEntry } from '@/lib/bookkeeping/engine'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { eventBus } from '@/lib/events'
@@ -156,17 +159,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
       date_from: url.searchParams.get('date_from') ?? undefined,
       date_to: url.searchParams.get('date_to') ?? undefined,
     })
-    if (!filtersResult.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: filtersResult.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!filtersResult.success) return v1ValidationError(ctx, filtersResult.error)
     const filters = filtersResult.data
 
     // Sort by (created_at DESC, id ASC). created_at is the stable cursor
@@ -281,7 +274,7 @@ const SI_RESPONSE_COLUMNS =
   'id, supplier_id, arrival_number, supplier_invoice_number, invoice_date, due_date, received_date, delivery_date, status, currency, exchange_rate, subtotal, subtotal_sek, vat_amount, vat_amount_sek, total, total_sek, vat_treatment, reverse_charge, payment_reference, paid_amount, remaining_amount, is_credit_note, credited_invoice_id, registration_journal_entry_id, payment_journal_entry_id, notes, default_dimensions, created_at, updated_at'
 
 const SI_ITEMS_RESPONSE_COLUMNS =
-  'id, sort_order, description, quantity, unit, unit_price, line_total, account_number, vat_code, vat_rate, vat_amount, reverse_charge_rate, dimensions'
+  'id, sort_order, description, quantity, unit, unit_price, line_total, account_number, vat_code, vat_rate, vat_amount, reverse_charge_rate, apply_slp, dimensions'
 
 const SupplierInvoiceCreated = z.object({
   id: z.string().uuid(),
@@ -321,6 +314,7 @@ registerEndpoint({
     'Foreign currency: omit exchange_rate and the server fetches Riksbanken\'s rate for invoice_date (ML 8 kap 21-23 §). If no rate can be resolved the create is refused with 400 SI_FX_RATE_MISSING rather than stored unconverted: pass exchange_rate explicitly to proceed. A SEK invoice needs no rate and gets total_sek = total.',
     'exchange_rate is SEK per 1 unit of the invoice currency and must satisfy 0 < rate < 100000, the same bounds the supplier_invoices CHECK enforces. Out-of-range values return 400 VALIDATION_ERROR; passing an invoice total where a rate belongs is the usual cause.',
     'Project/cost-center tagging: pass default_dimensions ({"6":"P001"} = project, {"1":"KS01"} = kostnadsställe) for the whole invoice and/or items[].dimensions per line (per-line wins per key). The registration JE lines are tagged accordingly. When the company has the dimension registry enabled, unknown or archived codes are rejected with 400 DIMENSION_VALIDATION_FAILED — list valid codes via GET /dimensions.',
+    'Tjänstepension invoices (Avanza etc.): set items[].apply_slp=true on the 741x premium line and the registration JE also books särskild löneskatt (debit 7533 / credit 2514 at 24.26% of the line amount) beyond the payable: 2440 stays at the invoice total. apply_slp on a non-741x account returns 400 SI_CREATE_SLP_INVALID_ACCOUNT.',
   ],
   example: {
     request: {
@@ -367,6 +361,7 @@ interface ComputedItem {
   vat_rate: number
   vat_amount: number
   reverse_charge_rate: number | null
+  apply_slp: boolean
   dimensions: Record<string, string>
 }
 
@@ -412,6 +407,10 @@ function computeItemsAndTotals(input: z.infer<typeof CreateSupplierInvoiceSchema
       // line vat_rate is 0 (validated below); the engine self-assesses at this
       // rate, defaulting to 25% huvudregeln when null.
       reverse_charge_rate: item.reverse_charge_rate ?? null,
+      // Särskild löneskatt (SLP): booking injects the self-balancing
+      // 7533/2514 pair for this line. Validated in the POST handler
+      // (741x accounts only, never together with periodisering).
+      apply_slp: item.apply_slp === true,
       // Dimensions PR7: per-item bag, merged over the invoice's
       // default_dimensions on the expense line at booking.
       dimensions: item.dimensions ?? {},
@@ -439,29 +438,33 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
 
     const parsed = CreateSupplierInvoiceSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
+    const body = parsed.data
+
+    // Särskild löneskatt (SLP): the 7533/2514 pair is only lawful on 741x
+    // pension premiums and cannot be combined with periodisering on the same
+    // item. Same guards as POST /api/supplier-invoices.
+    if (body.items.some((it) => it.apply_slp && !isSlpPensionAccount(it.account_number))) {
+      return v1ErrorResponseFromCode('SI_CREATE_SLP_INVALID_ACCOUNT', ctx.log, {
         requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
       })
     }
-    const body = parsed.data
+    if (
+      body.items.some(
+        (it) =>
+          it.apply_slp &&
+          (it.accrual_period_start || it.accrual_period_end || it.accrual_balance_account),
+      )
+    ) {
+      return v1ErrorResponseFromCode('SI_CREATE_SLP_ACCRUAL', ctx.log, {
+        requestId: ctx.requestId,
+      })
+    }
 
     // Supplier lookup. Scoped to company; deny soft-archived.
     const { data: supplier, error: supplierErr } = await ctx.supabase
@@ -700,16 +703,20 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
 
-    // Determine accounting method: registration JE is only posted under accrual.
+    // Registration JE is only posted when the company books at issue:
+    // kontantmetoden books at payment, and defer_invoice_booking (#967)
+    // books via the explicit Bokför step. Same gate as POST /api/supplier-invoices.
     const { data: settings } = await ctx.supabase
       .from('company_settings')
-      .select('accounting_method')
+      .select('accounting_method, defer_invoice_booking')
       .eq('company_id', ctx.companyId!)
       .maybeSingle()
-    const accountingMethod = (settings as { accounting_method?: string } | null)?.accounting_method ?? 'accrual'
+    const bookingSettings = settings as
+      | { accounting_method?: string | null; defer_invoice_booking?: boolean | null }
+      | null
 
     let registrationJournalEntryId: string | null = null
-    if (accountingMethod === 'accrual') {
+    if (booksInvoicesOnIssue(bookingSettings)) {
       try {
         const entry = await createSupplierInvoiceRegistrationEntry(
           ctx.supabase,

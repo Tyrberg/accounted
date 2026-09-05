@@ -20,7 +20,8 @@ import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { OpeningBalancesFieldsSchema } from '@/lib/api/schemas'
 import { getOpeningBalances, setOpeningBalancesBulk } from '@/lib/salary/opening-balances'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
@@ -33,6 +34,7 @@ const OpeningBalancesResponse = z.object({
   ytd_tax: z.number(),
   ytd_net: z.number(),
   vacation_paid_days_remaining: z.number(),
+  vacation_days_taken_this_year: z.number(),
   vacation_saved_days_by_year: z.record(z.string(), z.number()),
   opening_semester_liability: z.number(),
   opening_semester_liability_avgifter: z.number(),
@@ -114,7 +116,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/employees/:id/opening-balances',
   summary: 'Set an employee\'s payroll cutover opening balances.',
   description:
-    'Full-replace upsert of the cutover state: YTD gross/tax/net for the cutover year, paid vacation days remaining, sparade dagar keyed by origin year (5-year rule), opening semesterlöneskuld SEK (+avgifter), and karens periods not covered by imported absence rows. cutover_date must be the first of a month in the current or previous year, on/after employment_start.',
+    'Full-replace upsert of the cutover state: YTD gross/tax/net for the cutover year, paid vacation days remaining, paid days already taken this vacation year, sparade dagar keyed by origin year (5-year rule), opening semesterlöneskuld SEK (+avgifter), and karens periods not covered by imported absence rows. cutover_date must be the first of a month in the current or previous year, on/after employment_start.',
   useWhen:
     'Onboarding one employee during a mid-year migration from Fortnox/Visma/etc. For whole-company onboarding, prefer the bulk PUT /employees/opening-balances.',
   doNotUseFor:
@@ -163,28 +165,12 @@ export const PUT = withApiV1<{ params: Promise<{ companyId: string; id: string }
       })
     }
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
 
     const parsed = OpeningBalancesFieldsSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
 
     // The per-employee PUT is the bulk handler with one item: one validation
     // and one upsert path to maintain.

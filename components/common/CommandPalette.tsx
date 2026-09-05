@@ -8,7 +8,6 @@ import {
   ArrowLeftRight,
   Users,
   Wallet,
-  Building2,
   BookOpen,
   ListTree,
   BarChart3,
@@ -22,10 +21,13 @@ import {
   Settings,
   HelpCircle,
   ArrowRight,
+  Scale,
   type LucideIcon,
+  Truck,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useCompany } from '@/contexts/CompanyContext'
+import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
 import { requiredCapabilityForExtension } from '@/lib/entitlements/keys'
 
 type Entry = {
@@ -47,7 +49,7 @@ const ACTION_ENTRIES: Entry[] = [
 
 const PAGE_ENTRIES: Entry[] = [
   { id: 'kunder', label: 'Kunder', icon: Users, href: '/customers' },
-  { id: 'leverantörer', label: 'Leverantörer', icon: Building2, href: '/suppliers' },
+  { id: 'leverantörer', label: 'Leverantörer', icon: Truck, href: '/suppliers' },
   { id: 'kundfakturor', label: 'Kundfakturor', icon: ReceiptText, href: '/invoices', keywords: 'fakturor fakturering invoices kundfaktura' },
   { id: 'leverantörsfakturor', label: 'Leverantörsfakturor', icon: Wallet, href: '/supplier-invoices' },
   { id: 'bokföring', label: 'Bokföring', icon: BookOpen, href: '/bookkeeping', keywords: 'verifikat journal ledger' },
@@ -58,9 +60,17 @@ const PAGE_ENTRIES: Entry[] = [
   { id: 'rapport-balansrapport', label: 'Visa rapport: Balansrapport', icon: BarChart3, href: '/reports/balansrapport', keywords: 'rapport balans tillgångar skulder saldo per konto' },
   { id: 'rapport-saldobalans', label: 'Visa rapport: Saldobalans', icon: BarChart3, href: '/reports/trial-balance', keywords: 'rapport saldobalans trial balance saldo per konto' },
   { id: 'rapport-moms', label: 'Visa rapport: Momsdeklaration', icon: BarChart3, href: '/reports/vat-declaration', keywords: 'rapport moms vat deklaration' },
-  { id: 'rapport-huvudbok', label: 'Visa rapport: Huvudbok', icon: BookOpen, href: '/reports/huvudbok', keywords: 'rapport huvudbok ledger general konto saldo transaktioner per konto kontoutdrag kontoanalys kontokort kontohistorik balance account statement transactions' },
+  // "verifikat" is the word a bookkeeper reaches for ("verifikat per konto"),
+  // and matches() requires every typed token, so leaving it out made the exact
+  // phrase return nothing even though this report is precisely the answer.
+  // Deliberately NOT carrying "stäm av"/"avstämning" here: the palette
+  // auto-selects the first hit and huvudbok is listed above Bankavstämning, so
+  // those words would hijack Enter from the reconciliation page. They live in
+  // ReportDescriptor.searchTerms instead, where the library shows a list.
+  { id: 'rapport-huvudbok', label: 'Visa rapport: Huvudbok', icon: BookOpen, href: '/reports/huvudbok', keywords: 'rapport huvudbok ledger general konto saldo transaktioner per konto verifikat verifikationer verifikationer per konto kontoutdrag kontoanalys kontokort kontohistorik balance account statement transactions vouchers' },
   { id: 'rapport-kundreskontra', label: 'Visa rapport: Kundreskontra', icon: Users, href: '/reports/kundreskontra', keywords: 'rapport kundreskontra ar kundfordringar' },
-  { id: 'rapport-bankavstamning', label: 'Bankavstämning', hint: 'Stäm av bank mot bokföring', icon: ArrowLeftRight, href: '/reports/bank-reconciliation', keywords: 'avstämning stäm av bank matcha banktransaktioner reconcile reconciliation 1930' },
+  { id: 'avstamning', label: 'Avstämning', hint: 'Stäm av bank och skattekonto', icon: Scale, href: '/reconciliation', keywords: 'avstämning stäm av bank skattekonto matcha reconcile reconciliation 1630 1930' },
+  { id: 'rapport-bankavstamning', label: 'Bankavstämning', hint: 'Stäm av bank mot bokföring', icon: ArrowLeftRight, href: '/reconciliation', keywords: 'avstämning stäm av bank matcha banktransaktioner reconcile reconciliation 1930' },
   { id: 'importera', label: 'Importera', icon: Upload, href: '/import' },
   { id: 'granskning', label: 'Granskning', icon: ClipboardCheck, href: '/pending', keywords: 'pending review' },
   { id: 'löner', label: 'Löner', icon: HandCoins, href: '/salary' },
@@ -86,6 +96,7 @@ export default function CommandPalette({ initialOpen = false }: { initialOpen?: 
   const [activeIndex, setActiveIndex] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const { capabilities } = useCompany()
+  const { identity } = useAgentSheet()
 
   // Drop entries that jump to a paywalled extension workspace the active
   // company can't reach (e.g. the AI-only Dokumentinkorg). The page itself is
@@ -136,27 +147,31 @@ export default function CommandPalette({ initialOpen = false }: { initialOpen?: 
     return q ? visible.filter(e => matches(e, q)) : visible.slice(0, 6)
   }, [q, allowedByCapability])
 
-  const annaFallback: Entry | null = q && filteredActions.length === 0 && filteredPages.length === 0
-    ? {
-        id: 'anna-fallback',
-        label: `Fråga Anna: "${query.trim()}"`,
-        icon: Wand2,
-        href: `/chat/new?prompt=${encodeURIComponent(query.trim())}`,
-      }
-    : q
+  // The hand-off-to-assistant entries use the agent name the user chose in
+  // /onboarding/agent, and hide entirely until that onboarding is done: the
+  // same gate as the nav entry and the FAB.
+  const assistantName = identity.displayName?.trim() || 'assistenten'
+  const assistantFallback: Entry | null = !identity.isVerified || !q
+    ? null
+    : filteredActions.length === 0 && filteredPages.length === 0
       ? {
-          id: 'anna-followup',
-          label: `Fråga Anna istället: "${query.trim()}"`,
+          id: 'assistant-fallback',
+          label: `Fråga ${assistantName}: "${query.trim()}"`,
           icon: Wand2,
           href: `/chat/new?prompt=${encodeURIComponent(query.trim())}`,
         }
-      : null
+      : {
+          id: 'assistant-followup',
+          label: `Fråga ${assistantName} istället: "${query.trim()}"`,
+          icon: Wand2,
+          href: `/chat/new?prompt=${encodeURIComponent(query.trim())}`,
+        }
 
   const flatEntries: Entry[] = [
-    ...(annaFallback && filteredActions.length === 0 && filteredPages.length === 0 ? [annaFallback] : []),
+    ...(assistantFallback && filteredActions.length === 0 && filteredPages.length === 0 ? [assistantFallback] : []),
     ...filteredActions,
     ...filteredPages,
-    ...(annaFallback && (filteredActions.length > 0 || filteredPages.length > 0) ? [annaFallback] : []),
+    ...(assistantFallback && (filteredActions.length > 0 || filteredPages.length > 0) ? [assistantFallback] : []),
   ]
 
   function commit(entry: Entry) {
@@ -237,13 +252,13 @@ export default function CommandPalette({ initialOpen = false }: { initialOpen?: 
                 })}
               </Section>
             )}
-            {annaFallback && (
-              <Section title="Anna">
+            {assistantFallback && (
+              <Section title={assistantName}>
                 <Row
-                  entry={annaFallback}
-                  active={flatEntries.indexOf(annaFallback) === activeIndex}
-                  onSelect={() => commit(annaFallback)}
-                  onHover={() => setActiveIndex(flatEntries.indexOf(annaFallback))}
+                  entry={assistantFallback}
+                  active={flatEntries.indexOf(assistantFallback) === activeIndex}
+                  onSelect={() => commit(assistantFallback)}
+                  onHover={() => setActiveIndex(flatEntries.indexOf(assistantFallback))}
                 />
               </Section>
             )}

@@ -5,6 +5,11 @@ import {
   OAUTH_TIMEOUT_MS,
   SKATTEVERKET_EXCHANGE_TIMEOUT_MS,
 } from '@/lib/http/fetch-with-timeout'
+import {
+  skatteverketConnectorMode,
+  exchangeConnectorCode,
+  refreshConnectorToken,
+} from './connector-mode'
 
 /**
  * Skatteverket OAuth2 helpers for the `per` (BankID) flow.
@@ -15,6 +20,15 @@ import {
  *
  * The `per` flow is user-facing BankID authentication.
  * No mTLS required (unlike the `org` flow).
+ *
+ * Connector mode (self-host with GNUBOK_CONNECTOR_KEY and no own SKV
+ * credentials): the token functions route through the hosted broker's
+ * /api/connect/skv/oauth/token instead; client_id/client_secret never leave
+ * the instance because the instance never has them (the broker holds Arcim's
+ * registered client). buildAuthorizeUrl stays direct-only: connector-mode
+ * authorization starts via startConnectorAuthorization (connector-mode.ts),
+ * which returns the broker-built URL plus the connector state and hosted
+ * redirect_uri the caller must persist for the exchange.
  */
 
 const DEFAULT_OAUTH_BASE_URL = 'https://peroauth2.test.skatteverket.se/oauth2/v1/per'
@@ -38,7 +52,25 @@ const DEFAULT_OAUTH_BASE_URL = 'https://peroauth2.test.skatteverket.se/oauth2/v1
 //   - `skattekonto` is NOT a real SKV scope name: SKV silently drops it
 //                   from every grant. Kept only so a future SKV rename in
 //                   our favor costs nothing.
-const DEFAULT_SCOPES = 'momsdeklaration inkforetag skahmst skattekonto ska agd'
+//
+// AGI needs TWO scopes, one per backing API, and missing the second one is
+// invisible until the very last step of a filing:
+//   - `agd`                  = arbetsgivardeklaration/inlamning (POST underlag,
+//                              kontrollresultat, spara, skapaGranskningsunderlag).
+//   - `agdredovisningperiod` = arbetsgivardeklaration/hanteraredovisningsperiod
+//                              (kvittenser, las, lasUpp). Note the spelling:
+//                              "redovisningperiod", no genitive s, exactly as
+//                              SKV registers it. Added 2026-08-13 after a real
+//                              prod filing signed fine and then failed on
+//                              "Hämta kvittens" with 403 {"error": "The
+//                              required scopes are not authorized"}: the token
+//                              carried `agd` only, so the hantera API refused
+//                              while inlämning kept working. Same body as the
+//                              APIGW subscription gap (#973), which is why the
+//                              gateway/token distinction has to be made with
+//                              the APIGW client, not from this string alone.
+const DEFAULT_SCOPES =
+  'momsdeklaration inkforetag skahmst skattekonto ska agd agdredovisningperiod'
 
 function getOAuthBaseUrl(): string {
   return process.env.SKATTEVERKET_OAUTH_BASE_URL || DEFAULT_OAUTH_BASE_URL
@@ -106,7 +138,32 @@ export async function exchangeCodeForTokens(
   code: string,
   redirectUri: string,
   codeVerifier?: string,
+  connectorState?: string,
 ): Promise<SkatteverketTokens> {
+  const connector = skatteverketConnectorMode()
+  if (connector) {
+    if (!connectorState) {
+      // A flow started before connector mode was enabled (or a state row that
+      // lost its connector_state) cannot be exchanged through the broker.
+      throw new Error(
+        'connector_state saknas: anslutningsflödet startades inte via connectorn. Starta om anslutningen.',
+      )
+    }
+    const data = await exchangeConnectorCode(connector, {
+      code,
+      redirectUri,
+      codeVerifier,
+      connectorState,
+    })
+    return {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token ?? null,
+      expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
+      refresh_count: 0,
+      scope: data.scope ?? DEFAULT_SCOPES,
+    }
+  }
+
   const base = getOAuthBaseUrl()
 
   const body = new URLSearchParams({
@@ -158,6 +215,25 @@ export async function refreshAccessToken(
   refreshToken: string,
   previousRefreshCount: number
 ): Promise<SkatteverketTokens> {
+  const connector = skatteverketConnectorMode()
+  if (connector) {
+    // Broker refresh rotates the hosted ledger's token hashes. Terminal
+    // failures come back as broker dialects api-client classifies as
+    // SESSION_EXPIRED: 401 CONNECTOR_SKV_REFRESH_DEAD (SKV declared the
+    // refresh token dead: the dominant outcome, per-flow tokens live 65
+    // minutes) and 404 CONNECTOR_NOT_OWNED (the ledger no longer vouches for
+    // it). The generic 502 stays a raw error (transient SKV outage must not
+    // flag the row for reconnect, the #1155 lesson).
+    const data = await refreshConnectorToken(connector, refreshToken)
+    return {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token ?? null,
+      expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
+      refresh_count: previousRefreshCount + 1,
+      scope: data.scope ?? '',
+    }
+  }
+
   const base = getOAuthBaseUrl()
 
   const body = new URLSearchParams({

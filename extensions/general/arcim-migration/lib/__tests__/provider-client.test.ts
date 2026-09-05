@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 
-const { mockBlGet } = vi.hoisted(() => ({ mockBlGet: vi.fn() }))
+const { mockBlGet, mockBokioGetCompany, mockWintGet, mockLoginWint } = vi.hoisted(() => ({
+  mockBlGet: vi.fn(),
+  mockBokioGetCompany: vi.fn(),
+  mockWintGet: vi.fn(),
+  mockLoginWint: vi.fn(),
+}))
 
 vi.mock('@/lib/supabase/server', () => ({
   createServiceClient: vi.fn(),
@@ -29,11 +34,47 @@ vi.mock('@/lib/providers/bjornlunden/client', async (importOriginal) => {
   }
 })
 
+// Same shape as the BL mock above: keep the real BokioApiError for the
+// instanceof checks, swap the client so the /companies probe is controllable.
+vi.mock('@/lib/providers/bokio/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/providers/bokio/client')>()
+  return {
+    ...actual,
+    BokioClient: vi.fn().mockImplementation(function mockClient() {
+      return { getCompany: mockBokioGetCompany }
+    }),
+  }
+})
+
+// WINT: keep the real WintApiError / WintLoginRejectedError classes (the
+// instanceof branches in provider-client depend on them), swap the network.
+vi.mock('@/lib/providers/wint/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/providers/wint/client')>()
+  return {
+    ...actual,
+    WintClient: vi.fn().mockImplementation(function mockClient() {
+      return { get: mockWintGet }
+    }),
+  }
+})
+
+vi.mock('@/lib/providers/wint/oauth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/providers/wint/oauth')>()
+  return {
+    ...actual,
+    loginWint: mockLoginWint,
+  }
+})
+
 import { createServiceClient } from '@/lib/supabase/server'
 import { BjornLundenApiError } from '@/lib/providers/bjornlunden/client'
+import { BokioApiError } from '@/lib/providers/bokio/client'
+import { WintApiError } from '@/lib/providers/wint/client'
+import { WintLoginRejectedError } from '@/lib/providers/wint/oauth'
 import {
   submitProviderToken,
   ProviderTokenInvalidError,
+  ProviderCompanyMismatchError,
   ConsentNotFoundError,
 } from '../provider-client'
 
@@ -65,12 +106,190 @@ describe('submitProviderToken', () => {
 
   it('stores tokens when the consent belongs to the caller company', async () => {
     mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+    mock.enqueue({ data: { org_number: '5560125790' } }) // target company lookup
+    mock.enqueue({ data: null }) // consent label update
     mock.enqueue({ data: null }) // token upsert
+    mockBokioGetCompany.mockResolvedValueOnce({
+      name: 'Testbolaget AB',
+      organizationNumber: '5560125790',
+    })
 
     const result = await submitProviderToken('consent-1', 'bokio', 'tok', 'bokio-guid', 'company-A')
 
     expect(result).toEqual({ success: true, consentId: 'consent-1' })
-    expect(tablesTouched()).toEqual(['provider_consents', 'provider_consent_tokens'])
+    expect(tablesTouched()).toEqual([
+      'provider_consents',
+      'companies',
+      'provider_consents',
+      'provider_consent_tokens',
+    ])
+  })
+
+  // ── Bokio company-identity guard ──────────────────────────────────
+  //
+  // The failure being prevented: a valid Bokio token plus a company id for the
+  // WRONG company imports a foreign legal entity's customers, suppliers and
+  // invoices into this ledger with no error at all.
+
+  it('refuses to store the token when the Bokio company org number differs from the target company', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+    mock.enqueue({ data: { org_number: '5560125790' } }) // target company
+    mockBokioGetCompany.mockResolvedValueOnce({
+      name: 'Någon Annans Bolag AB',
+      organizationNumber: '5566778899', // a different legal entity
+    })
+
+    const err: unknown = await submitProviderToken(
+      'consent-1',
+      'bokio',
+      'tok',
+      'bokio-guid',
+      'company-A',
+    ).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ProviderCompanyMismatchError)
+    expect(err).toMatchObject({
+      expectedOrgNumber: '5560125790',
+      actualOrgNumber: '5566778899',
+      actualCompanyName: 'Någon Annans Bolag AB',
+    })
+
+    // Nothing was stored and the consent was NOT labelled: the connection must
+    // not exist in any form, or the next step would import from it.
+    expect(tablesTouched()).not.toContain('provider_consent_tokens')
+    expect(tablesTouched()).toEqual(['provider_consents', 'companies'])
+  })
+
+  it('compares org numbers canonically, so formatting differences are not a mismatch', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mock.enqueue({ data: { org_number: '5560125790' } }) // stored 10-digit
+    mock.enqueue({ data: null }) // consent label update
+    mock.enqueue({ data: null }) // token upsert
+    // Same company, hyphenated and with the century prefix Bokio may return.
+    mockBokioGetCompany.mockResolvedValueOnce({
+      name: 'Testbolaget AB',
+      organizationNumber: '556012-5790',
+    })
+
+    await expect(
+      submitProviderToken('consent-1', 'bokio', 'tok', 'bokio-guid', 'company-A'),
+    ).resolves.toEqual({ success: true, consentId: 'consent-1' })
+
+    expect(tablesTouched()).toContain('provider_consent_tokens')
+  })
+
+  it('still connects when an org number is missing on either side (absence is not evidence of mismatch)', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mock.enqueue({ data: { org_number: null } }) // company has no org number
+    mock.enqueue({ data: null }) // consent label update
+    mock.enqueue({ data: null }) // token upsert
+    mockBokioGetCompany.mockResolvedValueOnce({
+      name: 'Testbolaget AB',
+      organizationNumber: '5560125790',
+    })
+
+    await expect(
+      submitProviderToken('consent-1', 'bokio', 'tok', 'bokio-guid', 'company-A'),
+    ).resolves.toEqual({ success: true, consentId: 'consent-1' })
+
+    // Labelled anyway: the wizard showing WHICH company was linked is what
+    // lets the user catch the mistake themselves in this case.
+    expect(tablesTouched()).toContain('provider_consent_tokens')
+  })
+
+  it('maps a 404 from the Bokio probe to a company-specific failure', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    // getCompany() maps 404 to null: an unknown GUID, not an outage.
+    mockBokioGetCompany.mockResolvedValueOnce(null)
+
+    const err: unknown = await submitProviderToken(
+      'consent-1',
+      'bokio',
+      'tok',
+      'bad-guid',
+      'company-A',
+    ).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ProviderTokenInvalidError)
+    expect(err).toMatchObject({ kind: 'company-not-found' })
+
+    expect(tablesTouched()).not.toContain('provider_consent_tokens')
+  })
+
+  it.each([401, 403])('maps a %s from the Bokio probe to invalid credentials', async (status) => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mockBokioGetCompany.mockRejectedValueOnce(
+      new BokioApiError(`Bokio API error: ${status}`, status),
+    )
+
+    const err: unknown = await submitProviderToken(
+      'consent-1',
+      'bokio',
+      'tok',
+      'bokio-guid',
+      'company-A',
+    ).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ProviderTokenInvalidError)
+    expect(err).toMatchObject({ kind: 'credentials' })
+  })
+
+  it('trims the token and company id and removes a pasted Bearer prefix before probing or storing', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mock.enqueue({ data: { org_number: '5560125790' } })
+    mock.enqueue({ data: null })
+    mock.enqueue({ data: null })
+    mockBokioGetCompany.mockResolvedValueOnce({
+      name: 'Testbolaget AB',
+      organizationNumber: '5560125790',
+    })
+
+    await submitProviderToken(
+      'consent-1',
+      'bokio',
+      '  Bearer copied-token==\r\n',
+      '  bokio-guid  ',
+      'company-A',
+    )
+
+    expect(mockBokioGetCompany).toHaveBeenCalledWith('copied-token==', 'bokio-guid')
+    expect(mock.findCall('provider_consent_tokens', 'upsert')?.[0]).toMatchObject({
+      access_token: 'copied-token==',
+      provider_company_id: 'bokio-guid',
+    })
+  })
+
+  it('does NOT map another Bokio 4xx to invalid credentials', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mockBokioGetCompany.mockRejectedValueOnce(new BokioApiError('Bokio API error: 400', 400))
+
+    const err: unknown = await submitProviderToken(
+      'consent-1',
+      'bokio',
+      'tok',
+      'bokio-guid',
+      'company-A',
+    ).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(BokioApiError)
+    expect(err).not.toBeInstanceOf(ProviderTokenInvalidError)
+  })
+
+  it('does NOT map a transient 503 from the Bokio probe to invalid credentials', async () => {
+    mock.enqueue({ data: [{ id: 'consent-1' }] })
+    mockBokioGetCompany.mockRejectedValueOnce(new BokioApiError('Bokio API error: 503', 503))
+
+    const err: unknown = await submitProviderToken(
+      'consent-1',
+      'bokio',
+      'tok',
+      'bokio-guid',
+      'company-A',
+    ).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(BokioApiError)
+    expect(err).not.toBeInstanceOf(ProviderTokenInvalidError)
+    expect(tablesTouched()).not.toContain('provider_consent_tokens')
   })
 
   // ── BL /details probe error classification ────────────────────────
@@ -154,5 +373,110 @@ describe('submitProviderToken', () => {
       'provider_consents',
       'provider_consent_tokens',
     ])
+  })
+
+  // ── WINT login exchange ───────────────────────────────────────────
+  //
+  // WINT has no API keys: the wizard sends mail (as providerCompanyId) +
+  // password (as apiToken). The password is exchanged for a token pair and
+  // must never reach the database.
+
+  describe('wint', () => {
+    const wintCompany = {
+      Id: 4711,
+      Name: 'Wintbolaget AB',
+      Org: '556012-5790',
+    }
+
+    const loginOk = () =>
+      mockLoginWint.mockResolvedValueOnce({
+        access_token: 'wint-jwt',
+        refresh_token: 'wint-refresh',
+        token_type: 'Bearer',
+        expires_in: 900,
+      })
+
+    it('exchanges the login, labels the consent and stores the token pair with the WINT company id', async () => {
+      mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+      mock.enqueue({ data: { org_number: '5560125790' } }) // target company
+      mock.enqueue({ data: null }) // consent label update
+      mock.enqueue({ data: null }) // token upsert
+      loginOk()
+      mockWintGet.mockResolvedValueOnce(wintCompany)
+
+      const result = await submitProviderToken('consent-1', 'wint', 'hemligt', 'user@bolag.se', 'company-A')
+
+      expect(result).toEqual({ success: true, consentId: 'consent-1' })
+      expect(mockLoginWint).toHaveBeenCalledWith('user@bolag.se', 'hemligt')
+      expect(tablesTouched()).toEqual([
+        'provider_consents',
+        'companies',
+        'provider_consents',
+        'provider_consent_tokens',
+      ])
+      // The stored row carries the token pair and the WINT company id; the
+      // login mail and password must never reach the database.
+      const upsert = mock.findCall('provider_consent_tokens', 'upsert')?.[0] as Record<string, unknown>
+      expect(upsert).toMatchObject({
+        provider: 'wint',
+        access_token: 'wint-jwt',
+        refresh_token: 'wint-refresh',
+        provider_company_id: '4711',
+      })
+      expect(JSON.stringify(upsert)).not.toContain('user@bolag.se')
+      expect(JSON.stringify(upsert)).not.toContain('hemligt')
+    })
+
+    it('rejects a login WINT refused (WrongUsernameOrPassword) without writing tokens', async () => {
+      mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+      mockLoginWint.mockRejectedValueOnce(new WintLoginRejectedError('WrongUsernameOrPassword'))
+
+      const err: unknown = await submitProviderToken(
+        'consent-1', 'wint', 'fel-lösenord', 'user@bolag.se', 'company-A',
+      ).catch((e: unknown) => e)
+
+      expect(err).toBeInstanceOf(ProviderTokenInvalidError)
+      expect((err as Error).message).toContain('WrongUsernameOrPassword')
+      expect(tablesTouched()).toEqual(['provider_consents'])
+    })
+
+    it('requires a login e-mail in the companyId field', async () => {
+      mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+
+      const err: unknown = await submitProviderToken(
+        'consent-1', 'wint', 'lösenord', undefined, 'company-A',
+      ).catch((e: unknown) => e)
+
+      expect(err).toBeInstanceOf(ProviderTokenInvalidError)
+      expect(mockLoginWint).not.toHaveBeenCalled()
+    })
+
+    it('refuses to store tokens when the WINT company org number differs from the target company', async () => {
+      mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+      mock.enqueue({ data: { org_number: '5566778899' } }) // a DIFFERENT target company
+      loginOk()
+      mockWintGet.mockResolvedValueOnce(wintCompany)
+
+      const err: unknown = await submitProviderToken(
+        'consent-1', 'wint', 'hemligt', 'user@bolag.se', 'company-A',
+      ).catch((e: unknown) => e)
+
+      expect(err).toBeInstanceOf(ProviderCompanyMismatchError)
+      expect((err as ProviderCompanyMismatchError).actualOrgNumber).toBe('5560125790')
+      // No token upsert, no consent label write
+      expect(tablesTouched()).toEqual(['provider_consents', 'companies'])
+    })
+
+    it('rethrows transient login failures (5xx) as generic errors, not invalid credentials', async () => {
+      mock.enqueue({ data: [{ id: 'consent-1' }] }) // ownership check
+      mockLoginWint.mockRejectedValueOnce(new WintApiError('WINT login failed: 503', 503))
+
+      const err: unknown = await submitProviderToken(
+        'consent-1', 'wint', 'hemligt', 'user@bolag.se', 'company-A',
+      ).catch((e: unknown) => e)
+
+      expect(err).toBeInstanceOf(WintApiError)
+      expect(err).not.toBeInstanceOf(ProviderTokenInvalidError)
+    })
   })
 })

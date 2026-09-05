@@ -26,7 +26,7 @@ import { z } from 'zod'
 import { accepted } from '@/lib/api/v1/response'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
 import {
   startOperation,
   completeOperation,
@@ -153,6 +153,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
         importOpeningBalances: z.boolean().optional().default(true),
         importTransactions: z.boolean().optional().default(true),
         voucherSeries: z.string().min(1).max(2).optional().default('A'),
+        // Series for the Ingående balanser voucher (issue #1882). No default
+        // here: executeSIEImport picks a series the file's vouchers do not
+        // use, so the IB entry never shifts the file's own numbering.
+        openingBalanceSeries: z.string().min(1).max(2).optional(),
         updateAccountNames: z.boolean().optional().default(true),
       })
       // OWASP V4.5: reject unknown keys so a future schema-extension
@@ -161,17 +165,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       // belt-and-suspenders.
       .strict()
       .safeParse(parsedOptions)
-    if (!optionsParse.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: optionsParse.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!optionsParse.success) return v1ValidationError(ctx, optionsParse.error)
     const options = optionsParse.data
 
     // Decode + parse + hash. These are all sync / fast: done before
@@ -294,6 +288,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           importOpeningBalances: options.importOpeningBalances,
           importTransactions: options.importTransactions,
           voucherSeries: options.voucherSeries,
+          openingBalanceSeries: options.openingBalanceSeries,
           updateAccountNames: options.updateAccountNames,
         },
       )

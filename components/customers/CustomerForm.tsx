@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react'
 import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { useTranslations } from 'next-intl'
+import { useLocale, useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -16,10 +16,22 @@ import { Loader2, CheckCircle, XCircle, Lock } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import {
+  EMAIL_PATTERN,
+  MAX_INVOICE_EMAIL_COPY_RECIPIENTS,
+  parseInvoiceRecipientText,
+} from '@/lib/invoices/email-recipients'
+import {
   PERSONAL_NUMBER_INPUT_RE,
   UNDECRYPTABLE_PERSONAL_NUMBER_MASK,
   isMaskedPersonalNumber,
 } from '@/lib/customers/mask-personal-number'
+import { looksLikeSwedishPersonalNumber } from '@/lib/customers/personal-number-shape'
+import {
+  COUNTRY_CONSISTENCY_MESSAGES,
+  checkCountryConsistency,
+  getCountryOptions,
+  normalizeCountryCode,
+} from '@/lib/vat/country-codes'
 import type { CreateCustomerInput } from '@/types'
 
 interface CustomerFormProps {
@@ -36,6 +48,8 @@ export default function CustomerForm({
   const { canWrite } = useCanWrite()
   const { toast } = useToast()
   const t = useTranslations('form_customer')
+  const locale = useLocale() === 'en' ? 'en' : 'sv'
+  const countryOptions = useMemo(() => getCountryOptions(locale), [locale])
   const [isValidatingVat, setIsValidatingVat] = useState(false)
   const [vatValidationResult, setVatValidationResult] = useState<{
     valid: boolean
@@ -46,13 +60,19 @@ export default function CustomerForm({
     name: z.string().min(1, t('name_required')),
     customer_type: z.enum(['individual', 'swedish_business', 'eu_business', 'non_eu_business']),
     customer_number: z.string().trim().max(32, t('customer_number_too_long')).optional(),
+    contact_person: z.string().max(200, t('contact_person_too_long')).optional(),
     email: z.string().email(t('email_invalid')).optional().or(z.literal('')),
     phone: z.string().optional(),
+    invoice_email_cc_addresses: z.string().optional(),
+    invoice_email_bcc_addresses: z.string().optional(),
     address_line1: z.string().optional(),
     address_line2: z.string().optional(),
     postal_code: z.string().optional(),
     city: z.string().optional(),
-    country: z.string().optional(),
+    // ISO 3166-1 alpha-2. A row from before 2026-09 can still carry a name
+    // the backfill could not map; it is shown as-is in the picker and has to
+    // be replaced before the form saves.
+    country: z.string().refine((v) => normalizeCountryCode(v) !== null, t('country_invalid')),
     org_number: z.string().optional(),
     vat_number: z.string().optional(),
     // Accepts a plaintext personnummer or either mask the API returns. The
@@ -66,9 +86,69 @@ export default function CustomerForm({
       .optional()
       .or(z.literal('')),
     language: z.enum(['sv', 'en']).optional(),
-    default_payment_terms: z.number().min(1).optional(),
+    // 0 is a real value (betalning direkt). The old min(1) made the form
+    // unsavable on "0" with no message at all (issue #2070); now the rule is
+    // whole days 0-365 and the field says so when it does not hold.
+    default_payment_terms: z
+      .number({ message: t('payment_terms_invalid') })
+      .int(t('payment_terms_invalid'))
+      .min(0, t('payment_terms_invalid'))
+      .max(365, t('payment_terms_invalid')),
     notes: z.string().optional(),
-  }), [t])
+  }).superRefine((customer, ctx) => {
+    // Country vs customer type vs VAT prefix (#2025): an EU customer with
+    // land Sverige got reverse charge and nothing objected until the
+    // periodisk sammanställning, after the invoice was sent. The API refuses
+    // the same combinations with a 400; saying it here keeps the fix one
+    // click away instead of one failed save away.
+    const countryIssue = checkCountryConsistency({
+      partyType: customer.customer_type,
+      country: customer.country,
+      vatNumber: customer.vat_number,
+    })
+    if (countryIssue) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['country'],
+        message: COUNTRY_CONSISTENCY_MESSAGES[countryIssue][locale],
+      })
+    }
+    // A personnummer entered as a business org number would be shown
+    // unmasked in every list (only individual customers are masked).
+    if (
+      customer.org_number &&
+      customer.customer_type !== 'individual' &&
+      looksLikeSwedishPersonalNumber(customer.org_number)
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['org_number'],
+        message: t('org_number_looks_personal'),
+      })
+    }
+    const cc = parseInvoiceRecipientText(customer.invoice_email_cc_addresses ?? '')
+    const bcc = parseInvoiceRecipientText(customer.invoice_email_bcc_addresses ?? '')
+    for (const [field, addresses] of [
+      ['invoice_email_cc_addresses', cc],
+      ['invoice_email_bcc_addresses', bcc],
+    ] as const) {
+      const invalid = addresses.find((address) => !EMAIL_PATTERN.test(address))
+      if (invalid) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: t('invoice_email_invalid', { address: invalid }),
+        })
+      }
+    }
+    if (cc.length + bcc.length > MAX_INVOICE_EMAIL_COPY_RECIPIENTS) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['invoice_email_cc_addresses'],
+        message: t('invoice_email_too_many', { count: MAX_INVOICE_EMAIL_COPY_RECIPIENTS }),
+      })
+    }
+  }), [t, locale])
 
   type FormData = z.infer<typeof schema>
 
@@ -84,23 +164,33 @@ export default function CustomerForm({
       name: initialData?.name || '',
       customer_type: initialData?.customer_type || 'swedish_business',
       customer_number: initialData?.customer_number || '',
+      contact_person: initialData?.contact_person ?? '',
       email: initialData?.email || '',
       phone: initialData?.phone || '',
+      invoice_email_cc_addresses: initialData?.invoice_email_cc_addresses?.join('\n') ?? '',
+      invoice_email_bcc_addresses: initialData?.invoice_email_bcc_addresses?.join('\n') ?? '',
       address_line1: initialData?.address_line1 || '',
       postal_code: initialData?.postal_code || '',
       city: initialData?.city || '',
-      country: initialData?.country || 'Sweden',
+      country: normalizeCountryCode(initialData?.country) ?? initialData?.country ?? 'SE',
       org_number: initialData?.org_number || '',
       vat_number: initialData?.vat_number || '',
       personal_number: initialData?.personal_number || '',
       language: initialData?.language || 'sv',
-      default_payment_terms: initialData?.default_payment_terms || 30,
+      // ?? not ||: a stored 0 (betalning direkt) must not reopen as 30.
+      default_payment_terms: initialData?.default_payment_terms ?? 30,
       notes: initialData?.notes || '',
     },
   })
 
   const customerType = watch('customer_type')
   const vatNumber = watch('vat_number')
+  const countryValue = watch('country')
+  // A stored value the picker does not list (an unmapped legacy name, or a
+  // code outside the curated list) still has to be visible, or the field
+  // would look empty while holding something.
+  const countryValueUnlisted =
+    countryValue && !countryOptions.some((option) => option.code === countryValue)
   // The stored value could not be decrypted. The field is editable (typing a
   // fresh personnummer replaces it); say so, because the placeholder on its own
   // reads like a rendering fault.
@@ -161,10 +251,25 @@ export default function CustomerForm({
   }
 
   const onFormSubmit = (data: FormData) => {
+    const {
+      invoice_email_cc_addresses: ccText,
+      invoice_email_bcc_addresses: bccText,
+      ...customerData
+    } = data
+    const isEditing = initialData !== undefined
     const payload: CreateCustomerInput = {
-      ...data,
+      ...customerData,
+      // NULL means never configured and lets a migration enrich the row.
+      // Empty values on an existing row are explicit clears and survive sync.
+      contact_person: data.contact_person?.trim() || (isEditing ? '' : null),
       email: data.email || undefined,
       personal_number: data.personal_number || null,
+      invoice_email_cc_addresses: ccText
+        ? parseInvoiceRecipientText(ccText)
+        : isEditing ? [] : null,
+      invoice_email_bcc_addresses: bccText
+        ? parseInvoiceRecipientText(bccText)
+        : isEditing ? [] : null,
     }
     // A mask means "unchanged", whichever form it is. Sending it would be
     // harmless (the route ignores masks too) but omitting it keeps the intent
@@ -231,32 +336,77 @@ export default function CustomerForm({
       </div>
 
       {/* Contact */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="email">{t('email_label')}</Label>
+          <Label htmlFor="contact_person">{t('contact_person_label')}</Label>
           <Input
-            id="email"
-            type="email"
-            placeholder={t('email_placeholder')}
-            {...register('email')}
+            id="contact_person"
+            placeholder={t('contact_person_placeholder')}
+            {...register('contact_person')}
           />
-          {errors.email && (
-            <p className="text-sm text-destructive">{errors.email.message}</p>
+          {errors.contact_person && (
+            <p className="text-sm text-destructive">{errors.contact_person.message}</p>
           )}
         </div>
-        <div className="space-y-2">
-          <Label htmlFor="phone">{t('phone_label')}</Label>
-          <Input
-            id="phone"
-            placeholder={t('phone_placeholder')}
-            {...register('phone')}
-          />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="email">{t('email_label')}</Label>
+            <Input
+              id="email"
+              type="email"
+              placeholder={t('email_placeholder')}
+              {...register('email')}
+            />
+            {errors.email && (
+              <p className="text-sm text-destructive">{errors.email.message}</p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="phone">{t('phone_label')}</Label>
+            <Input
+              id="phone"
+              placeholder={t('phone_placeholder')}
+              {...register('phone')}
+            />
+          </div>
         </div>
+      </div>
+
+      {/* Customer-specific invoice recipients */}
+      <div className="space-y-4">
+        <h3 className="text-sm">{t('invoice_email_section')}</h3>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="invoice_email_cc_addresses">{t('invoice_email_cc_label')}</Label>
+            <Textarea
+              id="invoice_email_cc_addresses"
+              rows={3}
+              placeholder={t('invoice_email_placeholder')}
+              {...register('invoice_email_cc_addresses')}
+            />
+            {errors.invoice_email_cc_addresses && (
+              <p className="text-sm text-destructive">{errors.invoice_email_cc_addresses.message}</p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="invoice_email_bcc_addresses">{t('invoice_email_bcc_label')}</Label>
+            <Textarea
+              id="invoice_email_bcc_addresses"
+              rows={3}
+              placeholder={t('invoice_email_placeholder')}
+              {...register('invoice_email_bcc_addresses')}
+            />
+            {errors.invoice_email_bcc_addresses && (
+              <p className="text-sm text-destructive">{errors.invoice_email_bcc_addresses.message}</p>
+            )}
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">{t('invoice_email_hint')}</p>
       </div>
 
       {/* Address */}
       <div className="space-y-4">
-        <h3 className="font-medium">{t('address_section')}</h3>
+        <h3>{t('address_section')}</h3>
         <div className="space-y-2">
           <Label htmlFor="address_line1">{t('street_label')}</Label>
           <Input
@@ -284,11 +434,34 @@ export default function CustomerForm({
           </div>
           <div className="space-y-2">
             <Label htmlFor="country">{t('country_label')}</Label>
-            <Input
-              id="country"
-              placeholder={t('country_placeholder')}
-              {...register('country')}
+            <Controller
+              name="country"
+              control={control}
+              render={({ field }) => (
+                <Select value={field.value} onValueChange={(v) => { if (v) field.onChange(v) }}>
+                  <SelectTrigger id="country">
+                    <SelectValue placeholder={t('country_placeholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {countryValueUnlisted && (
+                      <SelectItem value={countryValue}>
+                        {normalizeCountryCode(countryValue)
+                          ? countryValue
+                          : t('country_unknown_option', { value: countryValue })}
+                      </SelectItem>
+                    )}
+                    {countryOptions.map((option) => (
+                      <SelectItem key={option.code} value={option.code}>
+                        {locale === 'en' ? option.nameEn : option.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
             />
+            {errors.country && (
+              <p className="text-sm text-destructive">{errors.country.message}</p>
+            )}
           </div>
         </div>
       </div>
@@ -296,7 +469,7 @@ export default function CustomerForm({
       {/* Identification: depends on customer type */}
       {customerType === 'individual' ? (
         <div className="space-y-4 pt-4 border-t">
-          <h3 className="font-medium">{t('individual_section')}</h3>
+          <h3>{t('individual_section')}</h3>
 
           <div className="space-y-2">
             <Label htmlFor="personal_number">{t('personal_number_label')}</Label>
@@ -314,7 +487,7 @@ export default function CustomerForm({
         </div>
       ) : (
         <div className="space-y-4 pt-4 border-t">
-          <h3 className="font-medium">{t('business_section')}</h3>
+          <h3>{t('business_section')}</h3>
 
           <div className="space-y-2">
             <Label htmlFor="org_number">{t('org_number_label')}</Label>
@@ -323,6 +496,9 @@ export default function CustomerForm({
               placeholder={t('org_number_placeholder')}
               {...register('org_number')}
             />
+            {errors.org_number && (
+              <p className="text-sm text-destructive">{errors.org_number.message}</p>
+            )}
           </div>
 
           {(customerType === 'eu_business' || customerType === 'non_eu_business') && (
@@ -370,8 +546,15 @@ export default function CustomerForm({
         <Input
           id="payment_terms"
           type="number"
+          min={0}
+          max={365}
+          step={1}
           {...register('default_payment_terms', { valueAsNumber: true })}
         />
+        <p className="text-xs text-muted-foreground">{t('payment_terms_help')}</p>
+        {errors.default_payment_terms && (
+          <p className="text-sm text-destructive">{errors.default_payment_terms.message}</p>
+        )}
       </div>
 
       {/* Invoice language */}

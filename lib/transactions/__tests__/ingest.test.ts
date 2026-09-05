@@ -5,7 +5,8 @@
  * and result aggregation.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { ingestTransactions, type RawTransaction } from '../ingest'
+import { ingestTransactions } from '../ingest'
+import type { RawTransaction } from '@/types'
 import { makeJournalEntry, makeTransaction } from '@/tests/helpers'
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,16 @@ const mockFetchExchangeRate = vi.fn()
 vi.mock('@/lib/currency/riksbanken', () => ({
   fetchExchangeRate: (...args: unknown[]) => mockFetchExchangeRate(...args),
 }))
+
+// Mocked so the open-begäran pool consumes no slot in the queued Supabase
+// mock: every existing test enqueues results in the pre-fetch order.
+const mockLoadOpenRotRutPayoutRequests = vi.fn()
+vi.mock('@/lib/invoices/rot-rut-payout-candidates', () => ({
+  loadOpenRotRutPayoutRequests: (...args: unknown[]) => mockLoadOpenRotRutPayoutRequests(...args),
+}))
+// Default: no open begäran. vi.clearAllMocks keeps implementations, so this
+// survives beforeEach; tests that need a pool override it.
+mockLoadOpenRotRutPayoutRequests.mockResolvedValue([])
 
 // ---------------------------------------------------------------------------
 // Queue-based Supabase mock
@@ -130,8 +141,10 @@ function makeMappingResult(overrides: Record<string, unknown> = {}) {
 // Tests
 //
 // Queue order after batch dedup refactor:
-// 1. Booked transaction map query
-// 1b. Unbooked bank-synced transaction map query
+// 1. Booked transaction map query (paginated via fetchAllRows: one queue entry
+//    per page; a page under 1000 rows ends the loop, so the common one-entry
+//    enqueue is unchanged)
+// 1b. Unbooked bank-synced transaction map query (same pagination)
 // 2. Supplier invoices fetch
 // 3. Batch external_id dedup query (returns matching external_ids)
 // 4. Per-transaction: insert, updates, etc.
@@ -220,6 +233,156 @@ describe('ingestTransactions', () => {
   })
 
   // -----------------------------------------------------------------------
+  // 1c2. Stamps bank_file_import_id from the batch option
+  // -----------------------------------------------------------------------
+  it('stamps bank_file_import_id on the insert when bankFileImportId is given', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -100 })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
+      bankFileImportId: 'import-1',
+    })
+
+    expect(result.imported).toBe(1)
+    const txInserts = inserts['transactions'] ?? []
+    expect(txInserts).toHaveLength(1)
+    expect(
+      (txInserts[0] as { bank_file_import_id?: string | null }).bank_file_import_id,
+    ).toBe('import-1')
+  })
+
+  it('inserts bank_file_import_id null when no batch id is given (PSD2/MCP paths)', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -100 })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(result.imported).toBe(1)
+    const txInserts = inserts['transactions'] ?? []
+    expect(
+      (txInserts[0] as { bank_file_import_id?: string | null }).bank_file_import_id,
+    ).toBeNull()
+  })
+
+  // -----------------------------------------------------------------------
+  // 1d. Transaction-method classification at the insert boundary
+  // -----------------------------------------------------------------------
+  it('classifies transaction_method, strips the channel phrase from the title, and persists the raw codes', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({
+      description: 'Vercel Jul Överföring via internet',
+      bank_transaction_code: 'PMNT/ICDT',
+      proprietary_bank_transaction_code: 'Överföring',
+    })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(result.imported).toBe(1)
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    // Working title is the clean prefix; the immutable original keeps the
+    // full bank string (dedup-bridge + restore-original source).
+    expect(payload.description).toBe('Vercel Jul')
+    expect(payload.original_description).toBe('Vercel Jul Överföring via internet')
+    // The phrase beats the generic ISO family (ICDT = credit transfer).
+    expect(payload.transaction_method).toBe('transfer')
+    expect(payload.bank_transaction_code).toBe('PMNT/ICDT')
+    expect(payload.proprietary_bank_transaction_code).toBe('Överföring')
+  })
+
+  it('treats a bank_connection_id row as a feed even without import_source', async () => {
+    // The oldest PSD2 rows predate the import_source column; a live bank
+    // connection is the unambiguous feed marker (isImportedTransaction).
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({
+      description: 'Vercel Jul Överföring via internet',
+      import_source: undefined,
+      bank_connection_id: 'bc-1',
+    })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const feedPayload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(feedPayload.transaction_method).toBe('transfer')
+    expect(feedPayload.description).toBe('Vercel Jul')
+    expect(feedPayload.original_description).toBe('Vercel Jul Överföring via internet')
+  })
+
+  it('never classifies or strips user-created sources (manual/mcp)', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    // A user-authored title that WOULD classify+strip if it came from a feed.
+    const raw = makeRaw({ description: 'Egen insättning', import_source: 'manual' })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(payload.description).toBe('Egen insättning')
+    expect(payload.original_description).toBe('Egen insättning')
+    expect(payload.transaction_method).toBeNull()
+  })
+
+  it('leaves the title untouched and method null when nothing classifies', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({ description: 'Test transaction' })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(payload.description).toBe('Test transaction')
+    expect(payload.original_description).toBe('Test transaction')
+    expect(payload.transaction_method).toBeNull()
+    expect(payload.bank_transaction_code).toBeNull()
+    expect(payload.proprietary_bank_transaction_code).toBeNull()
+  })
+
+  // -----------------------------------------------------------------------
   // 2. Detects duplicates
   // -----------------------------------------------------------------------
   it('detects duplicates via external_id', async () => {
@@ -274,6 +437,52 @@ describe('ingestTransactions', () => {
     expect(result.duplicates).toBe(1)
     expect(result.imported).toBe(0)
     expect(result.transaction_ids).toEqual([])
+  })
+
+  // -----------------------------------------------------------------------
+  // 2b-page. Pagination regression: buildExistingTransactionMaps paginates
+  //     via fetchAllRows, so a stored twin BEYOND the 1000-row PostgREST page
+  //     still lands in the dedup map. The old un-paginated select silently
+  //     truncated at 1000 rows, and a re-import over a wide date range in an
+  //     active company inserted everything past the cap as duplicates.
+  // -----------------------------------------------------------------------
+  it('dedupes against a stored twin served on the second page (>1000 stored rows)', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    const raw = makeRaw({
+      date: '2024-06-15',
+      amount: -250.0,
+      description: 'ICA Maxi Solna',
+      external_id: 'lunar_csvhash_page2',
+      import_source: 'csv_lunar',
+    })
+
+    // Booked map page 1: exactly 1000 filler rows in OTHER (date, öre)
+    // buckets. A full page forces fetchAllRows to request page 2.
+    const filler = Array.from({ length: 1000 }, (_, i) => ({
+      date: '2024-06-01',
+      amount: -(i + 1),
+      original_description: `Filler ${i}`,
+      description: `Filler ${i}`,
+      import_source: 'csv_lunar',
+    }))
+    enqueue({ data: filler, error: null })
+    // Booked map page 2: the twin the old un-paginated query dropped.
+    enqueue({
+      data: [{ date: '2024-06-15', amount: -250.0, original_description: 'ICA Maxi Solna', description: 'ICA Maxi Solna', import_source: 'csv_lunar' }],
+      error: null,
+    })
+    // Unbooked map
+    enqueue({ data: [], error: null })
+    // Supplier invoices fetch
+    enqueue({ data: [], error: null })
+    // Batch external_id dedup query: no match
+    enqueue({ data: [], error: null })
+    // No insert expected: deduped by the text bridge against the page-2 twin.
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(result.duplicates).toBe(1)
+    expect(result.imported).toBe(0)
   })
 
   // -----------------------------------------------------------------------
@@ -1556,6 +1765,51 @@ describe('ingestTransactions', () => {
       expect.objectContaining({ id: 'tx-income' }),
       0.50
     )
+  })
+
+  // -----------------------------------------------------------------------
+  // 4a. Skatteverkets ROT/RUT payout: an income row equal to an open begäran
+  //     gets potential_rot_rut_payout_request_id (a suggestion, never a hard
+  //     link) and skips auto-categorisation, exactly like an invoice hint.
+  // -----------------------------------------------------------------------
+  it('suggests the open ROT/RUT payout request for a matching Skatteverket income row', async () => {
+    const { supabase, enqueue, updates } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: 3000, description: 'Skatteverket utbetalning' })
+    const inserted = makeTransaction({
+      id: 'tx-skv',
+      amount: 3000,
+      currency: 'SEK',
+      description: 'Skatteverket utbetalning',
+      external_id: raw.external_id,
+    })
+    mockLoadOpenRotRutPayoutRequests.mockResolvedValueOnce([
+      {
+        id: 'rr-1',
+        name: 'ROT 2026-07',
+        deduction_type: 'rot',
+        status: 'submitted',
+        requested_total: 3000,
+        decided_total: null,
+        settlement_journal_entry_id: null,
+      },
+    ])
+    mockGetBestInvoiceMatch.mockResolvedValue(null)
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked bank-synced map
+    enqueue({ data: [], error: null }) // supplier invoices pool
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    enqueue({ data: null, error: null }) // suggestion update
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(result.imported).toBe(1)
+    expect(result.auto_matched_invoices).toBe(1)
+    const txUpdates = (updates['transactions'] ?? []) as Record<string, unknown>[]
+    expect(txUpdates).toEqual([{ potential_rot_rut_payout_request_id: 'rr-1' }])
+    // The hint short-circuits the mapping engine: no auto-booked voucher.
+    expect(mockEvaluateMappingRules).not.toHaveBeenCalled()
   })
 
   // -----------------------------------------------------------------------

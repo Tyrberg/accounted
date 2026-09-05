@@ -34,11 +34,22 @@ export interface BankFileParseResult {
   }
 }
 
+/**
+ * Advisory duplicate preview from POST /api/import/bank-file/check-duplicates:
+ * rows that already exist and that execute-side ingest will skip. Never a
+ * promise of the exact final count; ingest's own result stays authoritative.
+ */
+export interface BankFileDuplicateInfo {
+  /** Indexes into the parsed transactions array, ascending. */
+  duplicate_row_indexes: number[]
+  duplicate_count: number
+}
+
 /** Issue encountered during parsing */
 export interface BankFileParseIssue {
   row: number
   message: string
-  severity: 'warning' | 'error'
+  severity: 'info' | 'warning' | 'error'
 }
 
 /** Supported bank file format identifiers */
@@ -54,6 +65,7 @@ export type BankFileFormatId =
   | 'lunar'
   | 'northmill'
   | 'wise'
+  | 'wise_statement'
   | 'generic_csv'
   | 'camt053'
 
@@ -65,25 +77,6 @@ export interface BankFileFormat {
   fileExtensions: string[]
   detect: (content: string, filename: string) => boolean
   parse: (content: string) => BankFileParseResult
-}
-
-/** Import tracking record stored in DB */
-export interface BankFileImport {
-  id: string
-  user_id: string
-  filename: string
-  file_hash: string
-  file_format: string
-  transaction_count: number
-  imported_count: number
-  duplicate_count: number
-  matched_count: number
-  date_from: string | null
-  date_to: string | null
-  status: 'pending' | 'processing' | 'completed' | 'failed'
-  error_message: string | null
-  created_at: string
-  updated_at: string
 }
 
 /** Column mapping for generic CSV format */

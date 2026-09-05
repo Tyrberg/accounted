@@ -38,6 +38,13 @@ vi.mock('@/lib/invoices/match-log', () => ({
   logMatchEvent: vi.fn(),
 }))
 
+// Mocked so it consumes no slot in the queued Supabase mock: the helper's own
+// query shape is pinned by lib/invoices/__tests__/clear-settled-invoice-suggestions.test.ts.
+const mockClearSuggestions = vi.fn()
+vi.mock('@/lib/invoices/clear-settled-invoice-suggestions', () => ({
+  clearSettledInvoiceSuggestions: (...args: unknown[]) => mockClearSuggestions(...args),
+}))
+
 vi.mock('@/lib/events/bus', () => ({
   eventBus: { emit: vi.fn() },
 }))
@@ -60,6 +67,7 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
 }))
 
 import { POST } from '../route'
+import { eventBus } from '@/lib/events/bus'
 
 const mockUser = { id: 'user-1', email: 'test@test.se' }
 
@@ -135,9 +143,13 @@ function enqueueHappyPath(opts: {
   })
   // 3. company_settings fetch
   enqueue({ data: { accounting_method: opts.accountingMethod ?? 'accrual' }, error: null })
-  // 4. cash_accounts lookup (only when the transaction is linked to one)
+  // 4. cash_accounts lookup: by id when the transaction is linked to one,
+  // otherwise the currency-fallback listing (issue #1722), empty here so the
+  // 1930 fallback applies.
   if (opts.transaction.cash_account_id) {
     enqueue({ data: { ledger_account: opts.cashAccountLedger ?? '1930' }, error: null })
+  } else {
+    enqueue({ data: [], error: null })
   }
   // 5. supplier_invoices update (CAS)
   enqueue({ data: [{ id: SI_UUID }], error: null })
@@ -452,6 +464,25 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: non-FX paths', () 
     expect(body.success).toBe(true)
     expect(body.paid_amount).toBe(1000)
     expect(body.remaining_amount).toBe(0)
+    const invoiceUpdate = findCalls('supplier_invoices', 'update').at(-1)?.[0]
+    expect(invoiceUpdate).toMatchObject({ paid_at: '2026-05-12T12:00:00Z' })
+    expect(vi.mocked(eventBus.emit)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'supplier_invoice.match_confirmed',
+        payload: expect.objectContaining({
+          supplierInvoice: expect.objectContaining({
+            status: 'paid',
+            paid_at: '2026-05-12T12:00:00Z',
+            paid_amount: 1000,
+            remaining_amount: 0,
+          }),
+          transaction: expect.objectContaining({
+            supplier_invoice_id: SI_UUID,
+            journal_entry_id: 'je-1',
+          }),
+        }),
+      }),
+    )
   })
 
   // The suggestion pointer must not survive the match that consumes it: this
@@ -471,6 +502,36 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: non-FX paths', () 
       potential_supplier_invoice_id: null,
       is_business: true,
     })
+  })
+
+  // Issue #1259: the settled invoice's pointer must also be retired from every
+  // OTHER transaction that still carries it as an import-time suggestion.
+  it('retires the settled invoice suggestion on the other transactions', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -1000, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 1000 },
+    })
+    await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+
+    expect(mockClearSuggestions).toHaveBeenCalledTimes(1)
+    expect(mockClearSuggestions).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'supplier_invoice',
+      SI_UUID,
+      { exceptTransactionId: TX_UUID },
+    )
+  })
+
+  it('leaves the suggestions alone on a partial payment: the invoice is still matchable', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -400, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 1000 },
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { body } = await parseJsonResponse<{ invoice_status: string }>(res)
+    expect(body.invoice_status).toBe('partially_paid')
+    expect(mockClearSuggestions).not.toHaveBeenCalled()
   })
 
   it('öresavrundning: a whole-krona Bankgiro payment settles an öre-bearing invoice in full via 3740', async () => {
@@ -629,25 +690,23 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: cash method + FX',
     expect(mockCreateCashEntry).not.toHaveBeenCalled()
   })
 
-  it('does NOT absorb öre under the cash method: a SEK sub-krona diff stays partial', async () => {
+  it('does NOT absorb öre under the cash method: a SEK sub-krona diff is rejected as partial', async () => {
     // Kontantmetoden books the full invoice via the cash entry (not the bank
     // amount), so folding the 0,25 to 3740 would hide a 1930 discrepancy. The
-    // öre band is accrual-only; here the invoice stays partially_paid.
+    // öre band is accrual-only. Previously the sub-krona shortfall booked the
+    // FULL cash entry while leaving the invoice partially_paid (an over-book
+    // the invoice could never recover from); now it is rejected outright.
     enqueueHappyPath({
       transaction: { amount: -11231, currency: 'SEK' },
       invoice: { currency: 'SEK', remaining_amount: 11231.25 },
       accountingMethod: 'cash',
     })
     const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
-    const { status, body } = await parseJsonResponse<{
-      invoice_status: string
-      remaining_amount: number
-    }>(res)
-    expect(status).toBe(200)
-    expect(mockCreateCashEntry).toHaveBeenCalledTimes(1)
-    expect(mockCreateJournalEntry).not.toHaveBeenCalled() // no 3740 clearing entry
-    expect(body.invoice_status).toBe('partially_paid')
-    expect(body.remaining_amount).toBe(0.25)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(res)
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CASH_PARTIAL_UNSUPPORTED')
+    expect(mockCreateCashEntry).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
   })
 })
 

@@ -7,21 +7,25 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
+import RattelseExplainer from '@/components/bookkeeping/RattelseExplainer'
 import { AddAccountDialog } from '@/components/bookkeeping/AddAccountDialog'
 import { AccountNumber } from '@/components/ui/account-number'
 import { useToast } from '@/components/ui/use-toast'
+import { useAccounts } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { changeCorrectionLineAccount, getSelectableCorrectionCatalog } from '@/lib/bookkeeping/correction-line-account'
 import { splitCreateAccountPrefill } from '@/lib/bookkeeping/create-account-prefill'
 import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
 import { Loader2, Plus, Trash2 } from 'lucide-react'
-import type { JournalEntry, JournalEntryLine, BASAccount } from '@/types'
+import type { JournalEntry, JournalEntryLine } from '@/types'
 
 interface NewLine {
   account_number: string
@@ -47,9 +51,18 @@ interface Props {
 export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrected }: Props) {
   const { toast } = useToast()
   const t = useTranslations('journal_detail')
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  // The full chart (deactivated rows included) comes from the session cache
+  // (lib/reference-data); only the static BAS catalogue is loaded per open,
+  // and it is module-cached after the first time.
+  const { accounts, isLoading: accountsLoading, error: accountsError, refresh: refreshAccounts } = useAccounts(false)
   const [catalog, setCatalog] = useState<CatalogAccount[]>([])
-  const [accountsStatus, setAccountsStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [catalogStatus, setCatalogStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const accountsStatus: 'loading' | 'ready' | 'error' =
+    accountsLoading || catalogStatus === 'loading'
+      ? 'loading'
+      : accountsError || catalogStatus === 'error'
+        ? 'error'
+        : 'ready'
   const [strikeIds, setStrikeIds] = useState<Set<string>>(new Set())
   const [newLines, setNewLines] = useState<NewLine[]>([])
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -75,26 +88,18 @@ export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrect
     if (open) {
       setStrikeIds(new Set())
       setNewLines([])
-      void fetchAccounts()
+      void loadCatalog()
     }
-  }, [open, entry.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, entry.id])
 
-  async function fetchAccounts() {
-    setAccountsStatus('loading')
+  async function loadCatalog() {
+    setCatalogStatus('loading')
     try {
-      const [res, basCatalog] = await Promise.all([
-        fetch('/api/bookkeeping/accounts?active=false'),
-        loadBasCatalog(),
-      ])
-      if (!res.ok) throw new Error(`accounts ${res.status}`)
-      const { data } = await res.json()
-      setAccounts(data || [])
-      setCatalog(basCatalog)
-      setAccountsStatus('ready')
+      setCatalog(await loadBasCatalog())
+      setCatalogStatus('ready')
     } catch {
-      setAccounts([])
       setCatalog([])
-      setAccountsStatus('error')
+      setCatalogStatus('error')
     }
   }
 
@@ -137,9 +142,9 @@ export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrect
   // a dead end here: the rättelse can only post to accounts that exist in the
   // chart. Creating it inline keeps the half-finished rättelse intact.
   const handleAccountCreated = async (account: { account_number: string; account_name?: string }) => {
-    await fetchAccounts()
+    await invalidateReferenceData('ref:accounts')
     if (creatingAccountForLine != null) {
-      // fetchAccounts' state update is not visible in this closure, so the
+      // The refreshed cache is not visible in this closure, so the
       // fresh account's own name is passed alongside the stale sources. The
       // reactivate path reports no name, but that account is already in
       // `accounts` (the fetch includes deactivated rows).
@@ -220,18 +225,30 @@ export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrect
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-3xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Stryk rader i verifikatet</DialogTitle>
+          {/* Convention 7: the how-it-works copy lives behind the "?", not in
+              the dialog flow. */}
+          <div className="flex items-center gap-2">
+            <DialogTitle>Stryk rader i verifikatet</DialogTitle>
+            <RattelseExplainer>
+              <p>
+                Här stryks felaktiga rader och ersätts direkt i samma verifikat,
+                utan ändringsverifikation. Det fungerar bara i öppna, olåsta
+                perioder.
+              </p>
+              <p>
+                Varje rättelse loggas med vem och när, och de ursprungliga
+                raderna förblir synliga i verifikatets rättelsehistorik.
+              </p>
+              <p>
+                Om månaden redan är momsdeklarerad kan en ändring av momskonton
+                påverka den inlämnade deklarationen.
+              </p>
+            </RattelseExplainer>
+          </div>
+          <DialogDescription>
+            De strukna raderna förblir synliga (överstrukna) i verifikatet.
+          </DialogDescription>
         </DialogHeader>
-
-        <div className="rounded-lg bg-muted/50 border p-3 text-sm text-muted-foreground">
-          <p className="font-medium text-foreground mb-1">Rättelse i samma verifikat</p>
-          <p>
-            Felaktiga rader stryks och ersätts direkt i verifikatet, utan ändringsverifikation.
-            De strukna raderna förblir synliga (överstrukna) och rättelsen loggas med vem och när,
-            enligt bokföringslagen. Fungerar bara i öppna, olåsta perioder. Om månaden redan är
-            momsdeklarerad kan en ändring av momskonton påverka den inlämnade deklarationen.
-          </p>
-        </div>
 
         {/* Original lines with strike checkboxes */}
         <div className="space-y-1">
@@ -286,7 +303,7 @@ export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrect
                 {accountsStatus === 'loading' ? t('accounts_loading') : t('accounts_load_failed')}
               </span>
               {accountsStatus === 'error' && (
-                <Button variant="outline" size="sm" onClick={() => void fetchAccounts()}>
+                <Button variant="outline" size="sm" onClick={() => void refreshAccounts()}>
                   {t('accounts_retry')}
                 </Button>
               )}
@@ -295,19 +312,25 @@ export default function StrikeLinesDialog({ entry, open, onOpenChange, onCorrect
 
           <div className="space-y-2">
             {newLines.map((line, index) => (
-              <div key={index} className="space-y-2 sm:space-y-0 sm:grid sm:grid-cols-[1fr_1fr_120px_120px_auto] sm:gap-2 sm:items-start border-b sm:border-0 pb-3 sm:pb-0 last:border-0">
-                <div className="grid grid-cols-[1fr_auto] sm:contents gap-2">
-                  <AccountCombobox
-                    value={line.account_number}
-                    accounts={activeAccounts}
-                    catalog={selectableCatalog}
-                    onChange={(v) => updateNewLineAccount(index, v)}
-                    onCreateAccount={(prefill) => {
-                      setCreatingAccountForLine(index)
-                      setCreateAccountPrefill(prefill)
-                    }}
-                    disabled={accountsStatus !== 'ready'}
-                  />
+              <div key={index} className="space-y-2 sm:space-y-0 sm:grid sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px_120px_auto] sm:gap-2 sm:items-start border-b sm:border-0 pb-3 sm:pb-0 last:border-0">
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] sm:contents gap-2">
+                  {/* min-w-0: at sm: the sm:contents wrapper promotes this cell
+                      to a direct grid item; without it the combobox refuses to
+                      shrink below its content and overflows the dialog (same
+                      pattern as SendInvoiceDialog's desktop rows). */}
+                  <div className="min-w-0">
+                    <AccountCombobox
+                      value={line.account_number}
+                      accounts={activeAccounts}
+                      catalog={selectableCatalog}
+                      onChange={(v) => updateNewLineAccount(index, v)}
+                      onCreateAccount={(prefill) => {
+                        setCreatingAccountForLine(index)
+                        setCreateAccountPrefill(prefill)
+                      }}
+                      disabled={accountsStatus !== 'ready'}
+                    />
+                  </div>
                   <Button
                     variant="ghost"
                     size="icon"

@@ -79,8 +79,95 @@ const KNOWN_STALE_ON_CONFLICT: Record<string, string> = {}
  *
  * Baseline 2026-07-26: 346 (145 dynamic-payload, 116 dynamic-select,
  * 48 dynamic-logical, 32 spread-payload, 4 dynamic-column, 1 computed key).
+ *
+ * 2026-08-01: 361 after the white-label build (WL-17: brands, teams.kind,
+ * cockpit, brand mail). The growth is spread across ordinary feature queries;
+ * ceiling raised 360 -> 370 to restore headroom.
+ *
+ * Raised 2026-08-06 for the sandbox seed's payroll + ledger-history builders.
+ * app/api/sandbox/seed/ follows the pure-row-builder pattern the existing
+ * customers.ts / pending-operations.ts modules established: the builder returns
+ * complete row objects and route.ts spreads them, adding only the ids it had to
+ * insert first (voucher_number, journal_entry_id, account_id). The scanner
+ * cannot see through that spread. Writing the columns out again in route.ts to
+ * satisfy the scanner would duplicate every builder's shape at the call site,
+ * which is the thing the builders exist to prevent, and the row shapes are
+ * covered by their own unit tests instead.
+ *
+ * Baseline 2026-08-06: 370 (158 dynamic-payload, 120 dynamic-select,
+ * 47 dynamic-logical, 38 spread-payload, 5 dynamic-column, 2 computed key).
+ *
+ * 2026-08-12 +3: lib/webshop-orders/ingest.ts builds partial UPDATE payloads
+ * at runtime (frozen rows get safe fields only; unfrozen rows get optional
+ * parent/legacy links). Writing the shapes as inline literals would need one
+ * variant per key combination; the row shapes are covered by ingest.test.ts.
+ *
+ * 2026-08-26 +2: the customer pickers in InvoiceEditor and
+ * NewRecurringScheduleDialog hide archived customers but must keep the one the
+ * draft already points at, which is a PostgREST logical filter
+ * `.or('archived_at.is.null,id.eq.<uuid>')`. The id is a runtime value, so the
+ * expression cannot be a literal; both columns are real and the filter is
+ * covered by the archived-counterparty tests.
+ *
+ * 2026-08-17 +1: lib/import/skattekonto-file/import-service.ts inserts parsed
+ * statement rows via a mapped batch (same shape as every other file importer);
+ * the row shape is covered by the execute route tests and the pg-real suite.
+ *
+ * 2026-08-21 +1: lib/invoices/peppol-inbound.ts updates the processing state
+ * of an inbound Peppol document through one helper (five literal shapes:
+ * routed / unrouted / converted / failed, all partial); the column set is
+ * pinned by peppol-inbound.test.ts and the pg-real immutability test.
+ *
+ * 2026-08-26 merge of add/white-label-infra with main: both sides' growth
+ * lands at once (WL queries + everything above). Count on the merged tree:
+ * 383 (162 dynamic-payload, 125 dynamic-select, 50 dynamic-logical,
+ * 39 spread-payload, 5 dynamic-column, 2 computed key); ceiling re-baselined
+ * with the usual headroom. The later catch-up merge of #1954 (byte-exact SIE
+ * upload) brought the merged count to 386.
+ *
+ * 2026-08-30 +1: lib/salary/update-run.ts applies the draft salary-run header
+ * patch (payment_date / voucher_series / notes) as a partial UPDATE payload,
+ * same patch-shape rationale as webshop-orders ingest: one literal per key
+ * combination is not viable. The field set is pinned by validatePatch and
+ * covered by payroll-executors.test.ts; both selects around it are literals.
+ *
+ * 2026-08-30 recurring payroll lines (#2042): +2 for the same two shapes the
+ * employee_benefits code already carries: the step-8d3 derived-rows insert
+ * (rows built in a .map with literal keys, opaque to the scanner) and the
+ * PATCH route's merged-updates payload (explicit literal keys, but assembled
+ * conditionally into a variable). Both carry scoped assertions instead:
+ * employee-recurring-lines.pg.test.ts inserts the derived-row shape against
+ * the real table, and the PATCH route test pins the exact writable column
+ * set ("writes exactly the patchable columns and nothing else"). Making
+ * either literal would cost a real property: the PATCH would have to write
+ * every column on every request, turning a partial update into
+ * last-write-wins.
  */
-const UNRESOLVED_CEILING = 360
+// 2026-08-20: +1 for lib/connect/instance/sync.ts, whose capability_grants
+// upsert is a per-company x per-scope row array built at runtime (one chunked
+// bulk write); the columns it writes are the same five the Stripe grant writer
+// uses literally, so the literal guard already covers them. Merged with main
+// at 389: 390.
+// 2026-08-31: +1 for lib/connect/hosted/ledger.ts countHeldConnections, whose
+// .or() filter interpolates a computed timestamp (fresh-pending quota window);
+// the columns it references (status, created_at) are literals in the string.
+// 2026-09-01: +2 for the multi_user seat gate: lib/entitlements/multi-user.ts
+// getMultiUserState's .or() scope filter interpolates server-resolved UUIDs
+// (company_id/team_id, same shape as hasCapability's existing filter), and
+// lib/stripe/subscription-sync.ts scopes the cancel-time multi_user expiry
+// update with an .or() interpolating a timestamp; every column named in both
+// strings is a literal (company_id, team_id, expires_at).
+// 2026-09-02: +2 for kundorder (lib/sales-orders): create-invoice-from-order.ts
+// spreads buildInvoiceWriteData()'s invoiceFields into the invoices insert and
+// maps its item rows into invoice_items, the exact shape the webshop
+// create-invoice route and POST /api/invoices already use (their columns are
+// pinned by build-invoice-write.ts and its tests); write.ts inserts order
+// lines as a row array built from one literal mapper (toInsertRow). Every
+// header/line update in the module is an object literal. Merged with main
+// (parties phase 1, #2162/#2168/#2169) at 395: 397.
+// 2026-09-04: +2 recurring lines (#2044, see the 2026-08-30 recurring payroll
+// lines note above); merged with main (#2141/#2164/#2170/#2192) at 397: 399.
+const UNRESOLVED_CEILING = 399
 
 /**
  * Floor on statically resolved column references. Guards the guard: if a change

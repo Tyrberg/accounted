@@ -22,6 +22,50 @@ export type VoucherSeriesMap = Partial<Record<JournalEntrySourceType, string>> &
 const SERIES_LETTER_RE = /^[A-Z]$/
 
 /**
+ * The conventional Swedish verifikationsserier and what each one is for.
+ *
+ * The column accepts any A-Z letter, but a free-text field invites typos and
+ * lets the same letter mean different things across a company's ledger, so the
+ * entry form offers this fixed set (plus whatever series the company has
+ * already configured or used).
+ *
+ * The letters are NOT prescribed by law: BFL 5 kap. 7 § only requires an
+ * unbroken, systematically ordered numbering within each series. This list is
+ * Fortnox's, taken verbatim from their Systemdokumentation (Fortnox Lön,
+ * section 4 Behandlingsregler), because Fortnox is the system most companies
+ * migrate here from and an imported ledger should keep its meaning. Note that
+ * the incumbents disagree with each other: Björn Lundén uses F for
+ * kundfakturor, L for leverantörsfakturor and N for löner. The one point
+ * they agree on is that A is the general series you post manual entries into,
+ * which also matches this codebase: every source_type in
+ * company_settings.default_voucher_series_per_source_type ships as 'A'.
+ *
+ * The labels are bookkeeping-domain terms that stay Swedish in both locales,
+ * same convention as VoucherSeriesPerSourceTypeForm.
+ */
+export const VOUCHER_SERIES_PRESETS: ReadonlyArray<{ letter: string; label: string }> = [
+  { letter: 'A', label: 'Redovisning' },
+  { letter: 'B', label: 'Kundfakturor' },
+  { letter: 'C', label: 'Inbetalningar från kunder' },
+  { letter: 'D', label: 'Leverantörsfakturor' },
+  { letter: 'E', label: 'Utbetalningar till leverantörer' },
+  { letter: 'F', label: 'Kassa' },
+  { letter: 'G', label: 'Avskrivning' },
+  { letter: 'H', label: 'Periodisering' },
+  { letter: 'I', label: 'Bokslut' },
+  { letter: 'J', label: 'Revisor' },
+  { letter: 'K', label: 'Lön' },
+  { letter: 'L', label: 'Kontantfaktura' },
+  { letter: 'M', label: 'Momsrapport' },
+]
+
+/** Swedish description for a preset series letter; empty for unknown letters. */
+export function voucherSeriesLabel(letter: string): string {
+  const match = VOUCHER_SERIES_PRESETS.find((p) => p.letter === letter)
+  return match ? match.label : ''
+}
+
+/**
  * Resolve the default voucher_series letter for a given source_type from a
  * company_settings row. Returns 'A' as a safe fallback when no mapping is
  * configured for that source_type.
@@ -107,15 +151,17 @@ export function formatVoucher(entry: {
 
 /**
  * Parse a formatted voucher label back into its parts. Returns null when the
- * input does not match the expected shape (single uppercase letter followed
- * by a positive integer). Use for filter inputs / search.
+ * input does not match the expected shape: a single letter followed by a
+ * positive integer, optionally separated by one space or hyphen ("A209",
+ * "a 209", "A-209"). Use for filter inputs / search: these are the shapes
+ * users type when they look for a voucher by its number.
  */
 export function parseVoucher(
   formatted: string,
 ): { series: string; number: number } | null {
   if (typeof formatted !== 'string') return null
   const trimmed = formatted.trim().toUpperCase()
-  const match = trimmed.match(/^([A-Z])(\d+)$/)
+  const match = trimmed.match(/^([A-Z])[ -]?(\d+)$/)
   if (!match) return null
   const number = parseInt(match[2], 10)
   if (!Number.isFinite(number) || number <= 0) return null

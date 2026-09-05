@@ -1,27 +1,35 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import crypto from 'crypto'
+import type { RedirectUriResolution } from '@/lib/auth/oauth-allowlist'
 
 const mocks = vi.hoisted(() => ({
   createClient: vi.fn(),
-  isAllowedRedirectUri: vi.fn(),
-  requireCompanyId: vi.fn(),
+  resolveRedirectUri: vi.fn(),
+  getActiveCompanyId: vi.fn(),
   getBranding: vi.fn(),
+  createAuthCode: vi.fn<(...args: unknown[]) => string>(() => 'test-auth-code'),
 }))
 
 vi.mock('@/lib/auth/oauth-codes', () => ({
-  createAuthCode: vi.fn(() => 'test-auth-code'),
+  createAuthCode: (...args: unknown[]) => mocks.createAuthCode(...args),
 }))
 
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => mocks.createClient(),
 }))
 
-vi.mock('@/lib/auth/oauth-allowlist', () => ({
-  isAllowedRedirectUri: (...args: unknown[]) => mocks.isAllowedRedirectUri(...args),
-}))
+// Only the redirect-URI resolution is replaced: the role cap helpers from the
+// same module run for real so the tests exercise the actual ceiling logic.
+vi.mock('@/lib/auth/oauth-allowlist', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/auth/oauth-allowlist')>()
+  return {
+    ...actual,
+    resolveRedirectUri: (...args: unknown[]) => mocks.resolveRedirectUri(...args),
+  }
+})
 
 vi.mock('@/lib/company/context', () => ({
-  requireCompanyId: (...args: unknown[]) => mocks.requireCompanyId(...args),
+  getActiveCompanyId: (...args: unknown[]) => mocks.getActiveCompanyId(...args),
 }))
 
 vi.mock('@/lib/branding/service', () => ({
@@ -30,35 +38,98 @@ vi.mock('@/lib/branding/service', () => ({
 
 import { GET, POST } from '../route'
 
+const CLAUDE: RedirectUriResolution = { allowed: true, kind: 'built_in', provider: 'claude' }
+const CHATGPT: RedirectUriResolution = { allowed: true, kind: 'built_in', provider: 'chatgpt' }
+const GROK: RedirectUriResolution = { allowed: true, kind: 'built_in', provider: 'grok' }
+const CURSOR: RedirectUriResolution = { allowed: true, kind: 'built_in', provider: 'cursor' }
+const CURSOR_DEEPLINK: RedirectUriResolution = { allowed: true, kind: 'built_in', provider: 'cursor_deeplink' }
+const REGISTERED: RedirectUriResolution = {
+  allowed: true,
+  kind: 'registered',
+  clientName: 'Byråns bokföringsbot',
+  registeredByConsentingUser: false,
+}
+
 function buildAuthorizeUrl(params: Record<string, string>): string {
   const url = new URL('http://localhost/api/mcp-oauth/authorize')
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v))
   return url.toString()
 }
 
+/**
+ * Chainable query stub: every builder method returns the chain, and the chain
+ * resolves to `result` whether awaited directly or via single()/maybeSingle().
+ */
+function tableChain(result: { data: unknown; error: unknown }) {
+  const chain: Record<string, unknown> = {}
+  for (const method of ['select', 'eq', 'is', 'in', 'order', 'range', 'limit']) {
+    chain[method] = vi.fn(() => chain)
+  }
+  chain.single = vi.fn().mockResolvedValue(result)
+  chain.maybeSingle = vi.fn().mockResolvedValue(result)
+  chain.then = (resolve: (v: unknown) => void) => resolve(result)
+  return chain
+}
+
+type Membership = { role: string | null } | { error: string }
+
 function buildSupabase(
-  user: { id: string } | null,
+  user: { id: string; email?: string } | null,
   companyName = 'Test AB',
   aal: { currentLevel: string; nextLevel: string } = { currentLevel: 'aal2', nextLevel: 'aal2' },
+  verifiedFactors: number = aal.nextLevel === 'aal2' ? 1 : 0,
+  membership: Membership = { role: 'owner' },
 ) {
+  const settingsResult = { data: { company_name: companyName }, error: null }
+  const membershipResult =
+    'error' in membership
+      ? { data: null, error: { message: membership.error } }
+      : { data: membership.role === null ? null : { role: membership.role }, error: null }
   return {
     auth: {
       getUser: vi.fn().mockResolvedValue({ data: { user }, error: null }),
       mfa: {
         getAuthenticatorAssuranceLevel: vi.fn().mockResolvedValue({ data: aal, error: null }),
+        listFactors: vi.fn().mockResolvedValue({
+          data: {
+            totp: Array.from({ length: verifiedFactors }, (_, i) => ({
+              id: `factor-${i}`,
+              status: 'verified',
+            })),
+          },
+          error: null,
+        }),
       },
     },
-    from: vi.fn().mockReturnValue({
-      select: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          single: vi.fn().mockResolvedValue({
-            data: { company_name: companyName },
-            error: null,
-          }),
-        }),
-      }),
-    }),
+    from: vi.fn((table: string) =>
+      table === 'company_members' ? tableChain(membershipResult) : tableChain(settingsResult),
+    ),
   }
+}
+
+// Mirrors getScopeSigningKey/signScopeBinding in the route so a POST can
+// present a scope binding that verifies against the test service key.
+function signScope(scopeParam: string): string {
+  const key = crypto.createHash('sha256').update('oauth-scope:test-service-key').digest()
+  return crypto.createHmac('sha256', key).update(scopeParam).digest('base64url')
+}
+
+function consentForm(scopeParam: string, scopes: string[] = []): FormData {
+  const formData = new FormData()
+  formData.set('consent', 'allow')
+  formData.set('scope_binding', scopeParam)
+  formData.set('scope_binding_sig', signScope(scopeParam))
+  for (const s of scopes) formData.append('scopes', s)
+  return formData
+}
+
+function checkboxFor(html: string, scope: string): string | undefined {
+  return html.match(new RegExp(`<input[^>]*value="${scope}"[^>]*>`))?.[0]
+}
+
+function lastMintedPayload(): Record<string, unknown> {
+  const calls = mocks.createAuthCode.mock.calls as unknown[][]
+  return calls[calls.length - 1]![0] as Record<string, unknown>
 }
 
 describe('GET /api/mcp-oauth/authorize: CSP', () => {
@@ -66,8 +137,8 @@ describe('GET /api/mcp-oauth/authorize: CSP', () => {
     vi.clearAllMocks()
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
     mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1' }))
-    mocks.isAllowedRedirectUri.mockResolvedValue(true)
-    mocks.requireCompanyId.mockResolvedValue('company-1')
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
     mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
   })
 
@@ -152,11 +223,11 @@ describe('GET /api/mcp-oauth/authorize: CSP', () => {
   })
 
   it('renders both read and write rows when client passes only the legacy `mcp` scope marker', async () => {
-    // Claude's connector sends scope=mcp today. The consent UI must render
-    // every scope group so the user can opt into write/approval rows if they
-    // want, but each write/approve row MUST start unchecked. Affirmative
-    // opt-in is the access-control gate (GDPR Art. 25(2), ISO 27001:2022
-    // A.5.18 / A.8.2, SOC 2 CC6.3, ASVS V10.2.2 / V2.3.1).
+    // Claude's connector sends scope=mcp today. The consent UI renders every
+    // scope group with ALL rows pre-checked (one-click consent, founder
+    // decision 2026-08-26): the affirmative act is the Allow click on a page
+    // that shows the full set, every write is staged for approval before it
+    // touches the ledger, and each row stays individually untickable.
     const request = new Request(
       buildAuthorizeUrl({
         response_type: 'code',
@@ -176,24 +247,14 @@ describe('GET /api/mcp-oauth/authorize: CSP', () => {
     expect(html).toMatch(/value="invoices:write"/)
     expect(html).toMatch(/value="pending_operations:approve"/)
 
-    // Write and approval scopes MUST render unchecked. Users have to make an
-    // affirmative, deliberate selection for each destructive permission.
-    const writeRow = html.match(/<input[^>]*value="transactions:write"[^>]*>/)?.[0]
-    expect(writeRow).toBeDefined()
-    expect(writeRow!).not.toContain('checked')
+    // Every row starts checked: the deliberate act is the visible Allow
+    // click, and unticking stays available per row inside the details fold.
+    expect(checkboxFor(html, 'transactions:write')).toContain('checked')
+    expect(checkboxFor(html, 'pending_operations:approve')).toContain('checked')
+    expect(checkboxFor(html, 'bookkeeping:write')).toContain('checked')
 
-    const approveRow = html.match(/<input[^>]*value="pending_operations:approve"[^>]*>/)?.[0]
-    expect(approveRow).toBeDefined()
-    expect(approveRow!).not.toContain('checked')
-
-    const bookkeepingRow = html.match(/<input[^>]*value="bookkeeping:write"[^>]*>/)?.[0]
-    expect(bookkeepingRow).toBeDefined()
-    expect(bookkeepingRow!).not.toContain('checked')
-
-    // The :read counterpart is pre-checked (safe default).
-    const readRow = html.match(/<input[^>]*value="transactions:read"[^>]*>/)?.[0]
-    expect(readRow).toBeDefined()
-    expect(readRow!).toContain('checked')
+    // The :read counterpart is pre-checked too.
+    expect(checkboxFor(html, 'transactions:read')).toContain('checked')
   })
 
   it('renders only the requested scopes when the client passes them explicitly', async () => {
@@ -219,8 +280,8 @@ describe('GET /api/mcp-oauth/authorize: CSP', () => {
     expect(html).not.toContain('value="bookkeeping:write"')
   })
 
-  it('rejects disallowed redirect_uri before any CSP would be emitted', async () => {
-    mocks.isAllowedRedirectUri.mockResolvedValue(false)
+  it('rejects a redirect_uri the allowlist refuses for this user before any CSP would be emitted', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue({ allowed: false })
     const request = new Request(
       buildAuthorizeUrl({
         response_type: 'code',
@@ -235,6 +296,374 @@ describe('GET /api/mcp-oauth/authorize: CSP', () => {
     // Important: the form-action whitelist must never be populated from an
     // untrusted origin. A 400 here keeps the allowlist as the single source
     // of truth for which origins can land at this endpoint.
+  })
+
+  it('binds the redirect_uri check to the consenting user on GET and POST', async () => {
+    // The allowlist can only tell a colleague's registration from a
+    // stranger's when it knows who is consenting. Both handlers must pass it.
+    const params = {
+      response_type: 'code',
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+      code_challenge: 'abc',
+      code_challenge_method: 'S256',
+      scope: 'mcp',
+    }
+    await GET(new Request(buildAuthorizeUrl(params)))
+    expect(mocks.resolveRedirectUri).toHaveBeenLastCalledWith(
+      'https://claude.ai/api/mcp/auth_callback',
+      undefined,
+      { consentingUserId: 'user-1' },
+    )
+
+    await POST(new Request(buildAuthorizeUrl(params), { method: 'POST', body: consentForm('mcp') }))
+    expect(mocks.resolveRedirectUri).toHaveBeenLastCalledWith(
+      'https://claude.ai/api/mcp/auth_callback',
+      undefined,
+      { consentingUserId: 'user-1' },
+    )
+  })
+})
+
+describe('client identity on the consent page', () => {
+  const params = {
+    response_type: 'code',
+    redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    code_challenge: 'abc',
+    code_challenge_method: 'S256',
+    scope: 'mcp',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1' }))
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
+    mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
+  })
+
+  it('names Claude as a verified client and shows the redirect host', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    const html = await (await GET(new Request(buildAuthorizeUrl(params)))).text()
+
+    expect(html).toContain('Claude (Anthropic)')
+    expect(html).toContain('Verifierad')
+    expect(html).toContain('Skickar dig vidare till')
+    expect(html).toContain('claude.ai')
+    // The generic "en extern applikation" wording is gone: the client is named.
+    expect(html).not.toContain('En extern applikation')
+  })
+
+  it('names ChatGPT for chatgpt.com callbacks', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue(CHATGPT)
+    const html = await (
+      await GET(
+        new Request(
+          buildAuthorizeUrl({ ...params, redirect_uri: 'https://chatgpt.com/connector/oauth/abc' }),
+        ),
+      )
+    ).text()
+
+    expect(html).toContain('ChatGPT (OpenAI)')
+    expect(html).toContain('chatgpt.com')
+  })
+
+  it('names Grok as a verified client for the grok.com callback', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue(GROK)
+    const html = await (
+      await GET(
+        new Request(
+          buildAuthorizeUrl({
+            ...params,
+            redirect_uri: 'https://grok.com/connectors-oauth-exchange-code/',
+          }),
+        ),
+      )
+    ).text()
+
+    expect(html).toContain('Grok (xAI)')
+    expect(html).toContain('Verifierad')
+    expect(html).toContain('grok.com')
+    expect(html).not.toContain('En extern applikation')
+  })
+
+  it('names Cursor as a verified client for the cursor.com callback', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue(CURSOR)
+    const html = await (
+      await GET(
+        new Request(
+          buildAuthorizeUrl({
+            ...params,
+            redirect_uri: 'https://www.cursor.com/agents/mcp/oauth/callback',
+          }),
+        ),
+      )
+    ).text()
+
+    expect(html).toContain('Cursor (Anysphere)')
+    expect(html).toContain('Verifierad')
+    expect(html).toContain('www.cursor.com')
+    expect(html).not.toContain('En extern applikation')
+  })
+
+  it('shows the cursor:// deeplink as Cursor but unverified, like localhost', async () => {
+    // Any local app can claim a custom scheme (RFC 8252 section 8.4), so the
+    // page must not present it as a vendor-verified callback.
+    mocks.resolveRedirectUri.mockResolvedValue(CURSOR_DEEPLINK)
+    const html = await (
+      await GET(
+        new Request(
+          buildAuthorizeUrl({
+            ...params,
+            redirect_uri: 'cursor://anysphere.cursor-mcp/oauth/callback',
+          }),
+        ),
+      )
+    ).text()
+
+    expect(html).toContain('Cursor (Anysphere)')
+    expect(html).toContain('Din egen dator')
+    expect(html).not.toContain('Verifierad')
+    expect(html).not.toContain('En extern applikation')
+  })
+
+  it('form-action uses a scheme-source for a custom-scheme redirect_uri', async () => {
+    // new URL('cursor://...').origin is the string "null", which CSP reads as
+    // a host named "null": with that the post-consent 303 to the deeplink is
+    // blocked in Chromium. The scheme-source form (cursor:) lets it through.
+    mocks.resolveRedirectUri.mockResolvedValue(CURSOR_DEEPLINK)
+    const response = await GET(
+      new Request(
+        buildAuthorizeUrl({
+          ...params,
+          redirect_uri: 'cursor://anysphere.cursor-mcp/oauth/callback',
+        }),
+      ),
+    )
+    expect(response.status).toBe(200)
+    const csp = response.headers.get('Content-Security-Policy')
+    expect(csp).toMatch(/form-action 'self' cursor:(;|$)/)
+    expect(csp).not.toContain('null')
+  })
+
+  it('shows client_name and redirect host for a DB-registered client, never marked verified', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue(REGISTERED)
+    const html = await (
+      await GET(
+        new Request(buildAuthorizeUrl({ ...params, redirect_uri: 'https://app.example.com/cb' })),
+      )
+    ).text()
+
+    expect(html).toContain('Byråns bokföringsbot')
+    expect(html).toContain('app.example.com')
+    expect(html).toContain('Registrerad av en kollega')
+    expect(html).not.toContain('Verifierad')
+    expect(html).not.toContain('Claude')
+  })
+
+  it('HTML-escapes a hostile client_name', async () => {
+    mocks.resolveRedirectUri.mockResolvedValue({
+      ...REGISTERED,
+      clientName: '<img src=x onerror=alert(1)>Claude (Anthropic)',
+      registeredByConsentingUser: true,
+    })
+    const html = await (
+      await GET(
+        new Request(buildAuthorizeUrl({ ...params, redirect_uri: 'https://app.example.com/cb' })),
+      )
+    ).text()
+
+    expect(html).not.toContain('<img src=x')
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+    expect(html).toContain('Registrerad av dig')
+  })
+})
+
+describe('scope defaults for DB-registered clients', () => {
+  const params = {
+    response_type: 'code',
+    redirect_uri: 'https://app.example.com/cb',
+    code_challenge: 'abc',
+    code_challenge_method: 'S256',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1' }))
+    mocks.resolveRedirectUri.mockResolvedValue(REGISTERED)
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
+    mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
+  })
+
+  it('pre-checks only read scopes when a registered client sends no scope', async () => {
+    // The ceiling stays ALL_SCOPES so the user can still opt in, but a
+    // registration is just a URL a member typed into settings: writes and
+    // approval must be a deliberate tick, never a default.
+    const html = await (await GET(new Request(buildAuthorizeUrl(params)))).text()
+
+    expect(checkboxFor(html, 'transactions:read')).toContain('checked')
+    expect(checkboxFor(html, 'reports:read')).toContain('checked')
+
+    expect(checkboxFor(html, 'transactions:write')).toBeDefined()
+    expect(checkboxFor(html, 'transactions:write')).not.toContain('checked')
+    expect(checkboxFor(html, 'bookkeeping:write')).not.toContain('checked')
+    expect(checkboxFor(html, 'pending_operations:approve')).not.toContain('checked')
+    expect(checkboxFor(html, 'webhooks:manage')).not.toContain('checked')
+
+    expect(html).toContain('Endast läs förvalt')
+    expect(html).toContain('Endast läsbehörigheter är förvalda')
+  })
+
+  it('pre-checks write scopes only when the registered client explicitly requested them', async () => {
+    const html = await (
+      await GET(
+        new Request(
+          buildAuthorizeUrl({ ...params, scope: 'transactions:read transactions:write' }),
+        ),
+      )
+    ).text()
+
+    expect(checkboxFor(html, 'transactions:write')).toContain('checked')
+    expect(checkboxFor(html, 'transactions:read')).toContain('checked')
+    // Not requested: not even rendered.
+    expect(html).not.toContain('value="pending_operations:approve"')
+  })
+
+  it('states the segregation-of-duties rule when stage and approve scopes are both on offer', async () => {
+    const html = await (await GET(new Request(buildAuthorizeUrl(params)))).text()
+    expect(html).toContain('medgivande')
+
+    const readOnly = await (
+      await GET(new Request(buildAuthorizeUrl({ ...params, scope: 'transactions:read' })))
+    ).text()
+    expect(readOnly).not.toContain('medgivande')
+  })
+})
+
+describe('role cap on consent', () => {
+  const params = {
+    response_type: 'code',
+    redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    code_challenge: 'abc',
+    code_challenge_method: 'S256',
+    scope: 'mcp',
+    state: 'xyz',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
+    mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
+  })
+
+  it('viewer: GET offers read scopes only and says why', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { role: 'viewer' }),
+    )
+    const response = await GET(new Request(buildAuthorizeUrl(params)))
+    expect(response.status).toBe(200)
+    const html = await response.text()
+
+    expect(checkboxFor(html, 'transactions:read')).toContain('checked')
+    expect(html).not.toContain('value="transactions:write"')
+    expect(html).not.toContain('value="pending_operations:approve"')
+    expect(html).not.toContain('value="webhooks:manage"')
+    expect(html).toContain('läsare')
+  })
+
+  it('viewer: POST caps a forged write selection to read scopes and records the company', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { role: 'viewer' }),
+    )
+    const response = await POST(
+      new Request(buildAuthorizeUrl(params), {
+        method: 'POST',
+        body: consentForm('mcp', ['transactions:read', 'transactions:write', 'pending_operations:approve']),
+      }),
+    )
+    expect(response.status).toBe(303)
+    expect(new URL(response.headers.get('location')!).searchParams.get('code')).toBe('test-auth-code')
+
+    const payload = lastMintedPayload()
+    expect(payload.scopes).toEqual(['transactions:read'])
+    expect(payload.companyId).toBe('company-1')
+    expect(payload.userId).toBe('user-1')
+  })
+
+  it('viewer: a write-only client request is bounced with invalid_scope instead of a read grant it never asked for', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { role: 'viewer' }),
+    )
+    const response = await GET(
+      new Request(buildAuthorizeUrl({ ...params, scope: 'transactions:write' })),
+    )
+    expect(response.status).toBe(303)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.origin).toBe('https://claude.ai')
+    expect(location.searchParams.get('error')).toBe('invalid_scope')
+    expect(location.searchParams.get('state')).toBe('xyz')
+    expect(location.searchParams.get('code')).toBeNull()
+  })
+
+  it('member: POST keeps requested write and approve scopes', async () => {
+    // Mirrors app/api/settings/api-keys: any writer role may hold approve;
+    // the stage+approve combination is acknowledged, not blocked.
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { role: 'member' }),
+    )
+    const response = await POST(
+      new Request(buildAuthorizeUrl(params), {
+        method: 'POST',
+        body: consentForm('mcp', ['transactions:read', 'transactions:write', 'pending_operations:approve']),
+      }),
+    )
+    expect(response.status).toBe(303)
+    expect(lastMintedPayload().scopes).toEqual([
+      'transactions:read',
+      'transactions:write',
+      'pending_operations:approve',
+    ])
+  })
+
+  it('no membership row: caps to read scopes rather than trusting the form', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { role: null }),
+    )
+    const response = await POST(
+      new Request(buildAuthorizeUrl(params), {
+        method: 'POST',
+        body: consentForm('mcp', ['reports:read', 'bookkeeping:write']),
+      }),
+    )
+    expect(response.status).toBe(303)
+    expect(lastMintedPayload().scopes).toEqual(['reports:read'])
+  })
+
+  it('GET fails closed with server_error when the role lookup errors', async () => {
+    // A transient error must neither widen the grant (treat as owner) nor
+    // silently downgrade a legitimate connection to read-only.
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { error: 'boom' }),
+    )
+    const response = await GET(new Request(buildAuthorizeUrl(params)))
+    expect(response.status).toBe(500)
+    expect((await response.json()).error).toBe('server_error')
+  })
+
+  it('POST fails closed with server_error when the role lookup errors', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', undefined, undefined, { error: 'boom' }),
+    )
+    const response = await POST(
+      new Request(buildAuthorizeUrl(params), { method: 'POST', body: consentForm('mcp', ['reports:read']) }),
+    )
+    expect(response.status).toBe(303)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.searchParams.get('error')).toBe('server_error')
+    expect(location.searchParams.get('code')).toBeNull()
+    expect(mocks.createAuthCode).not.toHaveBeenCalled()
   })
 })
 
@@ -257,8 +686,8 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
-    mocks.isAllowedRedirectUri.mockResolvedValue(true)
-    mocks.requireCompanyId.mockResolvedValue('company-1')
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
     mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
   })
 
@@ -310,6 +739,63 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     expect(response.status).toBe(200)
   })
 
+  it('GET fails closed to /mfa/verify when the assurance lookup returns nothing', async () => {
+    // A transient auth error must never read as "no MFA needed": consent
+    // here mints a key that bypasses MFA on every later call.
+    const supabase = buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal1', nextLevel: 'aal1' }, 1)
+    ;(supabase.auth.mfa.getAuthenticatorAssuranceLevel as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: null,
+      error: { message: 'boom' },
+    })
+    mocks.createClient.mockResolvedValue(supabase)
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
+  })
+
+  it('GET steps up (not enroll) when a verified factor exists despite an AAL1 answer', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal1', nextLevel: 'aal1' }, 1),
+    )
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
+  })
+
+  it('GET sends a password account with no factor to /mfa/enroll with returnTo', async () => {
+    // A brand-new account created inside the OAuth popup (issue #1814) has no
+    // company, so the middleware never forced enrollment. Without this leg the
+    // consent would mint an MFA-exempt key for an account with no second factor.
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal1', nextLevel: 'aal1' }, 0),
+    )
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+
+    expect(response.status).toBeGreaterThanOrEqual(300)
+    expect(response.status).toBeLessThan(400)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.pathname).toBe('/mfa/enroll')
+    const returnTo = new URL(location.searchParams.get('returnTo')!, location.origin)
+    expect(returnTo.pathname).toBe('/api/mcp-oauth/authorize')
+    expect(returnTo.searchParams.get('state')).toBe('xyz')
+  })
+
+  it('POST refuses consent from a password account with no factor', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal1', nextLevel: 'aal1' }, 0),
+    )
+
+    const formData = new FormData()
+    formData.set('consent', 'allow')
+    const response = await POST(
+      new Request(buildAuthorizeUrl(authorizeParams), { method: 'POST', body: formData }),
+    )
+
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/enroll')
+    expect(response.headers.get('location')).not.toContain('code=')
+  })
+
   it('GET skips step-up for BankID-linked users (inherently 2FA)', async () => {
     const supabase = buildSupabase(
       { id: 'user-1' },
@@ -327,6 +813,73 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
   })
 })
 
+describe('account with no company yet (issue #1814)', () => {
+  // Someone who signed up inside the MCP client's OAuth popup has an account
+  // but no company. Consent must still complete: the key is minted unbound
+  // and binds itself once the company exists.
+  const authorizeParams = {
+    response_type: 'code',
+    redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    code_challenge: 'abc',
+    code_challenge_method: 'S256',
+    scope: 'mcp',
+    state: 'xyz',
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    mocks.getActiveCompanyId.mockResolvedValue(null)
+    mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
+  })
+
+  it('GET renders consent labelled with the account instead of a company', async () => {
+    const supabase = buildSupabase({ id: 'user-1', email: 'ny@example.se' })
+    mocks.createClient.mockResolvedValue(supabase)
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+    expect(response.status).toBe(200)
+
+    const html = await response.text()
+    expect(html).toContain('ny@example.se')
+    expect(html).toContain('inget företag')
+    expect(html).not.toContain('Test AB')
+    // No company to look up: neither company_settings nor company_members is queried.
+    expect(supabase.from).not.toHaveBeenCalled()
+  })
+
+  it('pre-ticks every scope for a companyless account (one-click consent covers the create flow)', async () => {
+    mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1', email: 'ny@example.se' }))
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+    const html = await response.text()
+
+    expect(checkboxFor(html, 'companies:write')).toContain('checked')
+    expect(checkboxFor(html, 'transactions:write')).toContain('checked')
+  })
+
+  it('POST still issues an authorization code with no role cap and a null company', async () => {
+    mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1', email: 'ny@example.se' }))
+
+    const response = await POST(
+      new Request(buildAuthorizeUrl(authorizeParams), {
+        method: 'POST',
+        body: consentForm('mcp', ['companies:write', 'companies:read']),
+      }),
+    )
+
+    expect(response.status).toBe(303)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.searchParams.get('code')).toBe('test-auth-code')
+    expect(location.searchParams.get('state')).toBe('xyz')
+
+    const payload = lastMintedPayload()
+    expect(payload.companyId).toBeNull()
+    expect(payload.scopes).toEqual(['companies:write', 'companies:read'])
+  })
+})
+
 describe('RFC 9207 iss parameter on authorization responses', () => {
   const authorizeParams = {
     response_type: 'code',
@@ -337,20 +890,13 @@ describe('RFC 9207 iss parameter on authorization responses', () => {
     state: 'xyz',
   }
 
-  // Mirrors getScopeSigningKey/signScopeBinding in the route so the POST can
-  // present a scope binding that verifies against the test service key.
-  function signScope(scopeParam: string): string {
-    const key = crypto.createHash('sha256').update('oauth-scope:test-service-key').digest()
-    return crypto.createHmac('sha256', key).update(scopeParam).digest('base64url')
-  }
-
   beforeEach(() => {
     vi.clearAllMocks()
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
     vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://app.test.example')
     mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1' }))
-    mocks.isAllowedRedirectUri.mockResolvedValue(true)
-    mocks.requireCompanyId.mockResolvedValue('company-1')
+    mocks.resolveRedirectUri.mockResolvedValue(CLAUDE)
+    mocks.getActiveCompanyId.mockResolvedValue('company-1')
     mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
   })
 
@@ -359,13 +905,8 @@ describe('RFC 9207 iss parameter on authorization responses', () => {
   })
 
   it('includes iss alongside code and state on the success redirect', async () => {
-    const formData = new FormData()
-    formData.set('consent', 'allow')
-    formData.set('scope_binding', 'mcp')
-    formData.set('scope_binding_sig', signScope('mcp'))
-
     const response = await POST(
-      new Request(buildAuthorizeUrl(authorizeParams), { method: 'POST', body: formData }),
+      new Request(buildAuthorizeUrl(authorizeParams), { method: 'POST', body: consentForm('mcp') }),
     )
 
     expect(response.status).toBe(303)

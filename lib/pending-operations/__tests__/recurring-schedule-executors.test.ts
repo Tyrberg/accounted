@@ -206,11 +206,16 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: existingRow }) // existing schedule
+    // The helper re-reads the header row scoped by company_id before touching
+    // the items: the items table has no company_id of its own, so this read is
+    // what keeps the schedule_id-scoped delete/insert inside the tenant on the
+    // service-role (RLS-off) executor path.
+    enqueue({ data: existingRow }) // header ownership read
     enqueue({
       data: [
         { sort_order: 0, description: 'Old', quantity: 1, unit: 'st', unit_price: 100, vat_rate: null },
       ],
-    }) // snapshot
+    }) // items snapshot
     enqueue({ data: null }) // delete old items
     enqueue({ data: null }) // insert new items
     enqueue({ data: null }) // finalize
@@ -236,9 +241,10 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
       items_replaced: true,
       item_count: 2,
     })
-    expect(supabase.from).toHaveBeenNthCalledWith(3, 'recurring_invoice_schedule_items')
+    expect(supabase.from).toHaveBeenNthCalledWith(3, 'recurring_invoice_schedules')
     expect(supabase.from).toHaveBeenNthCalledWith(4, 'recurring_invoice_schedule_items')
     expect(supabase.from).toHaveBeenNthCalledWith(5, 'recurring_invoice_schedule_items')
+    expect(supabase.from).toHaveBeenNthCalledWith(6, 'recurring_invoice_schedule_items')
   })
 
   it('keeps existing items when items are omitted', async () => {
@@ -382,6 +388,93 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     expect(result.status).toBe('rejected')
     expect(result.auto_rejected).toBe(true)
     expect(result.http_status).toBe(404)
+  })
+
+  /**
+   * A combined edit writes the header and then replaces the items, which
+   * PostgREST cannot do atomically. Issue #1275: an item-insert failure used to
+   * leave the header update committed, so the edit half-applied.
+   */
+  const fullExistingRow = {
+    ...existingRow,
+    name: 'Månadsavgift',
+    updated_at: '2026-07-01T00:00:00Z',
+  }
+  const snapshotItem = {
+    id: 'item-old-1',
+    created_at: '2026-07-01T00:00:00Z',
+    schedule_id: SCHEDULE_ID,
+    sort_order: 0,
+    description: 'Old',
+    quantity: 1,
+    unit: 'st',
+    unit_price: 100,
+    vat_rate: null,
+    dimensions: {},
+  }
+  const combinedChanges = {
+    schedule_id: SCHEDULE_ID,
+    changes: {
+      name: 'Nytt namn',
+      items: [{ description: 'Ny rad', quantity: 2, unit: 'tim', unit_price: 1200 }],
+    },
+  }
+
+  it('restores the prior header field when the items insert fails on a combined edit', async () => {
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-recurring-1' } }) // claim
+    enqueue({ data: fullExistingRow }) // existing schedule
+    enqueue({ data: fullExistingRow }) // header snapshot
+    enqueue({ data: { updated_at: '2026-07-30T09:00:00.000Z' } }) // header update
+    enqueue({ data: [snapshotItem] }) // items snapshot
+    enqueue({ data: null }) // delete old items
+    enqueue({ error: { message: 'items insert failed', code: '23514' } }) // items insert
+    enqueue({ data: null }) // items restore insert
+    enqueue({ data: [{ id: SCHEDULE_ID }] }) // header restore update
+    enqueue({ data: null }) // finalize
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp('update_recurring_schedule', combinedChanges),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(500)
+    const updates = findCalls('recurring_invoice_schedules', 'update')
+    expect(updates).toHaveLength(2)
+    // The rollback puts the prior name back rather than leaving it half-saved.
+    expect(updates[1][0]).toEqual({ name: 'Månadsavgift' })
+  })
+
+  it('reports the partial-state message when the items restore also fails', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-recurring-1' } }) // claim
+    enqueue({ data: fullExistingRow }) // existing schedule
+    enqueue({ data: fullExistingRow }) // header snapshot
+    enqueue({ data: { updated_at: '2026-07-30T09:00:00.000Z' } }) // header update
+    enqueue({ data: [snapshotItem] }) // items snapshot
+    enqueue({ data: null }) // delete old items
+    enqueue({ error: { message: 'items insert failed', code: '23514' } }) // items insert
+    enqueue({ error: { message: 'restore boom' } }) // items restore insert fails
+    enqueue({ data: [{ id: SCHEDULE_ID }] }) // header restore update
+    enqueue({ data: null }) // finalize
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp('update_recurring_schedule', combinedChanges),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(500)
+    // Same registry sentence the PATCH route returns.
+    expect(result.error).toMatch(/halvsparat/)
+    // And the same machine-readable code, so an MCP caller can detect the
+    // partial state without substring-matching the Swedish prose.
+    expect(result.code).toBe('INVOICE_RECURRING_UPDATE_PARTIAL')
   })
 
   it('rejects tampered change fields at the commit boundary', async () => {

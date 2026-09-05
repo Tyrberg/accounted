@@ -11,6 +11,7 @@ import { useToast } from '@/components/ui/use-toast'
 import { Loader2, ShieldCheck, LogOut } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
 import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import { resolvePostLoginDestination } from '@/lib/company/post-login-landing'
 import {
   consumeInviteCookie,
   INVITE_PROBLEM_MESSAGE_KEYS,
@@ -144,15 +145,23 @@ function MfaVerifyContent() {
         return
       }
 
-      if (returnTo.startsWith('/api/')) {
-        // Route-handler destinations (e.g. the MCP OAuth consent page)
-        // return raw HTML the client router cannot render: hard-navigate.
-        window.location.assign(returnTo)
-        return
-      }
-
-      router.push(returnTo)
-      router.refresh()
+      // Hosted byrå staff hit MFA before any dashboard, so the cockpit
+      // landing (WL-14) resolves here too: only when no explicit step-up
+      // destination was requested. Everyone else keeps returnTo/'/' exactly
+      // as before (the helper degrades to '/' on any failure). The session
+      // is AAL2 at this point, so the /api MFA gate passes.
+      //
+      // Always a hard navigation, for two reasons that point the same way.
+      // Route-handler destinations (e.g. the MCP OAuth consent page) return
+      // raw HTML the client router cannot render. And verifying raises the
+      // session to aal2, which lib/supabase/middleware.ts only re-evaluates
+      // on a fresh document request: `router.push` followed by
+      // `router.refresh` raced, the refresh won, and the user stayed on the
+      // code screen; re-entering the same code is then rejected as reuse and
+      // bumps the lockout counter (#2056, the shape #1984 fixed on enroll).
+      // returnTo went through safeReturnTo and the helper only ever returns
+      // '/clients' or '/', so the navigation stays same-origin.
+      window.location.assign(returnTo === '/' ? await resolvePostLoginDestination() : returnTo)
     } catch {
       toast({
         title: t('verify_failed_title'),
@@ -170,15 +179,15 @@ function MfaVerifyContent() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+    <div className="min-h-dvh flex flex-col items-center justify-center bg-frame p-4">
       <div className="w-full max-w-sm animate-slide-up">
         <div className="text-center mb-10">
           <div className="flex justify-center mb-4">
-            <div className="h-14 w-14 rounded-2xl bg-primary/8 flex items-center justify-center">
+            <div className="h-14 w-14 rounded-xl bg-primary/8 flex items-center justify-center">
               <ShieldCheck className="h-7 w-7 text-primary" />
             </div>
           </div>
-          <h1 className="text-2xl font-medium tracking-tight">{t('verify_title')}</h1>
+          <h1 className="text-2xl tracking-tight">{t('verify_title')}</h1>
           <p className="text-muted-foreground text-sm mt-2">
             {t('verify_subtitle_full')}
           </p>

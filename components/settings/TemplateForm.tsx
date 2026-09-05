@@ -229,12 +229,15 @@ export function TemplateForm({
       </div>
 
       <div>
-        <Label>{t('lines_label')}</Label>
+        <div className="flex items-center gap-1">
+          <Label>{t('lines_label')}</Label>
+          <InfoTooltip content={t('line_types_help')} />
+        </div>
         <div className="space-y-2 mt-1">
           {lines.map((line, i) => {
             const showRatioInput = showRatio && line.type === 'business'
             return (
-            <div key={i} className="rounded-md border border-border p-2 space-y-1.5">
+            <div key={i} className="rounded-lg border border-border p-2 space-y-1.5">
               <div className="flex items-center gap-2">
                 <Input
                   value={line.account}
@@ -271,7 +274,7 @@ export function TemplateForm({
                 <Select value={line.type} onValueChange={(v) => updateLineType(i, v as BookingTemplateLibraryLine['type'])}>
                   <SelectTrigger className="flex-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="business">{t('type_cost')}</SelectItem>
+                    <SelectItem value="business">{t('type_cost_revenue')}</SelectItem>
                     <SelectItem value="vat">{t('type_vat')}</SelectItem>
                     <SelectItem value="settlement">{t('type_settlement')}</SelectItem>
                   </SelectContent>
@@ -320,8 +323,8 @@ export function TemplateForm({
       </div>
 
       {ratioSumOff && (
-        <div className="rounded-lg border border-warning/30 bg-warning/[0.03] px-3 py-2">
-          <p className="text-xs text-warning-foreground leading-snug">
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+          <p className="text-xs text-attn leading-snug">
             {t('ratio_sum_warning')}
           </p>
         </div>
@@ -358,16 +361,16 @@ export function TemplateForm({
       )}
 
       {nameCollision && (
-        <div className="rounded-lg border border-warning/30 bg-warning/[0.03] px-3 py-2">
-          <p className="text-xs text-warning-foreground leading-snug">
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+          <p className="text-xs text-attn leading-snug">
             {t('duplicate_name_warning')}
           </p>
         </div>
       )}
 
       {!isConvertible && (
-        <div className="rounded-lg border border-warning/30 bg-warning/[0.03] px-3 py-2">
-          <p className="text-xs text-warning-foreground leading-snug">
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+          <p className="text-xs text-attn leading-snug">
             {t('unconvertible_hint')}
           </p>
         </div>

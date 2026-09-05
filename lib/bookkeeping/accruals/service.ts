@@ -43,8 +43,10 @@ import {
   firstOfMonth,
   maxIsoDate,
 } from '@/lib/bookkeeping/accruals/compute'
+import { coerceDimensionsBag } from '@/lib/bookkeeping/dimension-resolver'
 import { roundOre, sumOre } from '@/lib/money'
 import { createLogger } from '@/lib/logger'
+import { todayIsoUtc } from '@/lib/dates/iso'
 
 const log = createLogger('bookkeeping.accruals')
 
@@ -63,6 +65,12 @@ export interface AccrualScheduleSpec {
   periodStart: string
   periodEnd: string
   description: string
+  /**
+   * Dimensions bag ({sie_dim_no: object_code}) as booked on the origin
+   * entry's interim line (invoice default_dimensions merged with the item
+   * bag). Carried onto both dissolution lines.
+   */
+  dimensions?: Record<string, string>
 }
 
 export interface PostDueResult {
@@ -74,10 +82,6 @@ export interface PostDueResult {
 
 type ScheduleRow = AccrualSchedule
 type InstallmentRow = AccrualScheduleInstallment & { schedule?: ScheduleRow | null }
-
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10)
-}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -121,40 +125,53 @@ async function findNextOpenPeriodStart(
 }
 
 function dissolutionLines(
-  schedule: Pick<ScheduleRow, 'direction' | 'balance_account' | 'target_account'>,
+  schedule: Pick<
+    ScheduleRow,
+    'direction' | 'balance_account' | 'target_account' | 'dimensions'
+  >,
   amount: number,
   lineDescription: string,
 ): CreateJournalEntryLineInput[] {
-  if (schedule.direction === 'expense') {
-    return [
-      {
-        account_number: schedule.target_account,
-        debit_amount: amount,
-        credit_amount: 0,
-        line_description: lineDescription,
-      },
-      {
-        account_number: schedule.balance_account,
-        debit_amount: 0,
-        credit_amount: amount,
-        line_description: lineDescription,
-      },
-    ]
+  const lines: CreateJournalEntryLineInput[] =
+    schedule.direction === 'expense'
+      ? [
+          {
+            account_number: schedule.target_account,
+            debit_amount: amount,
+            credit_amount: 0,
+            line_description: lineDescription,
+          },
+          {
+            account_number: schedule.balance_account,
+            debit_amount: 0,
+            credit_amount: amount,
+            line_description: lineDescription,
+          },
+        ]
+      : [
+          {
+            account_number: schedule.balance_account,
+            debit_amount: amount,
+            credit_amount: 0,
+            line_description: lineDescription,
+          },
+          {
+            account_number: schedule.target_account,
+            debit_amount: 0,
+            credit_amount: amount,
+            line_description: lineDescription,
+          },
+        ]
+  // Both origin generators tag the interim (17xx/29xx) line with the item's
+  // merged bag (groupExpenseBuckets / generatePerRateLines keep the bag when
+  // the account swaps to the interim account), so BOTH dissolution lines get
+  // the schedule's bag: the P&L line for the per-dimension result, the
+  // balance line so per-dimension views of the interim account net to zero.
+  const dimensions = coerceDimensionsBag(schedule.dimensions)
+  if (dimensions) {
+    for (const line of lines) line.dimensions = { ...dimensions }
   }
-  return [
-    {
-      account_number: schedule.balance_account,
-      debit_amount: amount,
-      credit_amount: 0,
-      line_description: lineDescription,
-    },
-    {
-      account_number: schedule.target_account,
-      debit_amount: 0,
-      credit_amount: amount,
-      line_description: lineDescription,
-    },
-  ]
+  return lines
 }
 
 /**
@@ -199,6 +216,7 @@ export async function createAccrualSchedule(
       posting_floor_date: options.postingFloorDate,
       status: 'active',
       description: spec.description,
+      dimensions: spec.dimensions ?? {},
     })
     .select('*')
     .single()
@@ -265,7 +283,7 @@ export async function postDueInstallments(
     today?: string
   } = {},
 ): Promise<PostDueResult> {
-  const today = options.today ?? todayIso()
+  const today = options.today ?? todayIsoUtc()
   const result: PostDueResult = { posted: 0, failed: 0, skipped: 0, errors: [] }
 
   let query = supabase
@@ -456,7 +474,7 @@ export async function dissolveScheduleNow(
   scheduleId: string,
   options: { today?: string } = {},
 ): Promise<{ journalEntryId: string; amount: number }> {
-  const today = options.today ?? todayIso()
+  const today = options.today ?? todayIsoUtc()
 
   const { data: scheduleData, error: scheduleError } = await supabase
     .from('accrual_schedules')

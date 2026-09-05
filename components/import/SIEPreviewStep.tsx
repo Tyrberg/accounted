@@ -7,7 +7,6 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { formatCurrency } from '@/lib/utils'
 import {
-  Building2,
   Calendar,
   FileText,
   CheckCircle,
@@ -16,6 +15,7 @@ import {
   ArrowRight,
   BarChart3,
   Info,
+  Briefcase,
 } from 'lucide-react'
 import type { ImportPreview, ParseIssue } from '@/lib/import/types'
 
@@ -27,6 +27,12 @@ interface SIEPreviewStepProps {
   isCreatingAccounts: boolean
   onContinue: () => void
   onBack: () => void
+  /**
+   * Opens the manual "Ingående balanser" wizard (issue #2082). Offered next to
+   * the IB-imbalance acknowledgement so a user who rightly hesitates to book an
+   * unexplained amount to 2099 has somewhere to go other than support.
+   */
+  onOpenManualOpeningBalances?: () => void
 }
 
 export default function SIEPreviewStep({
@@ -37,6 +43,7 @@ export default function SIEPreviewStep({
   isCreatingAccounts,
   onContinue,
   onBack,
+  onOpenManualOpeningBalances,
 }: SIEPreviewStepProps) {
   const errors = issues.filter((i) => i.severity === 'error')
   const warnings = issues.filter((i) => i.severity === 'warning')
@@ -62,7 +69,7 @@ export default function SIEPreviewStep({
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Building2 className="h-5 w-5" />
+            <Briefcase className="h-5 w-5" />
             Företagsinformation
           </CardTitle>
           <CardDescription>Information från SIE-filen</CardDescription>
@@ -142,15 +149,18 @@ export default function SIEPreviewStep({
         <Card>
           <CardContent className="pt-6">
             <div className="flex items-center gap-2 text-muted-foreground mb-1">
-              <span className="text-sm">IB Summa</span>
+              <span className="text-sm">IB, summa debet</span>
             </div>
             <p className="text-2xl font-display tabular-nums">{formatCurrency(preview.openingBalanceTotal)}</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Summan av alla debetsaldon i ingående balans, inte ett enskilt kontosaldo.
+            </p>
           </CardContent>
         </Card>
       </div>
 
       {/* Trial balance check */}
-      <Card className={preview.trialBalance.isBalanced ? 'border-success/50' : 'border-warning/50'}>
+      <Card className={preview.trialBalance.isBalanced ? 'border-success/50' : 'border-border'}>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             {preview.trialBalance.isBalanced ? (
@@ -185,7 +195,7 @@ export default function SIEPreviewStep({
 
           {/* Significant imbalance: explain + require acknowledgement before continuing */}
           {significantImbalance && (
-            <div className="mt-4 space-y-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-3">
+            <div className="mt-4 space-y-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
               <div className="flex items-start gap-2 text-sm">
                 <AlertCircle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
                 <div className="space-y-1">
@@ -193,12 +203,31 @@ export default function SIEPreviewStep({
                     Ingående balanser balanserar inte ({formatCurrency(Math.abs(ibDiff))})
                   </p>
                   <p className="text-muted-foreground">
-                    Det betyder oftast att exporten från ditt bokföringssystem är ofullständig:
-                    t.ex. att skulder saknas eller att föregående års resultat inte är disponerat.
-                    Om du fortsätter bokförs differensen på konto 2099 (Årets resultat), vilket
-                    nästan alltid blir fel. Vi rekommenderar att du rättar exporten i källsystemet
-                    och laddar upp filen på nytt.
+                    Vanligaste orsaken är att föregående års resultat aldrig fördes över till
+                    eget kapital i det gamla programmet. SpeedLedger parkerar det till exempel på
+                    egna 9xxx-konton (9030/9031 Obokat resultat), och då summerar inte filens
+                    ingående balanser till noll: differensen är det oförda resultatet. En annan
+                    orsak är en ofullständig export, till exempel att skulder saknas.
                   </p>
+                  <p className="text-muted-foreground">
+                    Rätta i källsystemet och ladda upp filen på nytt, eller lägg in de ingående
+                    balanserna för hand i guiden Ingående balanser, där du kan rätta raderna
+                    själv innan de bokförs (den här filen importeras då inte). Fortsätter du ändå
+                    bokförs differensen på konto 2099 (Årets resultat), vilket nästan alltid blir
+                    fel.
+                  </p>
+                  {onOpenManualOpeningBalances && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-1"
+                      onClick={onOpenManualOpeningBalances}
+                    >
+                      Lägg in ingående balanser för hand
+                      <ArrowRight className="ml-2 h-4 w-4" />
+                    </Button>
+                  )}
                 </div>
               </div>
               <label className="flex items-start gap-2 text-sm cursor-pointer">
@@ -222,7 +251,7 @@ export default function SIEPreviewStep({
           preview.mappingStatus.unmapped > 0
             ? 'border-destructive/50'
             : preview.mappingStatus.lowConfidence > 0
-            ? 'border-warning/50'
+            ? 'border-border'
             : 'border-success/50'
         }
       >
@@ -356,7 +385,7 @@ export default function SIEPreviewStep({
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <Card className="border-warning/50">
+        <Card className="border-border">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <AlertCircle className="h-5 w-5 text-warning" />

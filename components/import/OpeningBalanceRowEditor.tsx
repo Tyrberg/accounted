@@ -1,12 +1,14 @@
 'use client'
 
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
-import Fuse from 'fuse.js'
+import Fuse, { type IFuseOptions } from 'fuse.js'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Plus, Trash2, AlertTriangle, Scale } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { BAS_REFERENCE } from '@/lib/bookkeeping/bas-data'
+import { getBasLoaded } from '@/lib/bookkeeping/bas-lazy'
+import { useBasReference } from '@/lib/bookkeeping/use-bas-reference'
+import type { BASReferenceAccount } from '@/lib/bookkeeping/bas-reference'
 
 export interface EditableRow {
   id: string
@@ -36,32 +38,32 @@ interface OpeningBalanceRowEditorProps {
 }
 
 // Balance-sheet accounts (class 1-2) drive the primary suggestions; numeric
-// queries fall back to the full chart.
-const BALANCE_SHEET_ACCOUNTS = BAS_REFERENCE.filter(
-  (a) => a.account_class === 1 || a.account_class === 2,
-)
-const ALL_BAS_ACCOUNTS = BAS_REFERENCE
+// queries fall back to the full chart. The chart is a lazily loaded chunk
+// (lib/bookkeeping/bas-lazy.ts): the indexes are built on first use after
+// it has arrived, and the suggestion list is empty until then.
+const FUSE_OPTIONS: IFuseOptions<BASReferenceAccount> = {
+  keys: ['account_number', 'account_name'],
+  threshold: 0.3,
+  includeScore: true,
+}
 
-let fuseInstance: Fuse<(typeof BAS_REFERENCE)[0]> | null = null
-function getFuse() {
-  if (!fuseInstance) {
-    fuseInstance = new Fuse(ALL_BAS_ACCOUNTS, {
-      keys: ['account_number', 'account_name'],
-      threshold: 0.3,
-      includeScore: true,
-    })
-  }
+let fuseInstance: Fuse<BASReferenceAccount> | null = null
+function getFuse(): Fuse<BASReferenceAccount> | null {
+  const chart = getBasLoaded()
+  if (!chart) return null
+  if (!fuseInstance) fuseInstance = new Fuse(chart, FUSE_OPTIONS)
   return fuseInstance
 }
 
-let balanceFuseInstance: Fuse<(typeof BAS_REFERENCE)[0]> | null = null
-function getBalanceFuse() {
+let balanceFuseInstance: Fuse<BASReferenceAccount> | null = null
+function getBalanceFuse(): Fuse<BASReferenceAccount> | null {
+  const chart = getBasLoaded()
+  if (!chart) return null
   if (!balanceFuseInstance) {
-    balanceFuseInstance = new Fuse(BALANCE_SHEET_ACCOUNTS, {
-      keys: ['account_number', 'account_name'],
-      threshold: 0.3,
-      includeScore: true,
-    })
+    balanceFuseInstance = new Fuse(
+      chart.filter((a) => a.account_class === 1 || a.account_class === 2),
+      FUSE_OPTIONS,
+    )
   }
   return balanceFuseInstance
 }
@@ -159,12 +161,16 @@ export default function OpeningBalanceRowEditor({
     onChangeRef.current({ rows, totals, canSubmit })
   }, [rows, totals, canSubmit])
 
+  const basReady = useBasReference()
   const autocompleteResults = useMemo(() => {
     if (!autocompleteQuery || autocompleteQuery.length < 1) return []
     const isNumeric = /^\d+$/.test(autocompleteQuery)
     const fuse = isNumeric ? getFuse() : getBalanceFuse()
+    if (!fuse) return []
     return fuse.search(autocompleteQuery, { limit: 8 }).map((r) => r.item)
-  }, [autocompleteQuery])
+  // basReady re-runs the search once the chart chunk has arrived.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autocompleteQuery, basReady])
 
   const updateRow = useCallback((id: string, updates: Partial<EditableRow>) => {
     setRows((prev) =>
@@ -208,7 +214,7 @@ export default function OpeningBalanceRowEditor({
   }, [])
 
   const selectAutocompleteItem = useCallback(
-    (rowId: string, account: (typeof BAS_REFERENCE)[0]) => {
+    (rowId: string, account: BASReferenceAccount) => {
       updateRow(rowId, {
         account_number: account.account_number,
         account_name: account.account_name,
@@ -239,7 +245,7 @@ export default function OpeningBalanceRowEditor({
   return (
     <div className="space-y-4">
       {/* Table */}
-      <div className="overflow-x-auto rounded-md border">
+      <div className="overflow-x-auto rounded-lg border">
         <table className="w-full text-sm">
           <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
             <tr className="border-b">
@@ -284,7 +290,7 @@ export default function OpeningBalanceRowEditor({
                   {activeAutocomplete === row.id && autocompleteResults.length > 0 && (
                     <div
                       ref={autocompleteRef}
-                      className="absolute z-50 top-full left-3 mt-1 w-72 max-h-48 overflow-y-auto rounded-md border bg-popover shadow-md"
+                      className="absolute z-50 top-full left-3 mt-1 w-72 max-h-48 overflow-y-auto rounded-lg border bg-popover shadow-md"
                     >
                       {autocompleteResults.map((item) => (
                         <button
@@ -415,7 +421,7 @@ export default function OpeningBalanceRowEditor({
 
       {/* Warnings */}
       {!totals.isBalanced && Math.abs(totals.diff) > 1 && (
-        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/5 px-4 py-3">
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
           <AlertTriangle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
           <p className="text-sm text-warning">
             Debet och kredit balanserar inte. Differens:{' '}

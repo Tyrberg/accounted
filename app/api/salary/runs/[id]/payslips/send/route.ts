@@ -3,12 +3,13 @@ import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getEmailService } from '@/lib/email/service'
-import { getBranding } from '@/lib/branding/service'
+import { getSenderForCompany, getBaseUrlForBrand } from '@/lib/email/brand-sender'
 import { rotateLinkForEmployee } from '@/lib/salary/payslips/links'
 import { buildPayslipLinkEmail } from '@/lib/salary/payslips/email-template'
 import { getCompanyDisplayName } from '@/lib/company/context'
 import { requireCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
+import { guardSandbox } from '@/lib/sandbox/guard'
 
 ensureInitialized()
 
@@ -25,6 +26,14 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
   'salary_run.payslips_send',
   async (_request, { supabase, companyId, user, log, requestId }, { params }) => {
     const { id } = await params
+
+    // The sandbox must never send a real email (lib/sandbox/guard.ts): this
+    // route reaches the live Resend service on hosted, and the demo now ships
+    // with a booked salary run, which puts "Skicka lönebesked" one click from
+    // an anonymous visitor. Sibling send paths (/api/invoices/[id]/send) have
+    // always been guarded; this one was missed.
+    const sandboxBlocked = await guardSandbox(supabase, companyId)
+    if (sandboxBlocked) return sandboxBlocked
 
     const blocked = await requireCapability(supabase, companyId, CAPABILITY.email_send)
     if (blocked) return blocked
@@ -68,7 +77,10 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       return errorResponseFromCode('SALARY_PAYSLIPS_NO_EMPLOYEES', log, { requestId })
     }
 
-    const appUrl = getBranding().appUrl
+    // Brand mail (WL-13): payslip links and the sender identity follow the
+    // company's brand; no brand = canonical URL and platform sender as before.
+    const sender = await getSenderForCompany(companyId)
+    const appUrl = getBaseUrlForBrand(sender.brand)
 
     let sent = 0
     let skipped = 0
@@ -119,6 +131,9 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
           subject: email.subject,
           html: email.html,
           text: email.text,
+          fromName: sender.fromName ?? undefined,
+          fromAddress: sender.fromAddress ?? undefined,
+          replyTo: sender.replyTo ?? undefined,
         })
 
         if (!sendResult.success) {

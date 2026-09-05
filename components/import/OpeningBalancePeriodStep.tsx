@@ -1,12 +1,12 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useFiscalPeriods } from '@/lib/reference-data/hooks'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
 import { AlertCircle, Loader2, CheckCircle2 } from 'lucide-react'
-import type { FiscalPeriod } from '@/types'
 
 interface EditableRow {
   id: string
@@ -33,9 +33,12 @@ export default function OpeningBalancePeriodStep({
   isLoading,
   error,
 }: OpeningBalancePeriodStepProps) {
-  const [periods, setPeriods] = useState<FiscalPeriod[]>([])
+  // Session-cached period list (lib/reference-data).
+  const { periods, isLoading: loadingPeriods } = useFiscalPeriods()
   const [selectedPeriodId, setSelectedPeriodId] = useState<string>('')
-  const [loadingPeriods, setLoadingPeriods] = useState(true)
+  // Auto-select the first open period without OB once per load, never again
+  // on a background refresh of the list (that would override a user pick).
+  const autoSelectedRef = useRef(false)
 
   // Compute totals
   let totalDebit = 0
@@ -51,31 +54,13 @@ export default function OpeningBalancePeriodStep({
   const isBalanced = Math.round((totalDebit - totalCredit) * 100) === 0
 
   useEffect(() => {
-    async function fetchPeriods() {
-      setLoadingPeriods(true)
-      try {
-        const res = await fetch('/api/bookkeeping/fiscal-periods')
-        if (res.ok) {
-          const data = await res.json()
-          const allPeriods: FiscalPeriod[] = data.data || []
-          setPeriods(allPeriods)
-
-          // Auto-select first open period without OB
-          const openPeriod = allPeriods.find(
-            (p) => !p.is_closed && !p.locked_at && !p.opening_balances_set,
-          )
-          if (openPeriod) {
-            setSelectedPeriodId(openPeriod.id)
-          }
-        }
-      } catch {
-        // Silent, user can still select period
-      } finally {
-        setLoadingPeriods(false)
-      }
-    }
-    fetchPeriods()
-  }, [])
+    if (loadingPeriods || autoSelectedRef.current) return
+    autoSelectedRef.current = true
+    const openPeriod = periods.find(
+      (p) => !p.is_closed && !p.locked_at && !p.opening_balances_set,
+    )
+    if (openPeriod) setSelectedPeriodId(openPeriod.id)
+  }, [periods, loadingPeriods])
 
   const selectedPeriod = periods.find((p) => p.id === selectedPeriodId)
   const periodHasOB = !!selectedPeriod?.opening_balances_set
@@ -115,7 +100,7 @@ export default function OpeningBalancePeriodStep({
               Hämtar perioder...
             </div>
           ) : periods.length === 0 ? (
-            <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/5 px-4 py-3">
+            <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
               <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
               <p className="text-sm text-warning">
                 Inga räkenskapsperioder hittades. Skapa en räkenskapsperiod under Bokföring först.
@@ -142,7 +127,7 @@ export default function OpeningBalancePeriodStep({
 
         {/* Replace notice: selecting a period that already has IB corrects it */}
         {periodHasOB && !periodIsClosed && !periodIsLocked && (
-          <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/5 px-4 py-3">
+          <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
             <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
             <p className="text-sm text-warning">
               Denna period har redan ingående balanser. Om du fortsätter makuleras (stornas) den

@@ -7,70 +7,12 @@
 
 import * as crypto from 'crypto'
 import type { BankFileFormat, BankFileFormatId, BankFileParseResult, ParsedBankTransaction } from './types'
-import { nordeaFormat } from './formats/nordea'
-import { nordeaBusinessFormat } from './formats/nordea-business'
-import { sebFormat } from './formats/seb'
-import { swedbankFormat } from './formats/swedbank'
-import { handelsbankenFormat } from './formats/handelsbanken'
-import { lansforsakringarFormat } from './formats/lansforsakringar'
-import { icaBankenFormat } from './formats/ica-banken'
-import { skandiaFormat } from './formats/skandia'
-import { lunarFormat } from './formats/lunar'
-import { northmillFormat } from './formats/northmill'
-import { wiseFormat } from './formats/wise'
-import { camt053Format } from './formats/camt053'
-import { genericCSVFormat } from './formats/generic-csv'
 
-/**
- * Ordered list of format detectors.
- * camt.053 first (XML detection is unambiguous), then bank-specific CSV formats.
- * New bank formats go after existing ones but before generic_csv.
- * Generic CSV is last: it never auto-detects (manual fallback only).
- */
-const FORMATS: BankFileFormat[] = [
-  camt053Format,
-  nordeaFormat,
-  nordeaBusinessFormat,
-  sebFormat,
-  swedbankFormat,
-  handelsbankenFormat,
-  lansforsakringarFormat,
-  icaBankenFormat,
-  skandiaFormat,
-  lunarFormat,
-  northmillFormat,
-  wiseFormat,
-  genericCSVFormat,
-]
-
-/**
- * Get a format by its ID
- */
-export function getFormat(id: BankFileFormatId): BankFileFormat | undefined {
-  return FORMATS.find((f) => f.id === id)
-}
-
-/**
- * Get all available formats
- */
-export function getAllFormats(): BankFileFormat[] {
-  return FORMATS
-}
-
-/**
- * Auto-detect the bank file format from content and filename
- *
- * Returns the first matching format, or null if no format matches.
- * Uses filename extension as a hint (e.g. .xml for camt.053).
- */
-export function detectFileFormat(content: string, filename: string): BankFileFormat | null {
-  for (const format of FORMATS) {
-    if (format.detect(content, filename)) {
-      return format
-    }
-  }
-  return null
-}
+// The format registry and detection live in ./formats (no Node imports) so
+// client components (BankFileImportHistory) can name a format without
+// pulling this module's `crypto` import into the browser bundle.
+import { detectFileFormat, getAllFormats, getFormat } from './formats'
+export { detectFileFormat, getAllFormats, getFormat } from './formats'
 
 /**
  * Parse a bank file with auto-detection or explicit format
@@ -95,15 +37,47 @@ export function parseBankFile(
         transactions: [],
         date_from: null,
         date_to: null,
-        issues: [{ row: 0, message: `Unknown format: ${formatId}`, severity: 'error' }],
+        issues: [{ row: 0, message: `Okänt format: ${formatId}`, severity: 'error' }],
         stats: { total_rows: 0, parsed_rows: 0, skipped_rows: 0, total_income: 0, total_expenses: 0 },
       }
     }
+
+    const explicitResult = format.parse(content)
+    if (explicitResult.transactions.length > 0 || formatId === 'generic_csv') {
+      // A working explicit parse is never overridden. generic_csv is also
+      // exempt: it is the manual column-mapping escape hatch and its default
+      // mapping legitimately parses 0 rows before the user maps columns.
+      return explicitResult
+    }
+
+    // The explicit choice parsed nothing: fall back to auto-detection so an
+    // explicitly selected bank is never WORSE than "Automatisk identifiering".
+    // detectFileFormat can never return generic_csv (its detect() is always
+    // false), so this cannot reroute the UI into the mapping flow.
+    const detected = detectFileFormat(content, filename)
+    if (detected && detected.id !== formatId) {
+      const detectedResult = detected.parse(content)
+      if (detectedResult.transactions.length > 0) {
+        return {
+          ...detectedResult,
+          issues: [
+            {
+              row: 0,
+              message: `Filen matchade inte det valda formatet (${format.name}) och tolkades istället som ${detected.name}.`,
+              severity: 'info',
+            },
+            ...detectedResult.issues,
+          ],
+        }
+      }
+    }
+
+    return explicitResult
   } else {
     format = detectFileFormat(content, filename) || undefined
     if (!format) {
       // Build diagnostic message listing which formats were tried
-      const tried = FORMATS
+      const tried = getAllFormats()
         .filter(f => f.id !== 'generic_csv')
         .map(f => f.name)
       const firstLine = content.split('\n')[0]?.substring(0, 80) || ''
@@ -148,6 +122,10 @@ export function generateExternalId(
   // `-fee` suffix for fee rows) in raw_line: use it so re-importing the same
   // statement dedups exactly instead of relying on the row hash.
   if (formatId === 'wise' && tx.raw_line) {
+    return `wise_${tx.raw_line}`
+  }
+
+  if (formatId === 'wise_statement' && tx.raw_line) {
     return `wise_${tx.raw_line}`
   }
 

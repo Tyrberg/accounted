@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
+import { useAccounts } from '@/lib/reference-data/hooks'
 import { useLocale, useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -10,12 +11,11 @@ import { formatCurrency, formatDate, cn } from '@/lib/utils'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { isInvoiceBookingRateMissing, previewedFxGainSek } from './invoice-match-fx'
 import {
-  isMatchableInvoice,
-  isMatchableSupplierInvoice,
+  getInvoiceMatchTargetState,
+  getSupplierInvoiceMatchTargetState,
 } from '@/lib/invoices/matchable-statuses'
 import { CheckCircle2, AlertTriangle, Trash2, Plus, Pencil } from 'lucide-react'
 import type { TransactionWithInvoice } from './transaction-types'
-import type { BASAccount } from '@/types'
 
 interface DuplicateCandidate {
   journal_entry_id: string
@@ -153,14 +153,16 @@ export default function InvoiceMatchDialog({
   // still be stale (fetched before the other match, or settled in another
   // tab), so re-check here rather than trust the pointer.
   //
-  // This is not an advisory guard: both match routes reject a settled target
-  // outright (MATCH_INVOICE_ALREADY_PAID / MATCH_SI_ALREADY_PAID), so there is
-  // no "match anyway" that could succeed. Say so and block, instead of
-  // computing a diff against a 0 kr remaining balance and calling the result
-  // a partial payment.
-  const targetSettled =
-    (isSupplierInvoice && !isMatchableSupplierInvoice(transaction!.potential_supplier_invoice)) ||
-    (isCustomerInvoice && !isMatchableInvoice(transaction!.potential_invoice))
+  // This is not an advisory guard: the match routes reject any target outside
+  // their open-status CAS lists, so there is no "match anyway" that could
+  // succeed. Distinguish a paid or zero-balance target from a different
+  // non-open status so the blocking copy explains the actual problem.
+  const targetMatchState = isSupplierInvoice
+    ? getSupplierInvoiceMatchTargetState(transaction!.potential_supplier_invoice)
+    : isCustomerInvoice
+      ? getInvoiceMatchTargetState(transaction!.potential_invoice)
+      : null
+  const targetBlocked = targetMatchState !== null && targetMatchState !== 'matchable'
 
   const [candidate, setCandidate] = useState<DuplicateCandidate | null>(null)
   const [isCheckingDuplicate, setIsCheckingDuplicate] = useState(false)
@@ -178,29 +180,10 @@ export default function InvoiceMatchDialog({
   const [manualRate, setManualRate] = useState<string>('')
   // BAS accounts power the AccountCombobox suggestions in edit mode. Loaded
   // once on dialog open; same endpoint that PaymentBookingDialog uses.
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const { accounts } = useAccounts()
 
   useEffect(() => {
-    if (!open) return
-    let cancelled = false
-    ;(async () => {
-      try {
-        const res = await fetch('/api/bookkeeping/accounts')
-        if (!res.ok) return
-        const data = await res.json()
-        if (!cancelled) setAccounts((data?.data as BASAccount[]) ?? [])
-      } catch {
-        // Non-fatal: combobox just shows no suggestions, user can still
-        // type the number manually.
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [open])
-
-  useEffect(() => {
-    if (!open || !transactionId) {
+    if (!open || !transactionId || targetBlocked) {
       setPreview(null)
       setPreviewFailure(null)
       setIsEditing(false)
@@ -260,11 +243,27 @@ export default function InvoiceMatchDialog({
     return () => {
       cancelled = true
     }
-  }, [open, transactionId, isCustomerInvoice, isSupplierInvoice, invoiceId, supplierInvoiceId, uiLocale])
+  }, [
+    open,
+    transactionId,
+    isCustomerInvoice,
+    isSupplierInvoice,
+    invoiceId,
+    supplierInvoiceId,
+    targetBlocked,
+    uiLocale,
+  ])
 
   useEffect(() => {
-    if (!open || !transactionId || !isCustomerInvoice || !onLinkToExisting) {
+    if (
+      !open ||
+      !transactionId ||
+      !isCustomerInvoice ||
+      !onLinkToExisting ||
+      targetBlocked
+    ) {
       setCandidate(null)
+      setIsCheckingDuplicate(false)
       return
     }
     let cancelled = false
@@ -285,7 +284,7 @@ export default function InvoiceMatchDialog({
     return () => {
       cancelled = true
     }
-  }, [open, transactionId, isCustomerInvoice, onLinkToExisting])
+  }, [open, transactionId, isCustomerInvoice, onLinkToExisting, targetBlocked])
 
   // Live balance + validity. The dialog disables Confirm while edit mode is
   // active and the entry is invalid; an out-of-balance entry can't be sent.
@@ -368,9 +367,11 @@ export default function InvoiceMatchDialog({
   }
 
   const matchTitle = isSupplierInvoice ? t('title_supplier') : t('title_customer')
-  const matchDescription = isSupplierInvoice
-    ? t('description_supplier')
-    : t('description_customer')
+  const matchDescription = targetBlocked
+    ? t('description_blocked')
+    : isSupplierInvoice
+      ? t('description_supplier')
+      : t('description_customer')
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -383,12 +384,12 @@ export default function InvoiceMatchDialog({
         {transaction && (isCustomerInvoice || isSupplierInvoice) && (
           <div className="space-y-4">
             {/* Duplicate-payment warning: customer-side only, only when a candidate exists */}
-            {candidate && isCustomerInvoice && (
-              <div className="rounded-lg border border-warning/40 bg-warning/10 p-4 space-y-3">
+            {!targetBlocked && candidate && isCustomerInvoice && (
+              <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-3">
                 <div className="flex items-start gap-2">
-                  <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-warning-foreground" />
+                  <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-attn" />
                   <div className="text-sm space-y-1">
-                    <p className="font-medium text-warning-foreground">{t('duplicate_title')}</p>
+                    <p className="font-medium text-attn">{t('duplicate_title')}</p>
                     {/* candidate.amount is the voucher leg's SEK debit
                         (duplicate-payment-detection.ts), so it is formatted as
                         SEK regardless of the transaction's currency: an
@@ -528,17 +529,24 @@ export default function InvoiceMatchDialog({
                 The customer branch previously fell back to .total; both
                 branches now mirror the supplier branch's correct logic. */}
             {(() => {
-              // Settled target: the amount comparison below would be
-              // meaningless (it measures against a 0 kr remaining balance and
-              // reports the whole transaction as a "differens"), and no
-              // outcome it describes is reachable. Replace it outright.
-              if (targetSettled) {
+              // A blocked target makes the amount comparison below
+              // meaningless, and no outcome it describes is reachable.
+              if (targetBlocked) {
+                const isSettled = targetMatchState === 'settled'
                 return (
-                  <div className="flex items-start gap-2 p-3 rounded-lg bg-warning/10 text-warning-foreground">
+                  <div className="flex items-start gap-2 p-3 rounded-lg bg-muted/30 text-attn">
                     <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" />
                     <div className="text-sm">
-                      <p className="font-medium">{t('target_settled_title')}</p>
-                      <p>{t('target_settled_description')}</p>
+                      <p className="font-medium">
+                        {t(isSettled ? 'target_settled_title' : 'target_not_open_title')}
+                      </p>
+                      <p>
+                        {t(
+                          isSettled
+                            ? 'target_settled_description'
+                            : 'target_not_open_description',
+                        )}
+                      </p>
                     </div>
                   </div>
                 )
@@ -590,7 +598,7 @@ export default function InvoiceMatchDialog({
               }
 
               return (
-                <div className="flex items-start gap-2 p-3 rounded-lg bg-warning/10 text-warning-foreground">
+                <div className="flex items-start gap-2 p-3 rounded-lg bg-muted/30 text-attn">
                   <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" />
                   <div className="text-sm">
                     <p className="font-medium">{t('amounts_differ')}</p>
@@ -624,10 +632,10 @@ export default function InvoiceMatchDialog({
                 front instead of showing a confident zero. Rendered on its own
                 rather than inside the Valutaomräkning card below, because in
                 this state the preview 400s and that card never renders. */}
-            {invoiceRateMissing && (
-              <div className="rounded-lg border border-warning/40 bg-warning/5 p-4">
+            {!targetBlocked && invoiceRateMissing && (
+              <div className="rounded-lg border border-border bg-muted/30 p-4">
                 <div className="flex items-start gap-2">
-                  <AlertTriangle className="h-4 w-4 mt-0.5 text-warning-foreground flex-shrink-0" />
+                  <AlertTriangle className="h-4 w-4 mt-0.5 text-attn flex-shrink-0" />
                   <div className="flex-1 text-sm">
                     {/* Untinted title, matching the sibling
                         fx_rate_unavailable panel below: the ochre lives in the
@@ -651,7 +659,7 @@ export default function InvoiceMatchDialog({
                 When the payment-date rate lookup failed, swaps in a
                 manual-rate input so the user can type the rate from their
                 bank statement and retry. */}
-            {preview?.fx_conversion?.required && (() => {
+            {!targetBlocked && preview?.fx_conversion?.required && (() => {
               const fx = preview.fx_conversion
               if (!fx?.required) return null
               // fx_conversion is only produced by the customer-invoice preview
@@ -664,9 +672,9 @@ export default function InvoiceMatchDialog({
               if ('error' in fx) {
                 // Riksbanken unavailable: show manual rate input.
                 return (
-                  <div className="rounded-lg border border-warning/40 bg-warning/5 p-4 space-y-3">
+                  <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-3">
                     <div className="flex items-start gap-2">
-                      <AlertTriangle className="h-4 w-4 mt-0.5 text-warning-foreground flex-shrink-0" />
+                      <AlertTriangle className="h-4 w-4 mt-0.5 text-attn flex-shrink-0" />
                       <div className="flex-1 text-sm">
                         <p className="font-medium">{t('fx_rate_unavailable_title')}</p>
                         <p className="text-muted-foreground mt-1">
@@ -755,7 +763,7 @@ export default function InvoiceMatchDialog({
                 blocked the preview: the ochre panel above already owns that
                 story, and an empty "Bokföring" card with a second phrasing of
                 the same refusal reads as two separate problems. */}
-            {(preview || (previewFailure && !invoiceRateMissing)) && (
+            {!targetBlocked && (preview || (previewFailure && !invoiceRateMissing)) && (
               <div className="rounded-lg border p-4 space-y-3">
                 <div className="flex items-center justify-between">
                   <p className="text-sm font-medium">{t('booking_title')}</p>
@@ -852,7 +860,7 @@ export default function InvoiceMatchDialog({
                         {/* Side toggle: segmented control. Clicking either
                             button picks that side; the amount stays the
                             same. */}
-                        <div className="inline-flex rounded-md border bg-background overflow-hidden h-9">
+                        <div className="inline-flex rounded-lg border bg-background overflow-hidden h-9">
                           <button
                             type="button"
                             onClick={() => updateEditLine(i, { side: 'debit' })}
@@ -928,15 +936,16 @@ export default function InvoiceMatchDialog({
               </div>
             )}
 
-            {/* What will happen */}
-            <div className="rounded-lg bg-muted/50 p-4 space-y-2">
-              <p className="text-sm font-medium">{t('on_confirm_title')}</p>
-              <ul className="text-sm text-muted-foreground space-y-1">
-                <li>• {isSupplierInvoice ? t('on_confirm_link_supplier') : t('on_confirm_link_customer')}</li>
-                <li>• {isSupplierInvoice ? t('on_confirm_mark_paid_supplier') : t('on_confirm_mark_paid_customer')}</li>
-                <li>• {t('on_confirm_voucher')}</li>
-              </ul>
-            </div>
+            {!targetBlocked && (
+              <div className="rounded-lg bg-muted/50 p-4 space-y-2">
+                <p className="text-sm font-medium">{t('on_confirm_title')}</p>
+                <ul className="text-sm text-muted-foreground space-y-1">
+                  <li>• {isSupplierInvoice ? t('on_confirm_link_supplier') : t('on_confirm_link_customer')}</li>
+                  <li>• {isSupplierInvoice ? t('on_confirm_mark_paid_supplier') : t('on_confirm_mark_paid_customer')}</li>
+                  <li>• {t('on_confirm_voucher')}</li>
+                </ul>
+              </div>
+            )}
           </div>
         )}
 
@@ -949,9 +958,9 @@ export default function InvoiceMatchDialog({
             disabled={
               isConfirming ||
               isCheckingDuplicate ||
-              // Settled target: the route rejects this unconditionally, so the
+              // Blocked target: the route rejects this unconditionally, so the
               // button has no reachable success path.
-              targetSettled ||
+              targetBlocked ||
               (isEditing && !editValidation.isValid) ||
               // Block confirm when cross-currency lookup failed and the user
               // hasn't typed a manual rate yet. Same-currency and auto-rate

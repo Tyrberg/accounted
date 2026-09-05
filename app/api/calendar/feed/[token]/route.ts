@@ -1,25 +1,16 @@
-import { createClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { generateCalendarFeed } from '@/lib/calendar/ics-generator'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { createLogger } from '@/lib/logger'
+import type { Deadline, Invoice } from '@/types'
+import { createTokenRateLimiter } from '@/lib/api/token-rate-limit'
+import { UUID_RE } from '@/lib/invariants/uuid'
 
 const log = createLogger('api/calendar/feed-token')
 
-// In-memory rate limiting: token -> { count, resetAt }
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>()
-const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minute
-const RATE_LIMIT_MAX = 60 // 60 requests per minute per token
-
-// Periodic cleanup to prevent memory leaks (every 5 minutes)
-let lastCleanup = Date.now()
-function cleanupRateLimitMap() {
-  const now = Date.now()
-  if (now - lastCleanup < 5 * 60_000) return
-  lastCleanup = now
-  for (const [key, value] of rateLimitMap) {
-    if (now > value.resetAt) rateLimitMap.delete(key)
-  }
-}
+// 60 requests per minute per token, process-local.
+const rateLimiter = createTokenRateLimiter({ max: 60, windowMs: 60_000 })
 
 /**
  * GET /api/calendar/feed/[token]
@@ -33,22 +24,13 @@ export async function GET(
   const { token } = await params
 
   // Validate token format (UUID)
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-  if (!uuidRegex.test(token)) {
+  if (!UUID_RE.test(token)) {
     return new NextResponse('Invalid token', { status: 400 })
   }
 
   // Rate limiting per token
-  cleanupRateLimitMap()
-  const nowMs = Date.now()
-  const rateEntry = rateLimitMap.get(token)
-  if (rateEntry && nowMs < rateEntry.resetAt) {
-    if (rateEntry.count >= RATE_LIMIT_MAX) {
-      return new NextResponse('Too many requests', { status: 429 })
-    }
-    rateEntry.count++
-  } else {
-    rateLimitMap.set(token, { count: 1, resetAt: nowMs + RATE_LIMIT_WINDOW_MS })
+  if (!rateLimiter.allow(token)) {
+    return new NextResponse('Too many requests', { status: 429 })
   }
 
   // Create service client (no user auth required)
@@ -59,7 +41,7 @@ export async function GET(
     return new NextResponse('Server configuration error', { status: 500 })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   // Fetch feed settings by token
   const { data: feed, error: feedError } = await supabase
@@ -76,6 +58,21 @@ export async function GET(
   // Check token expiry
   if (feed.expires_at && new Date(feed.expires_at) < new Date()) {
     return new NextResponse('Feed token has expired', { status: 410 })
+  }
+
+  // The token authenticates the feed, but the feed's creator must still be a
+  // member of the company: offboarding (removal from company_members) must
+  // stop the feed, or an ex-member's subscribed calendar keeps receiving the
+  // company's deadlines and invoice details indefinitely.
+  const { data: membership } = await supabase
+    .from('company_members')
+    .select('user_id')
+    .eq('company_id', feed.company_id)
+    .eq('user_id', feed.user_id)
+    .maybeSingle()
+
+  if (!membership) {
+    return new NextResponse('Feed not found or inactive', { status: 404 })
   }
 
   // Update access tracking
@@ -97,36 +94,58 @@ export async function GET(
   const startStr = startDate.toISOString().split('T')[0]
   const endStr = endDate.toISOString().split('T')[0]
 
-  // Fetch relevant data based on feed options. Deadlines are always
-  // fetched: include_tax_deadlines only hides SYSTEM rows (the generator
-  // filters by source), while user-created deadlines always appear.
-  const [deadlinesResult, invoicesResult] = await Promise.all([
-    supabase
-      .from('deadlines')
-      .select('*')
-      .eq('company_id', feed.company_id)
-      .is('dismissed_at', null)
-      .gte('due_date', startStr)
-      .lte('due_date', endStr)
-      .order('due_date'),
-
-    // Invoices
-    feed.include_invoices
-      ? supabase
-          .from('invoices')
-          .select('*, customer:customers(*)')
-          .eq('company_id', feed.company_id)
-          .gte('due_date', startStr)
-          .lte('due_date', endStr)
-          .order('due_date')
-      : { data: [] },
-  ])
-
   try {
+    // Fetch relevant data based on feed options. Deadlines are always
+    // fetched: include_tax_deadlines only hides SYSTEM rows (the generator
+    // filters by source), while user-created deadlines always appear.
+    // The secondary .order('id') gives the stable total order paging
+    // requires: due dates cluster hard (invoice batches, tax deadlines), so
+    // ordering by due_date alone leaves the page boundary inside a run of
+    // tied rows, where Postgres may drop or repeat rows between pages.
+    const [deadlines, invoices] = await Promise.all([
+      fetchAllRows<Deadline>(
+        ({ from, to }) =>
+          supabase
+            .from('deadlines')
+            .select('*')
+            .eq('company_id', feed.company_id)
+            .is('dismissed_at', null)
+            .gte('due_date', startStr)
+            .lte('due_date', endStr)
+            .order('due_date')
+            .order('id')
+            .range(from, to),
+        { dedupeBy: (row) => row.id }
+      ),
+
+      // Invoices with a real due date to remind about: drafts, cancelled and
+      // credited invoices have no payable due date and would leak
+      // speculative amounts into the subscriber's calendar.
+      feed.include_invoices
+        ? fetchAllRows<Invoice>(
+            ({ from, to }) =>
+              supabase
+                .from('invoices')
+                .select('*, customer:customers(*)')
+                .eq('company_id', feed.company_id)
+                .in('status', ['sent', 'paid', 'partially_paid', 'overdue'])
+                // A quote's due_date only mirrors its expiry; it is not a
+                // payment date. Proformas and delivery notes are not owed.
+                .eq('document_type', 'invoice')
+                .gte('due_date', startStr)
+                .lte('due_date', endStr)
+                .order('due_date')
+                .order('id')
+                .range(from, to),
+            { dedupeBy: (row) => row.id }
+          )
+        : Promise.resolve([]),
+    ])
+
     const icsContent = await generateCalendarFeed(
       {
-        deadlines: deadlinesResult.data || [],
-        invoices: invoicesResult.data || [],
+        deadlines,
+        invoices,
       },
       {
         includeTaxDeadlines: feed.include_tax_deadlines,
@@ -137,7 +156,7 @@ export async function GET(
     return new NextResponse(icsContent, {
       headers: {
         'Content-Type': 'text/calendar; charset=utf-8',
-        'Content-Disposition': 'attachment; filename="erp-base.ics"',
+        'Content-Disposition': 'attachment; filename="accounted.ics"',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0',

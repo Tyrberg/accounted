@@ -25,6 +25,20 @@ export const WORKLIST_CATEGORIES = [
    */
   'book_transaction',
   /**
+   * Unbooked skattekonto rows ("N st skattekontohändelser att bokföra").
+   * Pending:  skattekonto_transactions with status = 'booked' (Skatteverket's
+   *           "tidigare": the event has happened on the tax account),
+   *           journal_entry_id IS NULL and is_ignored = false. Rows with
+   *           status = 'upcoming' are future charges with nothing to book
+   *           yet and never reach the Transaktioner inbox, so they are not
+   *           pending work either.
+   * Done:     the skattekonto booking flows set journal_entry_id (here it IS
+   *           the booked marker, unlike bank transactions), or the user
+   *           ignores the row (is_ignored = true). Same predicate as the
+   *           Transaktioner inbox's Skatteverket rows.
+   */
+  'book_skattekonto',
+  /**
    * Unconsumed documents in the inbox ("N st underlag att hantera").
    * Pending:  invoice_inbox_items with a document and no
    *           created_supplier_invoice_id / created_journal_entry_id /
@@ -77,6 +91,19 @@ export const WORKLIST_CATEGORIES = [
    * Done:     committed or rejected.
    */
   'pending_operations',
+  /**
+   * Accounts not signed off through the end of the previous month
+   * ("N konton att stämma av"), only for companies that have adopted the
+   * sign-off ritual (at least one account_reconciliations row ever).
+   * Pending:  an enabled cash account (deduplicated per IBAN + currency) or a
+   *           configured skattekonto whose latest ACTIVE sign-off has
+   *           through_date before the last day of the previous month.
+   * Done:     a sign-off through that date or later (POST .../signoff), or
+   *           the account stops being reconcilable (disabled cash account).
+   * Zero for companies with no sign-off at all: the nudge is for those who
+   * reconcile monthly, not a new chore for everyone.
+   */
+  'reconciliation_due',
 ] as const
 
 export type WorklistCategory = (typeof WORKLIST_CATEGORIES)[number]
@@ -97,10 +124,38 @@ export interface SuggestedMatch {
   transaction_description: string
   transaction_amount: number
   transaction_currency: string
-  /** Which match endpoint confirms it: match-invoice vs match-supplier-invoice. */
-  kind: 'invoice' | 'supplier_invoice'
+  /**
+   * Which match endpoint confirms it: match-invoice, match-supplier-invoice,
+   * or match-rot-rut-payout (Skatteverkets utbetalning for an open begäran;
+   * candidate_number is then the request name).
+   */
+  kind: 'invoice' | 'supplier_invoice' | 'rot_rut_payout'
   candidate_id: string
   candidate_number: string | null
   counterparty_name: string | null
   candidate_total: number | null
 }
+
+/**
+ * Journal-entry source types that require underlag (BFL 5 kap 7 §). Source
+ * types representing system-generated entries (VAT settlement, year-end,
+ * currency revaluation, ...) are exempt by omission.
+ *
+ * Single source of truth for EVERY TS surface (worklist counts, journal-list
+ * chip/waiver UI, no-doc-required batch route, push notifications); the SQL
+ * mirror lives in the verifikat_without_documents RPC, pinned by
+ * tests/pg/document-surfaces-unification.pg.test.ts. Lives here (not in
+ * categories.ts) because this module is dependency-free and safe to import
+ * from client components.
+ */
+export const NEEDS_DOC_SOURCE_TYPES = [
+  'manual',
+  'bank_transaction',
+  'supplier_invoice_registered',
+  'supplier_invoice_paid',
+  'supplier_invoice_cash_payment',
+  'import',
+  // Webshop order bookings rest on the generated orderunderlag (#1881); an
+  // entry whose underlag failed to attach must surface here.
+  'webshop_order',
+] as const

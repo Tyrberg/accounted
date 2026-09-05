@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createQueuedMockSupabase, makeCustomer } from '@/tests/helpers'
 import { buildInvoiceWriteData, type InvoiceWriteInput } from '@/lib/invoices/build-invoice-write'
+import { encryptPersonnummer, decryptPersonnummer } from '@/lib/salary/personnummer'
 import type { Customer, InvoiceDocumentType } from '@/types'
 
 // Uses the REAL getVatRules / rot-rut-rules / personnummer helpers (only the
@@ -128,7 +129,7 @@ describe('buildInvoiceWriteData', () => {
     enqueue({ data: { vat_registered: true }, error: null })
 
     // 10% is not a Swedish momssats (ML 9 kap: 25 / 12 / 6) for any customer.
-    const customer = makeCustomer({ customer_type: 'eu_business', vat_number_validated: true })
+    const customer = makeCustomer({ customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567', vat_number_validated: true })
     const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
       ...baseHeader,
       items: [{ description: 'Konsult', quantity: 1, unit: 'tim', unit_price: 1000, vat_rate: 10 }],
@@ -148,7 +149,7 @@ describe('buildInvoiceWriteData', () => {
     enqueue({ data: { vat_registered: true }, error: null })
 
     // Huvudregeln (ML 6 kap. 34 §): taxed where the buyer is established.
-    const customer = makeCustomer({ customer_type: 'eu_business', vat_number_validated: true })
+    const customer = makeCustomer({ customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567', vat_number_validated: true })
     const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
       ...baseHeader,
       items: [{ description: 'Konsult', quantity: 10, unit: 'tim', unit_price: 1000, vat_rate: 0 }],
@@ -169,7 +170,7 @@ describe('buildInvoiceWriteData', () => {
 
     // Widening the permitted set must not change the default: an omitted
     // vat_rate still falls back to getVatRules().rate === 0.
-    const customer = makeCustomer({ customer_type: 'eu_business', vat_number_validated: true })
+    const customer = makeCustomer({ customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567', vat_number_validated: true })
     const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
       ...baseHeader,
       items: [{ description: 'Konsult', quantity: 1, unit: 'tim', unit_price: 1000 }],
@@ -189,7 +190,7 @@ describe('buildInvoiceWriteData', () => {
     // Stockholm hotel night invoiced to a German company. Restaurang/hotell is
     // taxed where performed (ML 6 kap. exception), so Swedish 12% applies even
     // though the buyer is an EU business. This was refused outright before.
-    const customer = makeCustomer({ customer_type: 'eu_business', vat_number_validated: true })
+    const customer = makeCustomer({ customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567', vat_number_validated: true })
     const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
       ...baseHeader,
       items: [{ description: 'Hotellnatt Stockholm', quantity: 2, unit: 'natt', unit_price: 1000, vat_rate: 12 }],
@@ -253,7 +254,7 @@ describe('buildInvoiceWriteData', () => {
     // 0% consulting (huvudregeln, reverse charge) + 12% hotel (taxed where
     // performed) on one invoice. The buyer IS liable for the consulting line,
     // so the notation is required; the 12% line still carries Swedish VAT.
-    const customer = makeCustomer({ customer_type: 'eu_business', vat_number_validated: true })
+    const customer = makeCustomer({ customer_type: 'eu_business', country: 'DE', vat_number: 'DE811234567', vat_number_validated: true })
     const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
       ...baseHeader,
       items: [
@@ -300,6 +301,7 @@ describe('buildInvoiceWriteData stored ROT/RUT personnummer (edit path)', () => 
     unit_price: 500,
     vat_rate: 25,
     deduction_type: 'rut' as const,
+    work_type: 'STAD',
     labor_hours: 10,
   }
 
@@ -359,5 +361,239 @@ describe('buildInvoiceWriteData stored ROT/RUT personnummer (edit path)', () => 
     if (!result.ok) return
     expect(result.invoiceFields.deduction_personnummer_encrypted).toBeNull()
     expect(result.invoiceFields.deduction_personnummer_last4).toBeNull()
+  })
+})
+
+describe('buildInvoiceWriteData kundkort personnummer fallback', () => {
+  const rutItem = {
+    description: 'Städning',
+    quantity: 10,
+    unit: 'tim',
+    unit_price: 500,
+    vat_rate: 25,
+    deduction_type: 'rut' as const,
+    work_type: 'STAD',
+    labor_hours: 10,
+  }
+
+  it('falls back to the customer card personal_number when the field is empty', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({
+      customer_type: 'individual',
+      personal_number: encryptPersonnummer('199001019802'),
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: { ...baseHeader, items: [rutItem] },
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.deduction_personnummer_last4).toBe('9802')
+    expect(decryptPersonnummer(result.invoiceFields.deduction_personnummer_encrypted as string)).toBe('199001019802')
+  })
+
+  it('expands a 10-digit legacy plaintext kundkort value to 12 digits', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({
+      customer_type: 'individual',
+      personal_number: '900101-9802',
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: { ...baseHeader, items: [rutItem] },
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.deduction_personnummer_last4).toBe('9802')
+    expect(decryptPersonnummer(result.invoiceFields.deduction_personnummer_encrypted as string)).toBe('199001019802')
+  })
+
+  it('lets a typed personnummer win over the customer card', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({
+      customer_type: 'individual',
+      personal_number: '250101-0025',
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: { ...baseHeader, deduction_personnummer: '199001019802', items: [rutItem] },
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.deduction_personnummer_last4).toBe('9802')
+    expect(decryptPersonnummer(result.invoiceFields.deduction_personnummer_encrypted as string)).toBe('199001019802')
+  })
+
+  it('lets the stored draft personnummer outrank the customer card (edit path)', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({
+      customer_type: 'individual',
+      personal_number: '900101-9802',
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: { ...baseHeader, items: [rutItem] },
+      existingPersonnummer: { encrypted: 'stored-ciphertext', last4: '1234' },
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.deduction_personnummer_encrypted).toBe('stored-ciphertext')
+    expect(result.invoiceFields.deduction_personnummer_last4).toBe('1234')
+  })
+
+  it('treats an invalid kundkort value as absent and still requires a typed one', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({
+      customer_type: 'individual',
+      // Bad Luhn: must fall through to the "Personnummer krävs" error, never
+      // to a confusing "invalid personnummer" for a value the user never typed.
+      personal_number: '900101-9803',
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: { ...baseHeader, items: [rutItem] },
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect('code' in result && result.code).toBe('INVOICE_CREATE_ROT_RUT_VALIDATION')
+  })
+})
+
+describe('buildInvoiceWriteData kundkort fallback customer-type gate', () => {
+  it('never claims on a stray personal_number of a non-individual customer', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    // personal_number is individual-only in the Zod schemas but not in the
+    // DB: a legacy/business row carrying one must not be claimed on
+    // implicitly, so the fallback stays off and validation asks for a typed
+    // personnummer.
+    const customer = makeCustomer({
+      customer_type: 'swedish_business',
+      personal_number: '900101-9802',
+    })
+    const result = await buildInvoiceWriteData({
+      supabase: supabase as unknown as SupabaseClient,
+      companyId: 'company-1',
+      customer,
+      documentType: 'invoice',
+      input: {
+        ...baseHeader,
+        items: [{
+          description: 'Städning',
+          quantity: 10,
+          unit: 'tim',
+          unit_price: 500,
+          vat_rate: 25,
+          deduction_type: 'rut' as const,
+          work_type: 'STAD',
+          labor_hours: 10,
+        }],
+      },
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect('code' in result && result.code).toBe('INVOICE_CREATE_ROT_RUT_VALIDATION')
+  })
+
+  it('writes valid_until + quote_status open for a quote, mirrors it into due_date and keeps nothing owed', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({ customer_type: 'swedish_business' })
+    const result = await call(
+      enqueue,
+      supabase as unknown as SupabaseClient,
+      customer,
+      {
+        ...baseHeader,
+        valid_until: '2026-08-01',
+        items: [{ description: 'Offererat arbete', quantity: 2, unit: 'tim', unit_price: 1000, vat_rate: 25 }],
+      },
+      'quote',
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.document_type).toBe('quote')
+    expect(result.invoiceFields.valid_until).toBe('2026-08-01')
+    expect(result.invoiceFields.due_date).toBe('2026-08-01')
+    // The decision column is never a builder output (a draft edit must not
+    // overwrite an accept/decline); the DB trigger opens a new quote.
+    expect(result.invoiceFields).not.toHaveProperty('quote_status')
+    expect(result.invoiceFields.total).toBe(2500)
+    expect(result.invoiceFields.remaining_amount).toBe(0)
+    expect(result.invoiceFields.deduction_total).toBe(0)
+  })
+
+  it('leaves the quote columns NULL on every other document type', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({ customer_type: 'swedish_business' })
+    const result = await call(enqueue, supabase as unknown as SupabaseClient, customer, {
+      ...baseHeader,
+      valid_until: '2026-08-01',
+      items: [{ description: 'Konsult', quantity: 1, unit: 'tim', unit_price: 1000, vat_rate: 25 }],
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.invoiceFields.valid_until).toBeNull()
+    expect(result.invoiceFields).not.toHaveProperty('quote_status')
+    expect(result.invoiceFields.due_date).toBe(baseHeader.due_date)
+  })
+
+  it('drops sales_order_item_id on quote lines so an offer never consumes kundorder quantity', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { vat_registered: true }, error: null })
+
+    const customer = makeCustomer({ customer_type: 'swedish_business' })
+    const result = await call(
+      enqueue,
+      supabase as unknown as SupabaseClient,
+      customer,
+      {
+        ...baseHeader,
+        valid_until: '2026-08-01',
+        items: [{ description: 'Orderrad', quantity: 1, unit: 'st', unit_price: 1000, vat_rate: 25, sales_order_item_id: '33333333-3333-4333-8333-333333333333' }],
+      },
+      'quote',
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.items[0]).toMatchObject({ sales_order_item_id: null })
   })
 })

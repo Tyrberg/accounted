@@ -16,38 +16,18 @@ import { created, ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { generateWebhookSecret } from '@/lib/webhooks/signing'
 import { validateWebhookUrl } from '@/lib/webhooks/url-guard'
 import { API_V1_VERSION } from '@/lib/api/v1/version'
 import { hasScope } from '@/lib/auth/api-keys'
+import { PUBLIC_WEBHOOK_EVENTS } from '@/lib/webhooks/public-events'
 
-const WEBHOOK_EVENT_TYPES = z.enum([
-  'invoice.created',
-  'invoice.sent',
-  'invoice.paid',
-  'credit_note.created',
-  'customer.created',
-  'supplier.created',
-  'supplier_invoice.registered',
-  'supplier_invoice.approved',
-  'supplier_invoice.paid',
-  'supplier_invoice.credited',
-  'supplier_invoice.uncredited',
-  'transaction.categorized',
-  'transaction.reconciled',
-  'journal_entry.committed',
-  'journal_entry.reversed',
-  'journal_entry.corrected',
-  'period.locked',
-  'period.unlocked',
-  'period.year_closed',
-  'salary_run.created',
-  'salary_run.approved',
-  'salary_run.booked',
-  'agi.generated',
-  'document.uploaded',
-])
+// Derived from the single catalogue the fan-out handler and the docs page
+// also read, so the events an agent can subscribe to are exactly the events
+// that get delivered.
+const WEBHOOK_EVENT_TYPES = z.enum(PUBLIC_WEBHOOK_EVENTS)
 
 const CreateWebhookSchema = z.object({
   event_type: WEBHOOK_EVENT_TYPES,
@@ -175,7 +155,7 @@ registerEndpoint({
   doNotUseFor:
     'Subscribing to internal MCP telemetry events (mcp.tool_called etc. are not delivered as webhooks). Replacing an existing webhook URL: use PATCH instead.',
   pitfalls: [
-    'The secret is returned exactly once. If lost, delete and recreate the webhook.',
+    'The secret is returned exactly once. If lost, rotate it with POST /webhooks/{id}/rotate-secret: a fresh secret is issued in place, the webhook id and delivery history are kept.',
     'Delivery is at-least-once with exponential backoff (1m / 5m / 30m / 2h / 12h / 24h / 48h). Receivers MUST be idempotent.',
     'HTTP 410 from your receiver auto-disables the webhook (sets active=false + disabled_reason).',
   ],
@@ -214,28 +194,12 @@ registerEndpoint({
 export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
   'webhooks.create',
   async (request, ctx) => {
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
 
     const parsed = CreateWebhookSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const body = parsed.data
 
     // Elevated-scope check for high-sensitivity payloads. Subscribing to

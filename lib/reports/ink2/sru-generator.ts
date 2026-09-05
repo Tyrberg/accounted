@@ -1,3 +1,4 @@
+import { sruAmount as formatAmount, sruDate as formatDate, sruTime as formatTime } from '@/lib/reports/sru/format'
 import { getBranding } from '@/lib/branding/service'
 import type {
   INK2Declaration,
@@ -61,34 +62,6 @@ function formatOrgNumber12(orgNumber: string): string {
   if (clean.length === 12) return clean
   if (clean.length === 10) return `16${clean}`
   return `16${clean}`
-}
-
-/**
- * Format a Date as YYYYMMDD
- */
-function formatDate(date: Date): string {
-  const y = date.getFullYear()
-  const m = String(date.getMonth() + 1).padStart(2, '0')
-  const d = String(date.getDate()).padStart(2, '0')
-  return `${y}${m}${d}`
-}
-
-/**
- * Format a Date as HHMMSS
- */
-function formatTime(date: Date): string {
-  const h = String(date.getHours()).padStart(2, '0')
-  const m = String(date.getMinutes()).padStart(2, '0')
-  const s = String(date.getSeconds()).padStart(2, '0')
-  return `${h}${m}${s}`
-}
-
-/**
- * Format integer amount for SRU. No decimals, no thousands separator.
- * Truncated to hela kronor by the engine.
- */
-function formatAmount(amount: number): string {
-  return Math.trunc(amount).toString()
 }
 
 /**
@@ -157,8 +130,8 @@ function generateBlanketterSru(declaration: INK2Declaration, now: Date): string 
   lines.push(`#UPPGIFT 7012 ${declaration.ink2['7012']}`)
 
   // Överskott/underskott
-  if (declaration.ink2['7113'] > 0) {
-    lines.push(`#UPPGIFT 7113 ${formatAmount(declaration.ink2['7113'])}`)
+  if (declaration.ink2['7104'] > 0) {
+    lines.push(`#UPPGIFT 7104 ${formatAmount(declaration.ink2['7104'])}`)
   }
   if (declaration.ink2['7114'] > 0) {
     lines.push(`#UPPGIFT 7114 ${formatAmount(declaration.ink2['7114'])}`)

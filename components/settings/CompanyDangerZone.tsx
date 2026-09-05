@@ -26,6 +26,8 @@ import { Loader2 } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
 import { getBranding } from '@/lib/branding/service'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { CompanyMigrationResetDialog } from '@/components/settings/CompanyMigrationResetDialog'
+import { CompanyMigrationArchiveRow } from '@/components/settings/CompanyMigrationArchiveRow'
 
 const branding = getBranding()
 
@@ -48,6 +50,7 @@ export function CompanyDangerZone() {
   const { company, role } = useCompany()
 
   const [showDialog, setShowDialog] = useState(false)
+  const [showResetDialog, setShowResetDialog] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [isDeleting, setIsDeleting] = useState(false)
 
@@ -89,7 +92,28 @@ export function CompanyDangerZone() {
 
   return (
     <>
+      <CompanyMigrationArchiveRow companyId={company.id} />
+
       <SettingsDangerZone label={t('danger_heading')}>
+        <SettingsRow label={t('reset_row_label')}>
+          {/* Both destructive rows say up front that a typed confirmation
+              follows. A reader who does not dare press the link cannot find
+              that out any other way, and on a phone the link sits where a
+              stray tap while scrolling lands (issue #2214). */}
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <SettingsRowNote>{t('reset_row_note')}</SettingsRowNote>
+            <SettingsRowNote>{t('danger_confirm_hint')}</SettingsRowNote>
+          </div>
+          <SettingsRowEnd>
+            <button
+              type="button"
+              onClick={() => setShowResetDialog(true)}
+              className="text-sm font-medium text-destructive underline underline-offset-2 transition-colors duration-150 hover:text-destructive/80"
+            >
+              {t('reset_row_action')}
+            </button>
+          </SettingsRowEnd>
+        </SettingsRow>
         <SettingsRow
           label={t('danger_button')}
           borderless
@@ -97,7 +121,10 @@ export function CompanyDangerZone() {
           // the "?": the visible row stays one quiet line.
           help={<RetentionNotice variant="company" className="border-0 bg-transparent p-0" />}
         >
-          <SettingsRowNote>{tRetention('company_title')}</SettingsRowNote>
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <SettingsRowNote>{tRetention('company_title')}</SettingsRowNote>
+            <SettingsRowNote>{t('danger_confirm_hint')}</SettingsRowNote>
+          </div>
           <SettingsRowEnd>
             <button
               type="button"
@@ -120,13 +147,15 @@ export function CompanyDangerZone() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t('danger_dialog_title', { companyName: company.name })}</DialogTitle>
+            {/* data-ph-mask: the title interpolates the company name */}
+            <DialogTitle data-ph-mask="">{t('danger_dialog_title', { companyName: company.name })}</DialogTitle>
             <DialogDescription>
               {t('danger_dialog_description', { appName: branding.appName.toLowerCase() })}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="company-delete-confirm">
+            {/* data-ph-mask: the label interpolates the company name */}
+            <Label data-ph-mask="" htmlFor="company-delete-confirm">
               {t.rich('danger_confirm_label', {
                 companyName: company.name,
                 strong: (chunks) => <strong>{chunks}</strong>,
@@ -138,6 +167,9 @@ export function CompanyDangerZone() {
               onChange={(e) => setConfirmText(e.target.value)}
               placeholder={company.name}
               autoComplete="off"
+              // ph-no-capture: the placeholder is the company name, and
+              // replay masking covers values, not attributes.
+              className="ph-no-capture"
             />
           </div>
           <DialogFooter>
@@ -168,6 +200,13 @@ export function CompanyDangerZone() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CompanyMigrationResetDialog
+        companyId={company.id}
+        companyName={company.name}
+        open={showResetDialog}
+        onOpenChange={setShowResetDialog}
+      />
     </>
   )
 }

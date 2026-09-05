@@ -1,14 +1,44 @@
 import { z } from 'zod'
 import { normaliseSwish, isValidSwish } from '@/lib/payments/swish'
 import { normalizeVatNumber } from '@/lib/vat/vat-number'
-import { isSaneDateString } from '@/lib/utils'
+import { ACCOUNT_VAT_TREATMENTS } from '@/lib/vat/account-vat-treatment'
+import {
+  accountNumberSchema,
+  isoDateSchema,
+  saneIsoDateSchema,
+  fiscalYearSchema,
+} from '@/lib/invariants/zod'
+import { ISO_DATE_RE, ISO_DATE_MESSAGE_SV } from '@/lib/invariants/iso-date'
 import { countCalendarMonths } from '@/lib/bookkeeping/accruals/compute'
 import { DimensionsBagSchema } from '@/lib/bookkeeping/dimension-resolver'
 import { validateEmployeeBankAccount } from '@/lib/salary/payment/bank-account'
+import { validateJamkning } from '@/lib/salary/jamkning-rules'
 import { MAX_INVOICE_EMAIL_COPY_RECIPIENTS } from '@/lib/invoices/email-recipients'
 import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
+import { computeLineNet } from '@/lib/invoices/line-amounts'
+import {
+  DEDUCTION_LINE_ERRORS,
+  HOUSEWORK_TYPE_VALUES,
+  SCHABLON_WORK_TYPES,
+  deductionTypeForWorkType,
+  normalizeHouseworkType,
+} from '@/lib/invoices/rot-rut-rules'
+import { NON_IBAN_CURRENCIES } from '@/lib/invoices/payment-accounts'
 import { PERSONAL_NUMBER_INPUT_RE } from '@/lib/customers/mask-personal-number'
-import type { AuditAction } from '@/types'
+import {
+  COUNTRY_CONSISTENCY_MESSAGES,
+  checkCountryConsistency,
+  defaultCountryForParty,
+  normalizeCountryCode,
+} from '@/lib/vat/country-codes'
+import {
+  looksLikeSwedishPersonalNumber,
+  normalizeReroutedPersonalNumber,
+  orgNumberHoldsPersonalNumber,
+  personalNumberDigits,
+} from '@/lib/customers/personal-number-shape'
+import type { AuditAction, Currency, InvoiceDocumentType } from '@/types'
+import type { BankFileFormatId } from '@/lib/import/bank-file/types'
 
 // ============================================================
 // Shared primitives
@@ -17,8 +47,13 @@ import type { AuditAction } from '@/types'
 /** UUID v4 string */
 const uuid = z.string().uuid()
 
-/** ISO date string (YYYY-MM-DD) */
-const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD date format')
+/**
+ * ISO date string (YYYY-MM-DD).
+ *
+ * Shape only. From `lib/invariants/iso-date.ts` so that every schema below, the
+ * v1 routes, and the MCP surface reject a malformed date the same way.
+ */
+const isoDate = isoDateSchema
 
 /**
  * ISO date that must also be a real, in-range calendar date: not just the
@@ -26,12 +61,10 @@ const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD dat
  * transaction form) so a 6-digit year or impossible date can't slip through
  * for user-entered dates. Use this over `isoDate` for free-text date input.
  */
-const saneIsoDate = z
-  .string()
-  .refine(isSaneDateString, 'Invalid or out-of-range date (expected YYYY-MM-DD, year 1900-2100)')
+const saneIsoDate = saneIsoDateSchema
 
 /** BAS account number: always a string of 4 digits */
-const accountNumber = z.string().regex(/^\d{4}$/, 'Account number must be exactly 4 digits')
+const accountNumber = accountNumberSchema
 
 /** Non-negative monetary amount (>= 0) */
 const nonNegativeAmount = z.number().nonnegative()
@@ -195,17 +228,10 @@ export const SupplierTypeSchema = z.enum([
   'non_eu_business',
 ])
 
-export const InvoiceStatusSchema = z.enum([
-  'draft', 'sent', 'paid', 'overdue', 'cancelled', 'credited',
-])
-
 export const InvoiceDocumentTypeSchema = z.enum([
-  'invoice', 'proforma', 'delivery_note',
+  'invoice', 'proforma', 'delivery_note', 'quote',
 ])
 
-export const SupplierInvoiceStatusSchema = z.enum([
-  'registered', 'approved', 'paid', 'partially_paid', 'overdue', 'disputed', 'credited',
-])
 
 export const VatTreatmentSchema = z.enum([
   'standard_25', 'reduced_12', 'reduced_6', 'reverse_charge', 'export', 'exempt',
@@ -265,6 +291,7 @@ export const JournalEntrySourceTypeSchema = z.enum([
   'rot_rut_payout',
   'vat_settlement',
   'stripe_payout',
+  'webshop_order',
 ])
 
 /** Query params for GET /api/bookkeeping/voucher-sequences/next. */
@@ -272,6 +299,9 @@ export const VoucherSequenceNextQuerySchema = z.object({
   period_id: uuid.optional(),
   series: z.string().regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z').optional(),
   source_type: JournalEntrySourceTypeSchema.optional(),
+  // Bank account the entry is booked from: its voucher_series override (when
+  // set) takes precedence over the per-source-type default.
+  cash_account_id: uuid.optional(),
   date: isoDate.optional(),
 })
 
@@ -377,6 +407,10 @@ export const CreateInvoiceItemSchema = z
     quantity: z.number(),
     unit: z.string(),
     unit_price: z.number(),
+    // Percentage discount on the line (rabatt i procent per artikelrad).
+    // line_total and vat_amount are computed NET of this server-side
+    // (lib/invoices/line-amounts.ts); the client never sends a total.
+    discount_percent: z.number().min(0).max(100).nullable().optional(),
     vat_rate: z.number().min(0).max(100).optional(),
     // Article linkage. `article_id` ties the line to a catalog article (text
     // rows omit it). `revenue_account` is the legacy wire name for the optional
@@ -385,6 +419,10 @@ export const CreateInvoiceItemSchema = z
     // accounts are only accepted on zero-VAT lines (build-invoice-write.ts).
     article_id: uuid.nullable().optional(),
     revenue_account: invoicePostingAccount.nullable().optional(),
+    // Kundorder provenance: the order line this invoice line was created
+    // from. Round-tripped on draft edits; the DB trigger refuses a quantity
+    // that would over-invoice the order line.
+    sales_order_item_id: uuid.nullable().optional(),
     // ROT/RUT-avdrag fields. `deduction_amount` is intentionally omitted from
     // the client schema: the API computes it from rot-rut-rules.ts so a
     // tampered client can't expand the 1513 receivable beyond the line total.
@@ -433,7 +471,8 @@ export const CreateInvoiceItemSchema = z
           message: 'ROT/RUT-rader kan inte periodiseras',
         })
       }
-      if (item.quantity * item.unit_price <= 0) {
+      // Net of any line discount: a 100 % rebated row has nothing to defer.
+      if (computeLineNet(item.quantity, item.unit_price, item.discount_percent) <= 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['accrual_period_start'],
@@ -457,15 +496,62 @@ export const CreateInvoiceItemSchema = z
 
 const optionalIsoDate = isoDate.or(z.literal('')).transform(v => v || undefined).optional()
 
-export const CreateInvoiceSchema = z.object({
+export const QuoteStatusSchema = z.enum(['open', 'accepted', 'declined'])
+
+// POST /api/invoices/[id]/quote-status. Any transition between the three
+// decisions is allowed until the quote has been converted to an invoice.
+export const SetQuoteStatusSchema = z.object({
+  status: QuoteStatusSchema,
+  // Optional new expiry. This is how an expired (open, past valid_until)
+  // quote is reopened: sent quotes are not draft-editable, so the date
+  // travels with the decision. The DB trigger mirrors it into due_date.
+  valid_until: optionalIsoDate,
+})
+
+/**
+ * ROT/RUT claim completeness (HUSFL: art av arbete + antal arbetstimmar) at
+ * the invoice level, where document_type is known: only real invoices book a
+ * deduction (buildInvoiceWriteData nulls the fields for proformas, delivery
+ * notes and quotes), and free-text rows carry no claim. Field-level paths so
+ * the editor can point at the row; validateInvoice re-runs the same rules for
+ * callers that bypass this schema.
+ */
+function refineRotRutLineCompleteness(
+  data: { document_type?: string; items: Array<{ line_type?: string; deduction_type?: 'rot' | 'rut' | null; work_type?: string | null; labor_hours?: number | null }> },
+  ctx: z.RefinementCtx,
+): void {
+  if (data.document_type && data.document_type !== 'invoice') return
+  data.items.forEach((item, index) => {
+    if (!item.deduction_type || item.line_type === 'text') return
+    const workType = item.work_type?.trim() || null
+    if (!workType) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'work_type'], message: DEDUCTION_LINE_ERRORS.workTypeMissing })
+    } else if (deductionTypeForWorkType(workType) !== item.deduction_type) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'work_type'], message: DEDUCTION_LINE_ERRORS.workTypeMismatch })
+    }
+    const isSchablon = workType != null && SCHABLON_WORK_TYPES.includes(workType)
+    if (!isSchablon && !(typeof item.labor_hours === 'number' && item.labor_hours > 0)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'labor_hours'], message: DEDUCTION_LINE_ERRORS.hoursMissing })
+    }
+  })
+}
+
+const CreateInvoiceBaseSchema = z.object({
   customer_id: uuid,
   invoice_date: isoDate,
   due_date: isoDate,
   delivery_date: optionalIsoDate,
   currency: CurrencySchema,
   document_type: InvoiceDocumentTypeSchema.optional(),
+  // Quotes only: the date the offer expires ("Giltig till"). Required when
+  // document_type is 'quote' (refineQuoteFields); ignored otherwise.
+  valid_until: optionalIsoDate,
   your_reference: z.string().optional(),
   our_reference: z.string().optional(),
+  // Fakturamärkning: buyer-required marking (kostnadsställe/projekt/PO),
+  // separate from your_reference. Printed on the PDF and mapped to Peppol
+  // BT-10 BuyerReference when set.
+  invoice_marking: z.string().max(200).optional(),
   notes: z.string().optional(),
   // Optional online payment link (manual MVP): the user pastes a link created
   // in their PSP dashboard (e.g. a Stripe Payment Link). https-only because the
@@ -548,14 +634,46 @@ export const CreateInvoiceSchema = z.object({
     .transform((v) => v || undefined)
     .optional(),
   received_date: optionalIsoDate,
+  // Which of the company's bank accounts the invoice asks the customer to pay
+  // to (migration 20260904011000). Omitted/null = the per-currency default.
+  // The route checks the account belongs to the company, is flagged as a
+  // payee and is usable for the invoice currency.
+  payment_cash_account_id: z
+    .union([uuid, z.literal('')])
+    .transform((v) => v || null)
+    .nullable()
+    .optional(),
   items: z.array(CreateInvoiceItemSchema).min(1, 'At least one item is required'),
 })
+
+// A quote must say how long it is valid: valid_until is the one header
+// field the document type adds, and the PDF, the list and the derived
+// "expired" state all key off it.
+function refineQuoteFields(
+  data: { document_type?: InvoiceDocumentType; valid_until?: string },
+  ctx: z.RefinementCtx,
+) {
+  if (data.document_type === 'quote' && !data.valid_until) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['valid_until'],
+      message: 'Giltig till (valid_until) krävs för en offert.',
+    })
+  }
+}
+
+export const CreateInvoiceSchema = CreateInvoiceBaseSchema
+  .superRefine(refineRotRutLineCompleteness)
+  .superRefine(refineQuoteFields)
 
 // Update (edit) an existing DRAFT invoice in place. Same shape as create minus
 // `save_as_draft`: editing never (re)creates a draft or allocates a number, it
 // only rewrites the draft's header + line items. The PATCH route guards that the
 // target is still a draft (status='draft', no journal entry, not self-billed).
-export const UpdateInvoiceSchema = CreateInvoiceSchema.omit({ save_as_draft: true })
+export const UpdateInvoiceSchema = CreateInvoiceBaseSchema
+  .omit({ save_as_draft: true })
+  .superRefine(refineRotRutLineCompleteness)
+  .superRefine(refineQuoteFields)
 
 export const CreateCreditNoteSchema = z.object({
   credited_invoice_id: uuid,
@@ -626,6 +744,32 @@ export const RotRutBeslutFileSchema = z.object({
 
 export const ArticleTypeSchema = z.enum(['vara', 'tjanst'])
 
+/**
+ * articles.housework_type: a Skatteverket arbetstypskod (BYGG, EL, ..., STAD,
+ * TRADGARD, ...) or the bare kind ROT / RUT (deduction only, no arbetstyp
+ * pre-fill). Case-insensitive, stored upper-case; '' clears to null. The
+ * invoice editor derives a line's skattereduktion from this value, so any
+ * other string is a silently dead flag and is rejected here.
+ */
+export const HouseworkTypeSchema = z
+  .string()
+  .max(64)
+  .nullable()
+  .optional()
+  .transform((v, ctx) => {
+    if (v == null) return v
+    if (v.trim() === '') return null
+    const normalized = normalizeHouseworkType(v)
+    if (!normalized) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Ogiltig ROT/RUT-arbetstyp. Tillåtna värden: ${HOUSEWORK_TYPE_VALUES.join(', ')}`,
+      })
+      return z.NEVER
+    }
+    return normalized
+  })
+
 export const CreateArticleSchema = z.object({
   name: z.string().min(1, 'Article name is required').max(200),
   type: ArticleTypeSchema.optional(),
@@ -644,7 +788,7 @@ export const CreateArticleSchema = z.object({
   cost_price: nonNegativeAmount.nullable().optional(),
   ean: z.string().max(32).nullable().optional(),
   // ROT/RUT arbetstyp; only meaningful for type === 'tjanst'.
-  housework_type: z.string().max(64).nullable().optional(),
+  housework_type: HouseworkTypeSchema,
   name_en: z.string().max(200).nullable().optional(),
   notes: z.string().max(2000).nullable().optional(),
   // Manual article number; omit to auto-generate via generate_article_number.
@@ -716,6 +860,9 @@ export const CreateRecurringScheduleSchema = z.object({
   customer_id: uuid,
   name: z.string().min(1, 'Schedule name is required').max(200),
   day_of_month: z.number().int().min(1).max(31),
+  // Months between runs: 1 = monthly (default), 3 = quarterly, 6 = half-
+  // yearly, 12 = yearly. Any 1-12 is accepted (e.g. every 2 months).
+  interval_months: z.number().int().min(1).max(12).default(1),
   // Whole hour (0-23) in Europe/Stockholm at which the invoice is sent.
   send_hour: z.number().int().min(0).max(23).default(8),
   payment_terms_days: z.number().int().min(0).max(90).default(30),
@@ -736,6 +883,9 @@ export const UpdateRecurringScheduleSchema = z.object({
   customer_id: uuid.optional(),
   name: z.string().min(1).max(200).optional(),
   day_of_month: z.number().int().min(1).max(31).optional(),
+  // Changing the interval alone leaves next_run_date untouched: the new
+  // cadence applies from the next run onward.
+  interval_months: z.number().int().min(1).max(12).optional(),
   send_hour: z.number().int().min(0).max(23).optional(),
   payment_terms_days: z.number().int().min(0).max(90).optional(),
   currency: CurrencySchema.optional(),
@@ -786,6 +936,13 @@ export const MarkInvoiceSentSchema = z.object({
   })).min(2).optional(),
 })
 
+// Bulk Bokför: drafts are issued (F-number + mark-sent semantics, no email)
+// and booked when the company books at issue; sent/overdue unbooked invoices
+// get the deferred /book semantics. 200 caps one request at two list pages.
+export const InvoicesBulkBookSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1).max(200),
+})
+
 export const SendInvoiceSchema = MarkInvoiceSentSchema.extend({
   additional_cc: invoiceEmailAddressList.optional(),
   additional_bcc: invoiceEmailAddressList.optional(),
@@ -804,6 +961,29 @@ export const SendInvoiceSchema = MarkInvoiceSentSchema.extend({
 // Customer schemas
 // ============================================================
 
+/**
+ * ISO 3166-1 alpha-2 country on customers and suppliers. A code in any case
+ * ("de", "DE"), Skatteverket's EL for Greece, or a Swedish/English country
+ * name ("Tyskland", "Germany") is normalised to the uppercase code; anything
+ * else is a 400. The column used to take free text, which put
+ * GERMANY811234567 in the SKV 5740 file (#2028). Empty string reads as
+ * "not supplied".
+ */
+const countryCode = z.string().transform((value, ctx) => {
+  const code = normalizeCountryCode(value)
+  if (!code) {
+    ctx.addIssue({
+      code: 'custom',
+      message:
+        `country "${value}" is not an ISO 3166-1 alpha-2 code or a known country name. `
+        + 'Use a code such as SE, DE or NO.',
+    })
+    return z.NEVER
+  }
+  return code
+})
+export const CountryCodeSchema = emptyStringAsUndefined(countryCode)
+
 export const CreateCustomerSchema = z.object({
   name: z.string().min(1, 'Customer name is required'),
   customer_type: CustomerTypeSchema,
@@ -815,13 +995,16 @@ export const CreateCustomerSchema = z.object({
     .max(32, 'Customer number must be 32 characters or fewer')
     .nullable()
     .optional(),
+  contact_person: z.string().trim().max(200).nullable().optional(),
   email: z.string().email('Invalid email address').optional(),
   phone: z.string().optional(),
+  invoice_email_cc_addresses: invoiceEmailAddressList.nullable().optional(),
+  invoice_email_bcc_addresses: invoiceEmailAddressList.nullable().optional(),
   address_line1: z.string().optional(),
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
   city: z.string().optional(),
-  country: z.string().optional(),
+  country: CountryCodeSchema,
   org_number: z.string().optional(),
   vat_number: z.string().optional(),
   personal_number: z
@@ -830,7 +1013,8 @@ export const CreateCustomerSchema = z.object({
     .optional()
     .nullable(),
   language: z.enum(['sv', 'en']).optional(),
-  default_payment_terms: z.number().int().positive().optional(),
+  // Whole days 0-365; 0 = betalning direkt / vid mottagande (issue #2070).
+  default_payment_terms: z.number().int().min(0).max(365).optional(),
   notes: z.string().optional(),
 }).superRefine((customer, ctx) => {
   if (customer.personal_number && customer.customer_type !== 'individual') {
@@ -840,19 +1024,119 @@ export const CreateCustomerSchema = z.object({
       message: 'Personal number is only allowed for individual customers',
     })
   }
+  // Country vs customer type vs VAT prefix (#2025): an EU business with
+  // country SE got reverse charge and nothing objected until the periodisk
+  // sammanställning, after the invoice was sent. An omitted country is SE
+  // for Swedish types, derived from the VAT prefix for eu_business, and
+  // required for non_eu_business (see defaultCountryForParty); the
+  // transform below stores the resolved value.
+  const effectiveCountry =
+    customer.country ?? defaultCountryForParty(customer.customer_type, customer.vat_number)
+  if (!effectiveCountry) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['country'],
+      message:
+        customer.customer_type === 'eu_business'
+          ? 'country is required for an EU business unless vat_number carries an EU country prefix (e.g. DE811234567)'
+          : 'country is required for a non-EU business',
+    })
+  } else {
+    const countryIssue = checkCountryConsistency({
+      partyType: customer.customer_type,
+      country: effectiveCountry,
+      vatNumber: customer.vat_number,
+    })
+    if (countryIssue) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['country'],
+        message: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].en,
+      })
+    }
+  }
+  // GDPR art. 5.1 c: a personnummer stored as a business org_number is shown
+  // unmasked everywhere (only customer_type='individual' rows are masked), so
+  // refuse to accept one silently.
+  if (
+    customer.org_number &&
+    customer.customer_type !== 'individual' &&
+    looksLikeSwedishPersonalNumber(customer.org_number)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['org_number'],
+      message:
+        'org_number looks like a Swedish personal identity number (personnummer). '
+        + 'Create the customer with customer_type "individual" and pass the number as personal_number '
+        + 'instead, so it is stored encrypted and masked in list responses.',
+    })
+  }
+  // An individual's personnummer submitted as org_number is moved into
+  // personal_number by the transform below. Next to a DIFFERENT
+  // personal_number in the same body the two conflict, and guessing which
+  // one the caller meant is worse than a 400.
+  if (
+    customer.personal_number
+    && orgNumberHoldsPersonalNumber(customer.customer_type, customer.org_number)
+    && personalNumberDigits(customer.org_number!) !== personalNumberDigits(customer.personal_number)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['org_number'],
+      message:
+        'org_number looks like a Swedish personal identity number (personnummer) and differs from '
+        + 'personal_number. An individual customer keeps its personnummer in personal_number; leave org_number empty.',
+    })
+  }
+  if (
+    (customer.invoice_email_cc_addresses?.length ?? 0)
+    + (customer.invoice_email_bcc_addresses?.length ?? 0)
+    > MAX_INVOICE_EMAIL_COPY_RECIPIENTS
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['invoice_email_cc_addresses'],
+      message: `At most ${MAX_INVOICE_EMAIL_COPY_RECIPIENTS} customer invoice copy recipients are allowed in total`,
+    })
+  }
+}).transform((input) => {
+  // The resolved country (see the superRefine above): always a code here,
+  // the refine has already rejected the cases where none can be derived.
+  const customer = {
+    ...input,
+    country: input.country ?? defaultCountryForParty(input.customer_type, input.vat_number) ?? 'SE',
+  }
+  // A personnummer-shaped org_number on customer_type='individual' IS the
+  // personnummer, submitted in the wrong field (the MCP create tool had no
+  // personal_number input until 2026-08-21, and the v1 docs long said
+  // "org_number accepted as input" for individuals). Nothing masks
+  // org_number, so it is moved into personal_number, where the routes
+  // encrypt it and every read returns ********-1234, and org_number is left
+  // empty. With an equal personal_number already present only the duplicate
+  // is dropped; an unequal one was refused above.
+  if (!orgNumberHoldsPersonalNumber(customer.customer_type, customer.org_number)) return customer
+  return {
+    ...customer,
+    org_number: undefined,
+    personal_number: customer.personal_number || normalizeReroutedPersonalNumber(customer.org_number!),
+  }
 })
 
 export const UpdateCustomerSchema = z.object({
   name: z.string().min(1, 'Customer name is required').optional(),
   customer_type: CustomerTypeSchema.optional(),
   customer_number: z.string().trim().max(32).nullable().optional(),
+  contact_person: z.string().trim().max(200).nullable().optional(),
   email: z.string().email('Invalid email address').optional(),
   phone: z.string().optional(),
+  invoice_email_cc_addresses: invoiceEmailAddressList.nullable().optional(),
+  invoice_email_bcc_addresses: invoiceEmailAddressList.nullable().optional(),
   address_line1: z.string().optional(),
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
   city: z.string().optional(),
-  country: z.string().optional(),
+  country: CountryCodeSchema,
   org_number: z.string().optional(),
   vat_number: z.string().optional(),
   // Plaintext personnummer (validated here, then encrypted by the route), or
@@ -872,24 +1156,52 @@ export const UpdateCustomerSchema = z.object({
     .nullable()
     .optional(),
   language: z.enum(['sv', 'en']).optional(),
-  default_payment_terms: z.number().int().positive().optional(),
+  // Whole days 0-365; 0 = betalning direkt / vid mottagande (issue #2070).
+  default_payment_terms: z.number().int().min(0).max(365).optional(),
   notes: z.string().optional(),
+}).superRefine((customer, ctx) => {
+  if (
+    (customer.invoice_email_cc_addresses?.length ?? 0)
+    + (customer.invoice_email_bcc_addresses?.length ?? 0)
+    > MAX_INVOICE_EMAIL_COPY_RECIPIENTS
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['invoice_email_cc_addresses'],
+      message: `At most ${MAX_INVOICE_EMAIL_COPY_RECIPIENTS} customer invoice copy recipients are allowed in total`,
+    })
+  }
 })
 
 // ============================================================
 // Supplier schemas
 // ============================================================
 
+/**
+ * Optional field where an empty or whitespace-only string means "not set".
+ *
+ * HTML forms submit untouched inputs as '', which a format-validated
+ * `.optional()` field would reject ('' is a present string, so it hits the
+ * format rule). Same normalization as `optString` in
+ * lib/pending-operations/schemas/create-supplier.ts.
+ */
+function emptyStringAsUndefined<T extends z.ZodTypeAny>(inner: T) {
+  return z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    inner.optional(),
+  )
+}
+
 export const CreateSupplierSchema = z.object({
   name: z.string().min(1, 'Supplier name is required'),
   supplier_type: SupplierTypeSchema,
-  email: z.string().email('Invalid email address').optional(),
+  email: emptyStringAsUndefined(z.string().email('Invalid email address')),
   phone: z.string().optional(),
   address_line1: z.string().optional(),
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
   city: z.string().optional(),
-  country: z.string().optional(),
+  country: CountryCodeSchema,
   org_number: z.string().optional(),
   vat_number: z.string().optional(),
   bankgiro: z.string().optional(),
@@ -897,13 +1209,34 @@ export const CreateSupplierSchema = z.object({
   bank_account: z.string().optional(),
   iban: z.string().optional(),
   bic: z.string().optional(),
-  default_expense_account: accountNumber.optional(),
-  default_payment_terms: z.number().int().positive().optional(),
+  clearing_number: z.string().optional(),
+  account_number: z.string().optional(),
+  default_expense_account: emptyStringAsUndefined(accountNumber),
+  // Whole days 0-365; 0 = betalning direkt / vid mottagande (issue #2070).
+  default_payment_terms: z.number().int().min(0).max(365).optional(),
   default_currency: CurrencySchema.nullable().optional(),
   notes: z.string().optional(),
 })
 
-export const UpdateSupplierSchema = CreateSupplierSchema.partial()
+/**
+ * Optional field where an empty or whitespace-only string means "clear it".
+ *
+ * Update routes pass validated fields straight into `.update({...})`, where
+ * undefined keys are dropped by supabase-js (column left unchanged) and null
+ * writes NULL. So on update an empty string from a cleared form field must
+ * become null, not undefined, or clearing would silently do nothing.
+ */
+function emptyStringAsNull<T extends z.ZodTypeAny>(inner: T) {
+  return z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? null : v),
+    inner.nullable().optional(),
+  )
+}
+
+export const UpdateSupplierSchema = CreateSupplierSchema.partial().extend({
+  email: emptyStringAsNull(z.string().email('Invalid email address')),
+  default_expense_account: emptyStringAsNull(accountNumber),
+})
 
 // ============================================================
 // Supplier invoice schemas
@@ -930,6 +1263,12 @@ export const CreateSupplierInvoiceItemSchema = z.object({
       message: 'reverse_charge_rate must be 0.06, 0.12, or 0.25',
     })
     .optional(),
+  // Särskild löneskatt på pensionskostnader (SLP): when true the booking
+  // engine injects a self-balancing 7533 D / 2514 K pair at 24.26 % of the
+  // line total (lib/bookkeeping/slp-lines.ts). The pair never changes the
+  // payable. Routes reject the flag on non-741x accounts and in combination
+  // with the periodisering fields below.
+  apply_slp: z.boolean().optional(),
   vat_code: z.string().optional(),
   quantity: z.number().optional(),
   unit: z.string().optional(),
@@ -1004,6 +1343,16 @@ export const CreateSupplierInvoiceSchema = z.object({
   items: z.array(CreateSupplierInvoiceItemSchema).min(1, 'At least one item is required'),
 })
 
+// Pre-submit duplicate lookup for the supplier-invoice editor. Mirrors the
+// partial unique index idx_supplier_invoices_company_supplier_number on
+// (company_id, supplier_id, supplier_invoice_number), which excludes
+// credited/reversed invoices, so the advisory never warns on the re-issue
+// pattern the index was widened to allow.
+export const SupplierInvoiceExistsQuerySchema = z.object({
+  supplier_id: uuid,
+  number: z.string().min(1, 'number is required'),
+})
+
 export const MarkSupplierInvoicePaidSchema = z.object({
   amount: z.number().positive().optional(),
   payment_date: isoDate.optional(),
@@ -1035,6 +1384,39 @@ export const UpdateSupplierInvoiceSchema = z.object({
   delivery_date: optionalIsoDate,
   payment_reference: z.string().optional(),
   notes: z.string().optional(),
+})
+
+// ============================================================
+// Supplier payment batch (betalfil) schemas
+// ============================================================
+
+// v1 gates the API to pain001; the DB CHECK also allows 'bg_lb' so a future
+// format lands without a migration.
+const supplierPaymentBatchFormat = z.enum(['pain001'])
+
+export const PreviewSupplierPaymentBatchSchema = z.object({
+  format: supplierPaymentBatchFormat,
+  ids: z.array(z.string().uuid()).min(1).max(100),
+})
+
+export const SupplierPaymentBatchItemInputSchema = z.object({
+  supplier_invoice_id: z.string().uuid(),
+  // Defaults to the invoice's remaining amount.
+  amount: z.number().positive().optional(),
+  // Defaults to max(due_date, today); past dates are normalized to today.
+  payment_date: isoDate.optional(),
+})
+
+export const CreateSupplierPaymentBatchSchema = z.object({
+  format: supplierPaymentBatchFormat,
+  items: z.array(SupplierPaymentBatchItemInputSchema).min(1).max(100),
+  confirm_already_batched: z.boolean().optional(),
+})
+
+export const SupplierPaymentBatchListQuerySchema = z.object({
+  status: z.enum(['created', 'cancelled', 'all']).default('all'),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
 })
 
 // ============================================================
@@ -1078,6 +1460,10 @@ export const CorrectJournalEntrySchema = z.object({
   // the user replace a header that echoed the wrong account's label (#1031).
   description: z.string().trim().min(1, 'Description cannot be empty').optional(),
   lines: z.array(CreateJournalEntryLineSchema).min(2, 'At least two lines are required for double-entry'),
+  // Explicit override of the correction-chain depth guard (the "Rätta ändå"
+  // confirm in the UI). Without it, correcting an entry 3+ links deep in a
+  // rättelse chain returns CORRECTION_CHAIN_TOO_DEEP.
+  allow_deep_chain: z.boolean().optional(),
 })
 
 // ============================================================
@@ -1261,6 +1647,9 @@ export const UpdateDimensionValueSchema = z
  */
 export const RecordateJournalEntrySchema = z.object({
   new_entry_date: isoDate,
+  // Explicit override of the correction-chain depth guard ("Flytta ändå"):
+  // a date move is another storno+rättelse layer, so it carries the guard too.
+  allow_deep_chain: z.boolean().optional(),
 })
 
 // ============================================================
@@ -1322,6 +1711,9 @@ export const BookTransactionSchema = z
     entry_date: isoDate,
     description: z.string().min(1, 'Description is required'),
     lines: z.array(CreateJournalEntryLineSchema).min(1, 'At least one line is required'),
+    // Explicit series from the booking dialog's picker. Omitted: the route
+    // resolves it from the transaction's cash account, then the per-type map.
+    voucher_series: z.string().regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z').optional(),
     // Booking-time duplicate guard: see CategorizeTransactionSchema.
     force: z.boolean().optional(),
     expected_duplicate_transaction_id: uuid.optional(),
@@ -1332,6 +1724,106 @@ export const BookTransactionSchema = z
     path: ['expected_duplicate_journal_entry_id'],
   })
 
+// ── Webshop orders (Orders page) ──────────────────────────────
+
+export const WebshopPlatformSchema = z.enum(['woocommerce', 'shopify'])
+
+export const WebshopOrdersListQuerySchema = z.object({
+  platform: WebshopPlatformSchema.optional(),
+  store_scope: z.string().max(255).optional(),
+  status: z.string().max(64).optional(),
+  row_type: z.enum(['order', 'refund']).optional(),
+  paid: z.enum(['paid', 'unpaid']).optional(),
+  booked: z.enum(['booked', 'unbooked']).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+})
+
+export const BookWebshopOrderSchema = z.object({
+  fiscal_period_id: uuid,
+  entry_date: isoDate,
+  description: z.string().min(1, 'Description is required').max(500),
+  lines: z.array(CreateJournalEntryLineSchema).min(2, 'At least two lines are required'),
+  voucher_series: z
+    .string()
+    .regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z')
+    .optional(),
+  notes: z.string().max(2000).optional(),
+})
+
+/**
+ * Bulk booking of webshop orders: each order books as its OWN verifikat
+ * through the same server-side flow as the single-order endpoint (never one
+ * combined journal write). Max 50 = one orders-page of selection.
+ */
+/**
+ * Revenue account for the bulk revenue template: class 3 only, and never
+ * 3740. The template routes the revenue side of the sweep; a non-revenue
+ * account here would put sales on a balance or cost account with no
+ * reviewing user per line. 3740 (öresavrundning) is excluded because the
+ * bulk route bounds the rounding residual by that account: a templated
+ * revenue line on 3740 would both misbook real revenue as rounding and
+ * blind that guard (skeptic finding). Orders needing an off-class-3 revenue
+ * leg go through the single-order dialog, which is fully line-editable.
+ */
+const webshopRevenueAccount = accountNumber
+  .refine((n) => n.startsWith('3'), {
+    message: 'Intäktskontot måste vara ett konto i klass 3 (3000-3999)',
+  })
+  .refine((n) => n !== '3740', {
+    message: 'Öresavrundningskontot 3740 kan inte användas som intäktskonto',
+  })
+
+export const BulkBookWebshopOrdersSchema = z.object({
+  order_ids: z.array(uuid).min(1).max(50),
+  /**
+   * Optional override: prefill every order's payment leg against this
+   * account instead of the per-store payment-method mapping.
+   */
+  payment_account: accountNumber.optional(),
+  /**
+   * Optional revenue template: revenue account per Swedish VAT rate, keyed
+   * by the rate as a string. A missing rate falls back to the standard
+   * 3001-series map. Output VAT accounts are never overridable: they are
+   * derived from the rate.
+   */
+  revenue_accounts: z
+    .object({
+      '25': webshopRevenueAccount.optional(),
+      '12': webshopRevenueAccount.optional(),
+      '6': webshopRevenueAccount.optional(),
+      '0': webshopRevenueAccount.optional(),
+    })
+    .strict()
+    .optional(),
+})
+
+export const CreateInvoiceFromWebshopOrderSchema = z.object({
+  /** Omitted: match by email/orgnr within the company, else create. */
+  customer_id: uuid.optional(),
+})
+
+/**
+ * Mark a webshop order as booked/handled outside the integration, with an
+ * optional reference to the existing (posted) verifikat that covers it.
+ */
+export const MarkWebshopOrderBookedSchema = z.object({
+  journal_entry_id: uuid.optional(),
+})
+
+/** {"<payment_method>": {mode:'book', account:'1930'} | {mode:'invoice'}} */
+export const WebshopStoreSettingsUpdateSchema = z.object({
+  platform: WebshopPlatformSchema,
+  store_scope: z.string().min(1).max(255),
+  payment_method_account_map: z.record(
+    z.string().min(1).max(64),
+    z.discriminatedUnion('mode', [
+      z.object({ mode: z.literal('book'), account: accountNumber }),
+      z.object({ mode: z.literal('invoice') }),
+    ]),
+  ),
+})
+
 /**
  * Edit a bank transaction's title (description). Only the working label:
  * gated server-side to unbooked, unmatched rows. Trimmed; whitespace-only is
@@ -1341,10 +1833,40 @@ export const UpdateTransactionTitleSchema = z.object({
   description: z.string().trim().min(1, 'Title cannot be empty').max(500),
 })
 
+/**
+ * Move an unbooked bank transaction to another of the company's cash accounts,
+ * addressed by the target's BAS 19xx ledger account. Deliberately no null
+ * variant: unassigning a row would just re-strand it under the primary
+ * account's report (the exact symptom the move action exists to fix).
+ */
+export const MoveTransactionCashAccountSchema = z.object({
+  account_number: z
+    .string()
+    .regex(/^19\d{2}$/, 'Expected a BAS 19xx bank account number'),
+})
+
+/**
+ * Set or clear the verifikationsserie override on one of the company's cash
+ * accounts. null clears the override: entries booked from the account then
+ * follow the per-source-type default again.
+ */
+export const UpdateCashAccountVoucherSeriesSchema = z.object({
+  voucher_series: z
+    .string()
+    .regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z')
+    .nullable(),
+})
+
 export const BookInboxItemDirectlySchema = z.object({
   fiscal_period_id: uuid,
   entry_date: isoDate,
   description: z.string().min(1, 'Beskrivning krävs'),
+  // `.optional()` here carries meaning the route depends on: ABSENT means
+  // "caller has no opinion", so the route may default the notes from the
+  // item's chat context, while an explicit '' means the user cleared the
+  // prefilled note and nothing must be written back onto the verifikat.
+  // Keep it `.optional()`, never `.default('')` or a min(1): both would
+  // collapse those two cases into one.
   notes: z.string().max(2000).optional(),
   lines: z.array(CreateJournalEntryLineSchema).min(2, 'Minst två rader krävs för dubbel bokföring'),
   transaction_id: uuid.optional(),
@@ -1381,7 +1903,6 @@ export const BulkBookInboxSchema = z.object({
   // staged-params reason as the fields above.
   dimensions: DimensionsBagSchema.nullish().transform((v) => v ?? undefined),
 })
-export type BulkBookInboxInput = z.infer<typeof BulkBookInboxSchema>
 
 export const MatchInvoiceSchema = z
   .object({
@@ -1500,6 +2021,11 @@ export const BulkBookSchema = z
     // BOTH the template and manual paths (per-line bags win per key). The
     // route merges before calling the RPC.
     default_dimensions: DimensionsBagSchema.optional(),
+    // Bypass the booking-time duplicate guard after the user reviewed the
+    // flagged candidate (TRANSACTION_BOOK_POSSIBLE_DUPLICATE). Bulk-book has
+    // no per-tx candidate binding: force skips the guard for the whole batch,
+    // and the route records each dismissed candidate in behandlingshistorik.
+    force: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
     const hasExisting = !!data.existing_journal_entry_id
@@ -1603,6 +2129,15 @@ export const CreateTransactionFromDocumentSchema = z.object({
   description: z.string().min(1).max(500),
 })
 
+/**
+ * POST /api/transactions/[id]/match-rot-rut-payout: settle a ROT/RUT begäran
+ * with the bank row that carried Skatteverkets utbetalning. Amount, date and
+ * bank account all come from the transaction, so the body is just the target.
+ */
+export const MatchRotRutPayoutSchema = z.object({
+  request_id: uuid,
+})
+
 export const MatchSupplierInvoiceSchema = z.object({
   supplier_invoice_id: uuid,
   // Same purpose as MatchInvoiceSchema.lines: user-edited rows override
@@ -1639,6 +2174,21 @@ export const InvoiceEmailTextsSchema = z.object({
   en: InvoiceEmailTextsLangSchema.optional(),
 })
 
+// Editable reminder email texts per reminder level. Same conventions as
+// InvoiceEmailTextsSchema: empty strings pass and are treated as unset by
+// the template resolver; the UI prunes empties and stores only diffs from
+// the defaults. Subject is a mail header: CR/LF are stripped at render time.
+const ReminderTextOverrideLevelSchema = z.object({
+  subject: z.string().max(200, 'Ämnesraden får vara max 200 tecken').optional(),
+  body: z.string().max(2000, 'Brödtexten får vara max 2000 tecken').optional(),
+})
+
+export const ReminderTextOverridesSchema = z.object({
+  level_1: ReminderTextOverrideLevelSchema.optional(),
+  level_2: ReminderTextOverrideLevelSchema.optional(),
+  level_3: ReminderTextOverrideLevelSchema.optional(),
+})
+
 const InvoiceIbanSchema = z.string()
   .transform((value) => value.replace(/\s/g, '').toUpperCase())
   .pipe(z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/, 'Ogiltigt IBAN'))
@@ -1660,19 +2210,71 @@ const InvoicePaymentAccountSchema = z.object({
     .nullable()
     .optional()
     .or(z.literal('')),
+  // Foreign non-IBAN routing (USD ABA routing number, GBP sort code): digits
+  // with optional dashes, 6-9 digits after stripping (ABA = 9, sort code = 6).
+  bank_code: z.string()
+    .transform((value) => value.replace(/\s/g, ''))
+    .pipe(z.string().regex(/^\d{2,3}(-?\d{2,3}){1,2}$|^\d{6,9}$/, 'Ogiltig bankkod'))
+    .nullable()
+    .optional()
+    .or(z.literal('')),
+  // Foreign account number: alphanumeric, distinct from the Swedish
+  // clearing+account pair (account_number is digits-only 6-12).
+  foreign_account_number: z.string()
+    .transform((value) => value.replace(/\s/g, ''))
+    .pipe(z.string().regex(/^[A-Za-z0-9-]{4,34}$/, 'Ogiltigt kontonummer'))
+    .nullable()
+    .optional()
+    .or(z.literal('')),
 })
+
+/**
+ * PATCH /api/cash-accounts/[id]: the verifikationsserie override plus the
+ * payee fields (migration 20260904010000). Payee keys share the field rules
+ * of InvoicePaymentAccountSchema so the settings form, the legacy settings
+ * writers and this route agree on what a valid bankgiro is.
+ */
+export const UpdateCashAccountSchema = InvoicePaymentAccountSchema.extend({
+  voucher_series: UpdateCashAccountVoucherSeriesSchema.shape.voucher_series.optional(),
+  name: z.string().trim().min(1).max(100).nullable().optional(),
+  invoice_payee: z.boolean().optional(),
+}).strict().refine((body) => Object.keys(body).length > 0, {
+  message: 'Inget att uppdatera',
+})
+
+/** POST /api/cash-accounts: a bank account typed by hand (no bank connection). */
+export const CreateCashAccountSchema = z.object({
+  name: z.string().trim().min(1, 'Ange ett namn').max(100),
+  currency: CurrencySchema,
+  ledger_account: z.string().regex(/^19[2-9]\d$/, 'Bankkonton bokförs på 1920-1999').optional(),
+  invoice_payee: z.boolean().optional(),
+  payee: InvoicePaymentAccountSchema.optional(),
+}).strict()
+
+/** PUT /api/cash-accounts/payee-defaults: which account invoices in a currency pay to. */
+export const SetInvoicePayeeDefaultSchema = z.object({
+  currency: CurrencySchema,
+  cash_account_id: uuid.nullable(),
+}).strict()
 
 const InvoicePaymentAccountsSchema = z
   .partialRecord(CurrencySchema, InvoicePaymentAccountSchema)
   .superRefine((accounts, ctx) => {
     for (const [currency, account] of Object.entries(accounts)) {
-      if (currency !== 'SEK' && account && !account.iban) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [currency, 'iban'],
-          message: `IBAN krävs för betalningskonto i ${currency}`,
-        })
-      }
+      if (currency === 'SEK' || !account) continue
+      if (account.iban) continue
+      // Non-IBAN banking systems (US, UK): bank code + account number + BIC
+      // identifies the account. Requiring an IBAN there forced users to paste
+      // one from another currency, which then printed on the invoice.
+      const nonIban = NON_IBAN_CURRENCIES.includes(currency as Currency)
+      if (nonIban && account.bank_code && account.foreign_account_number && account.bic) continue
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [currency, 'iban'],
+        message: nonIban
+          ? `Ange IBAN eller bankkod, kontonummer och BIC/SWIFT för betalningskontot i ${currency}`
+          : `IBAN krävs för betalningskonto i ${currency}`,
+      })
     }
   })
 
@@ -1751,7 +2353,7 @@ export const UpdateSettingsSchema = z.object({
   pays_salaries: z.boolean().optional(),
   sector_slug: z.string().nullable().optional(),
   // Bookkeeping lock
-  bookkeeping_locked_through: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Ogiltigt datumformat (YYYY-MM-DD)').nullable().optional(),
+  bookkeeping_locked_through: z.string().regex(ISO_DATE_RE, ISO_DATE_MESSAGE_SV).nullable().optional(),
   auto_lock_period_days: z.number().int().positive().nullable().optional(),
   // Voucher series
   default_voucher_series: z.string().regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z').optional(),
@@ -1813,6 +2415,10 @@ export const UpdateSettingsSchema = z.object({
   reminder_days_level_1: z.number().int().min(1).max(365).optional(),
   reminder_days_level_2: z.number().int().min(1).max(365).optional(),
   reminder_days_level_3: z.number().int().min(1).max(365).optional(),
+  // Editable reminder email texts: { level_1?: {...}, ... }; null clears all
+  // overrides. Text only: fee and interest math are computed by the reminder
+  // processor and never configurable here (Lag 1981:739 caps the fee at 60 kr).
+  reminder_text_overrides: ReminderTextOverridesSchema.nullable().optional(),
   // Reminder surcharges (dröjsmålsränta + lagstadgad påminnelseavgift)
   reminder_fee_enabled: z.boolean().optional(),
   reminder_fee_amount: z
@@ -1831,6 +2437,16 @@ export const UpdateSettingsSchema = z.object({
   // Dimensions (kostnadsställe/projekt): UI-visibility toggle only, never
   // load-bearing for correctness (dev_docs/dimensions_implementation_plan.md §2).
   dimensions_enabled: z.boolean().optional(),
+  // Körjournal (mileage log): UI-visibility toggle only, never load-bearing
+  // for correctness (trips created via API/MCP work regardless).
+  mileage_enabled: z.boolean().optional(),
+  // Kundorder (sales orders): UI-visibility toggle only, never load-bearing
+  // for correctness (the pages and APIs work regardless).
+  sales_orders_enabled: z.boolean().optional(),
+  // Data analysis consent (#1346): gates cross-company analysis of this
+  // company's bookkeeping outcomes. Flipped by a human in the settings UI
+  // only; deliberately absent from the v1 REST / MCP settings pick lists.
+  data_analysis_opt_in: z.boolean().optional(),
   // Salary payment file
   preferred_payment_format: z.enum(['bg_lb', 'pain001']).optional(),
   // Salary settings (migration 20260703190000). Day of month salaries are
@@ -1841,6 +2457,9 @@ export const UpdateSettingsSchema = z.object({
     .enum(['swedbank', 'seb', 'handelsbanken', 'nordea', 'other'])
     .nullable()
     .optional(),
+  // Öresavrundning: round each net payout up to whole kronor (banks that
+  // reject öre in salary payment files). Diff books on 3740.
+  salary_net_rounding: z.boolean().optional(),
   // Vacation year basis (payroll gap-closure 3.1): sammanfallande calendar
   // year (default) or the statutory Apr 1 - Mar 31 split. The settings route
   // blocks changing this while open vacation-ledger rows exist.
@@ -1945,6 +2564,12 @@ const defaultVatRate = z
   .nullable()
   .optional()
 
+// Single source of truth for treatments is lib/vat/account-vat-treatment.ts;
+// the DB CHECK on chart_of_accounts.default_vat_treatment mirrors it per class.
+export const AccountVatTreatmentSchema = z.enum(ACCOUNT_VAT_TREATMENTS)
+
+const defaultVatTreatment = AccountVatTreatmentSchema.nullable().optional()
+
 export const CreateAccountSchema = z.object({
   account_number: accountNumber,
   account_name: z.string().min(1, 'Account name is required'),
@@ -1954,6 +2579,7 @@ export const CreateAccountSchema = z.object({
   description: z.string().nullable().optional(),
   default_vat_code: z.string().nullable().optional(),
   default_vat_rate: defaultVatRate,
+  default_vat_treatment: defaultVatTreatment,
   sru_code: z.string().nullable().optional(),
 })
 
@@ -1963,6 +2589,7 @@ export const UpdateAccountSchema = z.object({
   description: z.string().nullable().optional(),
   default_vat_code: z.string().nullable().optional(),
   default_vat_rate: defaultVatRate,
+  default_vat_treatment: defaultVatTreatment,
   sru_code: z.string().nullable().optional(),
 })
 
@@ -1983,17 +2610,28 @@ export const PruneAccountsSchema = z
 // Bank reconciliation schemas
 // ============================================================
 
-export const BankLinkSchema = z.object({
-  transaction_id: uuid,
-  journal_entry_id: uuid,
-  // Settlement account being reconciled. The voucher must have a line on this
-  // account and the transaction must belong to it. Defaults to '1930' in the
-  // route for back-compat.
-  account_number: z
-    .string()
-    .regex(/^[0-9]{4}$/, 'Kontonummer måste vara 4 siffror')
-    .optional(),
-})
+export const BankLinkSchema = z
+  .object({
+    transaction_id: uuid,
+    // One verifikat (1:1, or N:1 when other transactions already point at it).
+    journal_entry_id: uuid.optional(),
+    // Or several verifikat settled by this one transaction (1:N, #1553): the
+    // signed slice per verifikat in the transaction's sign convention. The
+    // slices must sum to the transaction amount; the engine enforces it.
+    allocations: z
+      .array(z.object({ journal_entry_id: uuid, amount: z.number() }))
+      .min(2)
+      .max(50)
+      .optional(),
+    // Settlement account being reconciled. The voucher must have a line on this
+    // account and the transaction must belong to it. Defaults to '1930' in the
+    // route for back-compat.
+    account_number: accountNumber.optional(),
+  })
+  .refine((v) => (v.journal_entry_id ? !v.allocations : Boolean(v.allocations)), {
+    message: 'Ange journal_entry_id eller allocations, inte båda.',
+    path: ['journal_entry_id'],
+  })
 
 export const BankUnlinkSchema = z.object({
   transaction_id: uuid,
@@ -2012,12 +2650,16 @@ export const MarkOpeningBalanceSchema = z.object({
 export const RunReconciliationSchema = z.object({
   date_from: isoDate.optional(),
   date_to: isoDate.optional(),
+  // Run the per-cash-account unattended sweep over every enabled cash account
+  // ("Kör matchning igen" in the review surface) instead of one account. The
+  // sweep always applies at the unattended threshold and persists suggestions;
+  // there is no dry-run form. The route REJECTS (400) any combination with
+  // dry_run, account_number or selected_matches rather than silently ignoring
+  // them: a request that asked for a preview must never apply writes.
+  all_accounts: z.boolean().optional(),
   // BAS settlement account to reconcile against (e.g. '1930', '1932'). Defaults
   // to '1930' server-side so existing clients stay correct.
-  account_number: z
-    .string()
-    .regex(/^[0-9]{4}$/, 'Kontonummer måste vara 4 siffror')
-    .optional(),
+  account_number: accountNumber.optional(),
   dry_run: z.boolean().optional(),
   // Pairs the user ticked in the dry-run preview. When present on an apply
   // (dry_run false), only these pairs are committed: intersected server-side
@@ -2031,6 +2673,20 @@ export const RunReconciliationSchema = z.object({
     )
     .max(500)
     .optional(),
+  // Server-side confidence floor for the apply path (0..1), mirroring the v1
+  // route. The UI sends 0.85 with a strong-only apply so a pair that scored
+  // lower on the fresh server re-run is never committed, even if a stale
+  // client still has it ticked. Omitted = legacy behavior: every selected
+  // match applies, including manually ticked fuzzy ones at 0.75.
+  confidence_threshold: z.number().min(0).max(1).optional(),
+})
+
+// Confirm or reject persisted journal-entry match suggestions
+// (transactions.potential_journal_entry_id). Each pair is revalidated
+// server-side at confirm time; stale pairs are skipped, never failing the batch.
+export const ConfirmJeSuggestionsSchema = z.object({
+  transaction_ids: z.array(uuid).min(1).max(500),
+  action: z.enum(['confirm', 'reject']),
 })
 
 // ============================================================
@@ -2041,12 +2697,6 @@ export const VatDeclarationQuerySchema = z.object({
   periodType: z.enum(['monthly', 'quarterly', 'yearly']),
   year: z.coerce.number().int().min(2000).max(2100),
   period: z.coerce.number().int().min(1).max(12),
-})
-
-export const ReportPeriodQuerySchema = z.object({
-  fiscal_period_id: uuid.optional(),
-  year: z.coerce.number().int().min(2000).max(2100).optional(),
-  month: z.coerce.number().int().min(1).max(12).optional(),
 })
 
 export const AccountBalancesQuerySchema = z.object({
@@ -2105,6 +2755,9 @@ export const PendingOperationsQuerySchema = z.object({
   status: z.enum(['pending', 'committed', 'rejected', 'failed_partial']).default('pending'),
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().nonnegative().default(0),
+  // Newest first by default; a bokslut batch of fifty operations is worked
+  // oldest first, so the queue can be flipped.
+  order: z.enum(['asc', 'desc']).default('desc'),
 })
 
 export const PendingOperationsBulkSchema = z.object({
@@ -2131,6 +2784,7 @@ const auditActions = [
   'INSERT', 'UPDATE', 'DELETE', 'COMMIT', 'REVERSE', 'CORRECT',
   'LOCK_PERIOD', 'CLOSE_PERIOD', 'DOCUMENT_DELETE_BLOCKED',
   'RETENTION_BLOCK', 'SECURITY_EVENT', 'INTEGRITY_FAILURE',
+  'COMMITTED_AT_OVERRIDE',
 ] as const satisfies readonly AuditAction[]
 
 export const AuditTrailQuerySchema = z.object({
@@ -2141,6 +2795,21 @@ export const AuditTrailQuerySchema = z.object({
   to_date: isoDate.optional(),
   page: z.coerce.number().int().min(1).default(1),
   page_size: z.coerce.number().int().min(1).max(200).default(50),
+})
+
+/**
+ * GET /api/reports/behandlingshistorik (BFL 5 kap. 11 §). period_id is the
+ * fiscal period; from_date/to_date narrow to a sub-range inside it (validated
+ * against the period bounds by the route, like the other fiscal-range reports).
+ */
+export const BehandlingshistorikQuerySchema = z.object({
+  period_id: z.string().min(1),
+  from_date: isoDate.optional(),
+  to_date: isoDate.optional(),
+  category: z
+    .enum(['verifikation', 'kontoplan', 'installningar', 'period', 'import', 'atkomst', 'ovrigt'])
+    .optional(),
+  format: z.enum(['json', 'csv', 'xlsx', 'pdf']).default('json'),
 })
 
 // ============================================================
@@ -2173,6 +2842,28 @@ export const OpeningBalanceExecuteSchema = z.object({
   })).min(2, 'At least two lines are required for double-entry'),
 })
 
+export const OpeningBalanceCorrectSchema = OpeningBalanceExecuteSchema.extend({
+  // Also apply the correction's per-account delta to subsequent years' linked
+  // IB verifikat (Fortnox/SIE migrations book one IB per imported year).
+  cascade: z.boolean().optional(),
+})
+
+/**
+ * Inline (no-storno) IB correction: strike changed lines and add replacements
+ * inside the SAME verifikat, BFL 5 kap 5 § track 2. Only for open, unlocked
+ * years; the correct_entry_lines_inline RPC enforces the full envelope.
+ */
+export const OpeningBalanceCorrectInlineSchema = z
+  .object({
+    fiscal_period_id: uuid,
+    strike_line_ids: z.array(uuid).max(200).default([]),
+    new_lines: z.array(InlineRattelseLineSchema).max(100).default([]),
+    cascade: z.boolean().optional(),
+  })
+  .refine((body) => body.strike_line_ids.length > 0 || body.new_lines.length > 0, {
+    message: 'Rättelsen måste stryka eller lägga till minst en rad',
+  })
+
 // ============================================================
 // Register import schemas (customers, suppliers)
 // ============================================================
@@ -2188,10 +2879,22 @@ const ImportedCustomerRowSchema = z.object({
   address_line2: z.string().nullable(),
   postal_code: z.string().nullable(),
   city: z.string().nullable(),
-  country: z.string(),
+  country: countryCode,
   vat_number: z.string().nullable(),
   default_payment_terms: z.number().int().min(0).max(365),
   notes: z.string().nullable(),
+}).superRefine((row, ctx) => {
+  // The preview flags these rows and the wizard refuses to continue with
+  // them; repeated here so a hand-built request cannot import an EU
+  // business with country SE (#2025).
+  const countryIssue = checkCountryConsistency({
+    partyType: row.customer_type,
+    country: row.country,
+    vatNumber: row.vat_number,
+  })
+  if (countryIssue) {
+    ctx.addIssue({ code: 'custom', path: ['country'], message: COUNTRY_CONSISTENCY_MESSAGES[countryIssue].en })
+  }
 })
 
 export const CustomerImportExecuteSchema = z.object({
@@ -2210,7 +2913,7 @@ const ImportedSupplierRowSchema = z.object({
   address_line2: z.string().nullable(),
   postal_code: z.string().nullable(),
   city: z.string().nullable(),
-  country: z.string(),
+  country: countryCode,
   vat_number: z.string().nullable(),
   bankgiro: z.string().nullable(),
   plusgiro: z.string().nullable(),
@@ -2285,7 +2988,6 @@ export const EmploymentTypeSchema = z.enum(['employee', 'company_owner', 'board_
 export const SalaryTypeSchema = z.enum(['monthly', 'hourly'])
 export const FSkattStatusSchema = z.enum(['a_skatt', 'f_skatt', 'fa_skatt', 'not_verified'])
 export const VacationRuleSchema = z.enum(['procentregeln', 'sammaloneregeln', 'none', 'semesterersattning'])
-export const SalaryRunStatusSchema = z.enum(['draft', 'review', 'approved', 'paid', 'booked', 'corrected'])
 
 export const SalaryLineItemTypeSchema = z.enum([
   'monthly_salary', 'hourly_salary',
@@ -2300,6 +3002,7 @@ export const SalaryLineItemTypeSchema = z.enum([
   'mileage_taxfree', 'mileage_taxable',
   'net_deduction_advance', 'net_deduction_union', 'net_deduction_benefit_payment',
   'net_deduction_other',
+  'oresavrundning',
   'correction', 'other',
 ])
 
@@ -2412,30 +3115,12 @@ export const CreateEmployeeSchema = EmployeeSchemaBase.superRefine((data, ctx) =
     })
   }
 
-  // Jämkning: a percentage without a start date is meaningless (the engine
-  // gates on jamkning_valid_from <= payment_date). End date is optional
-  // (beslut often run until year-end implicitly).
-  if (
-    data.jamkning_percentage !== null &&
-    data.jamkning_percentage !== undefined &&
-    !data.jamkning_valid_from
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'Jämkningens startdatum måste anges när jämkningsprocent sätts',
-      path: ['jamkning_valid_from'],
-    })
-  }
-  if (
-    data.jamkning_valid_from &&
-    data.jamkning_valid_to &&
-    data.jamkning_valid_to < data.jamkning_valid_from
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'Jämkningens slutdatum måste vara efter startdatumet',
-      path: ['jamkning_valid_to'],
-    })
+  // Jämkning: the engine (isJamkningValid in lib/salary/calculation-engine.ts)
+  // applies the beslut only when BOTH dates are set, so a percentage needs
+  // both a start and an end date on every write path (#2058). The create body
+  // is the whole row, so the shared validator sees the final state here.
+  for (const issue of validateJamkning(data)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message, path: [issue.field] })
   }
 
   // Bank details: validate clearing/kontonummer structure at entry so a typo is
@@ -2541,21 +3226,13 @@ export const UpdateEmployeeSchema = EmployeeSchemaPatchBase.partial().superRefin
     })
   }
 
-  // Jämkning: same schema-visibility caveat as växa-stöd above. What the
-  // schema CAN see: a non-null percentage sent WITHOUT any start date in the
-  // same body is only valid if a start date already exists on the row: the
-  // route layer does the merged-state check. Within-body date ordering is
-  // checkable here.
-  if (
-    data.jamkning_valid_from &&
-    data.jamkning_valid_to &&
-    data.jamkning_valid_to < data.jamkning_valid_from
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'Jämkningens slutdatum måste vara efter startdatumet',
-      path: ['jamkning_valid_to'],
-    })
+  // Jämkning: same schema-visibility caveat as växa-stöd above. A non-null
+  // percentage sent WITHOUT dates in the same body is only valid if the dates
+  // already exist on the row, so the route layer runs validateJamkning on the
+  // merged state. Within-body date ordering is checkable here: pass the
+  // percentage as null so only the ordering rule fires.
+  for (const issue of validateJamkning({ ...data, jamkning_percentage: null })) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message, path: [issue.field] })
   }
 })
 
@@ -2650,6 +3327,83 @@ export const UpdateEmployeeBenefitSchema = z.object({
   }
 })
 
+export const RecurringLineItemTypeSchema = z.enum([
+  'gross_deduction_pension',
+  'gross_deduction_other',
+  'net_deduction_union',
+  'net_deduction_benefit_payment',
+  'net_deduction_other',
+])
+
+/** Same inclusive-bound semantics as BENEFIT_PERIOD_ORDER_MESSAGE, for
+ * employee_recurring_lines (migration 20260902140000). */
+export const RECURRING_LINE_PERIOD_ORDER_MESSAGE =
+  '"Gäller till" måste vara samma dag som eller efter "Gäller från". Lämna fältet tomt för en löpande rad.'
+
+const recurringLineAmountIssue = (
+  data: { item_type?: string; amount?: number },
+  ctx: z.RefinementCtx,
+) => {
+  // Mirrors the employee_recurring_lines_amount_sign CHECK: every supported
+  // type is a deduction and must be negative. Kept in the schema so the
+  // violation is a field-level 400 instead of a Postgres 23514.
+  if (data.amount === undefined || data.item_type === undefined) return
+  const bad = data.amount >= 0
+  if (bad) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Avdragsrader måste ha negativt belopp och tilläggsrader positivt belopp.',
+      path: ['amount'],
+    })
+  }
+}
+
+export const CreateEmployeeRecurringLineSchema = z.object({
+  item_type: RecurringLineItemTypeSchema,
+  description: z.string().min(1).max(200),
+  amount: z.number(),
+  account_number: accountNumberSchema.optional(),
+  valid_from: isoDate,
+  valid_to: isoDate.optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  is_active: z.boolean().optional(),
+}).superRefine((data, ctx) => {
+  recurringLineAmountIssue(data, ctx)
+  if (data.valid_to !== undefined && data.valid_to < data.valid_from) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: RECURRING_LINE_PERIOD_ORDER_MESSAGE,
+      path: ['valid_to'],
+    })
+  }
+})
+
+/** item_type is not patchable (like benefit_type): the sign rule and derived
+ * flags key off it, so changing kind means delete + recreate. The route
+ * re-checks the amount sign and merged date pair against the stored row. */
+export const UpdateEmployeeRecurringLineSchema = z.object({
+  description: z.string().min(1).max(200).optional(),
+  amount: z.number().optional(),
+  account_number: accountNumberSchema.nullable().optional(),
+  valid_from: isoDate.optional(),
+  valid_to: isoDate.nullable().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  is_active: z.boolean().optional(),
+}).superRefine((data, ctx) => {
+  if (
+    data.valid_from !== undefined &&
+    data.valid_to !== undefined &&
+    data.valid_to !== null &&
+    data.valid_to < data.valid_from
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: RECURRING_LINE_PERIOD_ORDER_MESSAGE,
+      path: ['valid_to'],
+    })
+  }
+})
+
 export const CreateSalaryRunSchema = z.object({
   period_year: z.number().int().min(2020).max(2100),
   period_month: z.number().int().min(1).max(12),
@@ -2679,7 +3433,13 @@ export const AddEmployeeToRunSchema = z.object({
 
 export const CreateSalaryLineItemSchema = z.object({
   salary_run_employee_id: uuid,
-  item_type: SalaryLineItemTypeSchema,
+  // 'oresavrundning' is derived-only: the calculator writes it from the
+  // engine's netRounding and the booking excludes it from the gross
+  // reconciliation, so a manually created row would unbalance the salary
+  // verifikat by exactly its amount (the DB balance trigger then rejects the
+  // booking). Every other derived type is absorbed by the base remainder and
+  // stays harmless to create by hand.
+  item_type: SalaryLineItemTypeSchema.exclude(['oresavrundning']),
   description: z.string().min(1).max(500),
   quantity: z.number().optional(),
   unit_price: z.number().optional(),
@@ -2744,8 +3504,13 @@ const openingBalancesShape = {
   ytd_tax: z.number().min(0).default(0),
   ytd_net: z.number().min(0).default(0),
   vacation_paid_days_remaining: z.number().min(0).max(40).default(0),
+  // Paid days already taken in the CURRENT vacation year under the previous
+  // system. The ledger's cutover-year row derives entitled = remaining +
+  // taken_this_year and folds this into taken_days; remaining keeps meaning
+  // "remaining at cutover".
+  vacation_days_taken_this_year: z.number().min(0).max(40).default(0),
   vacation_saved_days_by_year: z
-    .record(z.string().regex(/^\d{4}$/, 'Nyckel måste vara ett fyrsiffrigt år'), z.number().min(0).max(40))
+    .record(fiscalYearSchema, z.number().min(0).max(40))
     .default({}),
   opening_semester_liability: z.number().min(0).default(0),
   opening_semester_liability_avgifter: z.number().min(0).default(0),
@@ -2867,90 +3632,6 @@ export const BatchUpsertWorkedDaysSchema = z
     },
   )
 
-// ============================================================
-// AI agent flow schemas
-// ============================================================
-
-const BookingProposalLineSchema = z.object({
-  account_number: accountNumber,
-  debit_amount: nonNegativeAmount,
-  credit_amount: nonNegativeAmount,
-  description: z.string().min(1).max(500),
-})
-
-const BookingProposalCounterpartyTemplateSchema = z.object({
-  counterparty_name: z.string().min(1).max(200),
-  debit_account: accountNumber,
-  credit_account: accountNumber,
-  vat_treatment: VatTreatmentSchema.nullable(),
-  category: TransactionCategorySchema.nullable(),
-})
-
-// Edit payload: the user's edited version of a booking proposal. Used in
-// the /accept endpoint when the user adjusted accounts/VAT before approving.
-export const EditBookingProposalSchema = z.object({
-  lines: z.array(BookingProposalLineSchema).min(2),
-  vat_treatment: VatTreatmentSchema.nullable(),
-  default_private: z.boolean(),
-  counterparty_template_proposal: BookingProposalCounterpartyTemplateSchema.nullable(),
-  fiscal_period_id: uuid,
-  entry_date: isoDate,
-  description: z.string().min(1).max(500),
-})
-
-// For match proposals, editing just means picking a different transaction.
-export const EditMatchProposalSchema = z.object({
-  matched_transaction_id: uuid,
-})
-
-export const AcceptProposalSchema = z.object({
-  version: z.number().int().nonnegative(),
-  edits: z.union([EditBookingProposalSchema, EditMatchProposalSchema]).optional(),
-})
-
-// Change the matched transaction on a pending match proposal without
-// accepting it. Source tells us whether the user picked one of the AI's
-// own alternatives, an AI-regenerated suggestion, or a manually-chosen
-// transaction: kept on edit_diff for learning signal.
-export const ChangeMatchProposalSchema = z.object({
-  version: z.number().int().nonnegative(),
-  matched_transaction_id: uuid,
-  source: z.enum(['user_alternative', 'user_manual', 'ai_regenerated']),
-})
-
-export const RejectProposalSchema = z.object({
-  version: z.number().int().nonnegative(),
-  reason: z.string().max(500).optional(),
-})
-
-export const BatchAcceptSchema = z.object({
-  proposal_ids: z.array(uuid).min(1).max(50),
-})
-
-export const ResolveRequestSchema = z.object({
-  response: z.record(z.string(), z.unknown()).optional(),
-})
-
-export const StartBackfillSchema = z.object({}).strict()
-
-export const RememberLearningSchema = z.object({
-  proposal_id: uuid,
-  counterparty_name: z.string().min(1).max(200),
-  debit_account: accountNumber,
-  credit_account: accountNumber,
-  vat_treatment: VatTreatmentSchema.nullable(),
-  category: TransactionCategorySchema.nullable(),
-})
-
-export const ListProposalsQuerySchema = z.object({
-  status: z
-    .enum(['pending', 'accepted', 'rejected', 'skipped', 'invalidated'])
-    .optional(),
-  step_type: z.enum(['match', 'booking']).optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-  offset: z.coerce.number().int().min(0).default(0),
-})
-
 export const AttachDocumentSchema = z.object({
   document_id: uuid,
 })
@@ -2962,70 +3643,19 @@ export const LinkDocumentSchema = z.object({
   transaction_id: uuid.optional(),
 })
 
-// ============================================================
-// Shift-premium rules (OB-tillägg och övertid)
-// ============================================================
-
-export const ShiftPremiumItemTypeSchema = z.enum([
-  'overtime_50',
-  'overtime_100',
-  'ob_weekday_evening',
-  'ob_weekend',
-  'ob_night',
-  'ob_holiday',
-])
-
-const dayOfWeekArray = z
-  .array(z.number().int().min(1).max(7))
-  .min(1, 'Välj minst en veckodag')
-  .max(7, 'Högst sju veckodagar tillåtna')
-
-export const CreateShiftPremiumRuleSchema = z
-  .object({
-    name: z.string().min(1).max(120),
-    applies_to_all_employees: z.boolean().default(true),
-    applies_to_employee_ids: z.array(uuid).default([]),
-    day_of_week: dayOfWeekArray,
-    start_time: timeString,
-    end_time: timeString,
-    premium_percent: z.number().min(0).max(500),
-    item_type: ShiftPremiumItemTypeSchema,
-    priority: z.number().int().min(0).max(1000).default(0),
-    is_active: z.boolean().default(true),
-  })
-  .refine(
-    (data) => data.applies_to_all_employees || data.applies_to_employee_ids.length > 0,
-    {
-      message: 'Välj minst en anställd när regeln inte gäller alla',
-      path: ['applies_to_employee_ids'],
-    },
-  )
-
-export const UpdateShiftPremiumRuleSchema = z
-  .object({
-    name: z.string().min(1).max(120).optional(),
-    applies_to_all_employees: z.boolean().optional(),
-    applies_to_employee_ids: z.array(uuid).optional(),
-    day_of_week: dayOfWeekArray.optional(),
-    start_time: timeString.optional(),
-    end_time: timeString.optional(),
-    premium_percent: z.number().min(0).max(500).optional(),
-    item_type: ShiftPremiumItemTypeSchema.optional(),
-    priority: z.number().int().min(0).max(1000).optional(),
-    is_active: z.boolean().optional(),
-  })
-  .refine(
-    (data) => {
-      if (data.applies_to_all_employees === false && data.applies_to_employee_ids !== undefined) {
-        return data.applies_to_employee_ids.length > 0
-      }
-      return true
-    },
-    {
-      message: 'Välj minst en anställd när regeln inte gäller alla',
-      path: ['applies_to_employee_ids'],
-    },
-  )
+/**
+ * Underlag import preview: filenames only, never file contents. The plan is
+ * built from the voucher reference in each name, so the bytes stay in the
+ * browser until the user has approved where each file will land.
+ *
+ * `fiscal_period_id` is required, not optional: a filename carries no year and
+ * source systems restart voucher numbering annually, so a plan with no declared
+ * year cannot identify a verifikat at all.
+ */
+export const UnderlagImportPreviewSchema = z.object({
+  file_names: z.array(z.string().min(1).max(400)).min(1).max(2000),
+  fiscal_period_id: uuid,
+})
 
 /**
  * Per-employee override on a salary run (advanced mode).
@@ -3038,7 +3668,7 @@ export const UpdateShiftPremiumRuleSchema = z
 // Upper bound on per-employee override values. 10 MSEK is well above any
 // plausible single-period gross/tax/avgifter figure for a salary run and
 // catches typos (e.g. an extra zero) before they reach the ledger or AGI.
-const SALARY_OVERRIDE_MAX = 10_000_000
+export const SALARY_OVERRIDE_MAX = 10_000_000
 
 export const SalaryEmployeeOverrideSchema = z
   .object({
@@ -3047,7 +3677,17 @@ export const SalaryEmployeeOverrideSchema = z
     // override: it sets the base the engine uses for this month only and does
     // not require a reason. The route gates this field to `draft` status.
     monthly_salary: z.number().nonnegative().max(SALARY_OVERRIDE_MAX).optional(),
-    tax_withheld_override: z.number().nonnegative().max(SALARY_OVERRIDE_MAX).nullable().optional(),
+    // Skatteavdrag is stated in whole kronor (öretal bortfaller, SFF
+    // 2011:1261 22 kap. 1 §) and the engine's own values already are: an
+    // öre-bearing override would book 2710 with öre that the whole-krona
+    // skattekonto draw never clears.
+    tax_withheld_override: z
+      .number()
+      .int('Skatteavdrag anges i hela kronor (öretal bortfaller)')
+      .nonnegative()
+      .max(SALARY_OVERRIDE_MAX)
+      .nullable()
+      .optional(),
     avgifter_amount_override: z.number().nonnegative().max(SALARY_OVERRIDE_MAX).nullable().optional(),
     avgifter_basis_override: z.number().nonnegative().max(SALARY_OVERRIDE_MAX).nullable().optional(),
     reason: z.string().min(1).max(500).nullable().optional(),
@@ -3114,4 +3754,393 @@ export const DimensionTaggingApplySchema = z.object({
   line_ids: z.array(uuid).min(1).max(500),
   dimensions: DimensionsBagSchema,
   reason: z.string().trim().min(3).max(500),
+})
+
+/**
+ * Body for PATCH /api/byra/brand. The app name is byra-editable (WL-17):
+ * shown beside the sidebar logo and across branded chrome. Trimmed and
+ * capped so it stays a name, not a paragraph; domain and colors are NOT
+ * accepted here (ops-managed).
+ */
+export const ByraBrandUpdateSchema = z.object({
+  appName: z.string().trim().min(1).max(60),
+})
+
+// ============================================================
+// Körjournal (mileage trips)
+// ============================================================
+
+const mileageVehicleType = z.enum(['own_car', 'company_car_fossil', 'company_car_electric'])
+
+export const CreateMileageTripSchema = z
+  .object({
+    trip_date: saneIsoDate,
+    vehicle_type: mileageVehicleType.default('own_car'),
+    vehicle_registration: z.string().trim().max(20).optional().nullable(),
+    odometer_start: z.number().int().nonnegative().optional().nullable(),
+    odometer_end: z.number().int().nonnegative().optional().nullable(),
+    distance_km: z.number().positive().max(100000),
+    from_location: z.string().trim().min(1).max(200),
+    to_location: z.string().trim().min(1).max(200),
+    purpose: z.string().trim().min(1).max(500),
+    visited: z.string().trim().max(200).optional().nullable(),
+    is_round_trip: z.boolean().default(false),
+    employee_id: uuid.optional().nullable(),
+    notes: z.string().trim().max(1000).optional().nullable(),
+  })
+  .refine(
+    (t) =>
+      t.odometer_start == null || t.odometer_end == null || t.odometer_end > t.odometer_start,
+    { message: 'Mätarställning vid ankomst måste vara högre än vid start' }
+  )
+  .refine((t) => t.vehicle_type === 'own_car' || Boolean(t.vehicle_registration?.trim()), {
+    message: 'Ange registreringsnummer för förmånsbilen',
+  })
+
+export const UpdateMileageTripSchema = z
+  .object({
+    trip_date: saneIsoDate.optional(),
+    vehicle_type: mileageVehicleType.optional(),
+    vehicle_registration: z.string().trim().max(20).optional().nullable(),
+    odometer_start: z.number().int().nonnegative().optional().nullable(),
+    odometer_end: z.number().int().nonnegative().optional().nullable(),
+    distance_km: z.number().positive().max(100000).optional(),
+    from_location: z.string().trim().min(1).max(200).optional(),
+    to_location: z.string().trim().min(1).max(200).optional(),
+    purpose: z.string().trim().min(1).max(500).optional(),
+    visited: z.string().trim().max(200).optional().nullable(),
+    is_round_trip: z.boolean().optional(),
+    employee_id: uuid.optional().nullable(),
+    notes: z.string().trim().max(1000).optional().nullable(),
+  })
+  .refine((t) => Object.keys(t).length > 0, { message: 'Inga fält att uppdatera' })
+
+export const BookMileagePeriodSchema = z
+  .object({
+    from: saneIsoDate,
+    to: saneIsoDate,
+    entry_date: saneIsoDate,
+    counter_account: z.enum(['2820', '2893', '1930']).default('2820'),
+    employee_id: uuid.optional(),
+  })
+  .refine((p) => p.from <= p.to, { message: 'Ogiltigt datumintervall' })
+  // Schablon rates are per calendar year: a cross-year period would book
+  // every trip at one year's rate.
+  .refine((p) => p.from.slice(0, 4) === p.to.slice(0, 4), {
+    message: 'Milersättning bokförs per kalenderår: dela upp perioden per år',
+  })
+
+export const MileageSalaryPushSchema = z
+  .object({
+    run_id: uuid,
+    employee_id: uuid,
+    from: saneIsoDate,
+    to: saneIsoDate,
+    include_unassigned: z.boolean().default(true),
+  })
+  .refine((p) => p.from <= p.to, { message: 'Ogiltigt datumintervall' })
+  .refine((p) => p.from.slice(0, 4) === p.to.slice(0, 4), {
+    message: 'Milersättning bokförs per kalenderår: dela upp perioden per år',
+  })
+
+export const MileageDistanceQuerySchema = z.object({
+  from: z.string().trim().min(2).max(200),
+  to: z.string().trim().min(2).max(200),
+})
+
+// ============================================================
+// Bank file import
+// ============================================================
+
+/**
+ * Known bank-file format ids, mirrored from `BankFileFormatId`
+ * (lib/import/bank-file/types.ts). `satisfies` pins every member to the union
+ * at compile time; a format id added to the union but not listed here only
+ * degrades the ADVISORY duplicate preview (400), never the import itself.
+ */
+const BANK_FILE_FORMAT_IDS = [
+  'nordea',
+  'nordea_business',
+  'seb',
+  'swedbank',
+  'handelsbanken',
+  'lansforsakringar',
+  'ica_banken',
+  'skandia',
+  'lunar',
+  'northmill',
+  'wise',
+  'wise_statement',
+  'generic_csv',
+  'camt053',
+] as const satisfies readonly BankFileFormatId[]
+
+/**
+ * POST /api/import/bank-file/check-duplicates
+ *
+ * The rows are client-supplied (the generic_csv path never round-trips through
+ * the parse route), so the array is hard-capped: the parse route caps files at
+ * 10 MB, and 20000 rows mirrors that ceiling so an oversized payload cannot
+ * drive the per-chunk dedup queries as a DoS vector. `raw_line` must pass
+ * through untouched: camt.053/Wise external_ids are derived from it, and the
+ * preview must compute byte-identical ids to execute.
+ */
+export const BankFileCheckDuplicatesSchema = z.object({
+  transactions: z
+    .array(
+      z.object({
+        date: isoDate,
+        description: z.string().max(1000),
+        amount: z.number().finite(),
+        currency: z.string().max(8).optional().nullable(),
+        raw_line: z.string().max(4000).optional().nullable(),
+      })
+    )
+    .min(1)
+    .max(20000),
+  format: z.enum(BANK_FILE_FORMAT_IDS),
+})
+
+/**
+ * POST /api/import/skattekonto-file/execute
+ *
+ * Rows are client-confirmed but the route recomputes dedup keys and
+ * re-partitions against the table server-side: the payload can only choose
+ * WHICH parsed rows to import, never what they dedup as. closing_saldo comes
+ * from the statement's "Utgående saldo" marker (not derivable from rows).
+ */
+export const SkattekontoFileExecuteSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        transaktionsdatum: isoDate,
+        transaktionstext: z.string().min(1).max(500),
+        belopp: z.number().finite(),
+      })
+    )
+    .min(1)
+    .max(20000),
+  filename: z.string().min(1).max(255),
+  file_hash: z.string().regex(/^[0-9a-f]{64}$/),
+  variant: z.enum(['csv', 'skv']),
+  closing_saldo: z.number().finite().nullable().optional(),
+})
+
+// ============================================================
+// Company migration reset
+// ============================================================
+
+/**
+ * POST /api/company/[id]/migration-reset
+ *
+ * Every confirmation is required independently. The database repeats these
+ * checks inside the atomic RPC, including the exact display-name match.
+ */
+export const CompanyMigrationResetSchema = z.object({
+  confirm_name: z
+    .string()
+    .trim()
+    .min(1, 'Ange företagsnamnet exakt som det visas')
+    .max(200, 'Företagsnamnet får vara högst 200 tecken'),
+  reason: z
+    .string()
+    .trim()
+    .min(20, 'Beskriv varför migreringen behöver göras om med minst 20 tecken')
+    .max(1000, 'Beskrivningen får vara högst 1 000 tecken'),
+  confirm_no_filed_declarations: z.literal(true, {
+    error: 'Bekräfta att inga deklarationer eller årsredovisningar har lämnats in',
+  }),
+  confirm_retained_archive: z.literal(true, {
+    error: 'Bekräfta att den tidigare företagskopian sparas som arkiv',
+  }),
+})
+
+/**
+ * POST /api/bookkeeping/fiscal-periods/[id]/reset
+ *
+ * Typed confirmation for the destructive fiscal-year reset: the caller must
+ * restate the year's label (fiscal_periods.name) exactly. The RPC repeats
+ * the match server-side, so this only provides early Swedish feedback.
+ */
+export const FiscalYearResetSchema = z.object({
+  confirm_name: z
+    .string()
+    .trim()
+    .min(1, 'Ange räkenskapsårets namn exakt som det visas')
+    .max(200, 'Räkenskapsårets namn får vara högst 200 tecken'),
+})
+
+/**
+ * POST /api/notices/dismiss
+ *
+ * notice_id is an opaque lib/notices id (category + state discriminator).
+ * Ids are bounded by construction: a multi-connection discriminator collapses
+ * to a count plus an 8-char sha256 digest of the sorted parts (see
+ * boundedDiscriminator in lib/notices/categories.ts), so the widest real id
+ * is a single connection uuid plus a status/expiry, well under this cap;
+ * anything longer is garbage.
+ */
+export const NoticeDismissSchema = z.object({
+  notice_id: z.string().min(1).max(200),
+})
+
+/**
+ * Brand signup access (invite-only white-label domains, 2026-08-27).
+ * Emails are lowercased here so they match the CHECK-enforced lowercase
+ * storage in brand_signup_allowlist.
+ */
+export const BrandSignupModeSchema = z.object({
+  signup_mode: z.enum(['open', 'invite_only']),
+})
+
+export const BrandAllowlistAddSchema = z.object({
+  email: z.string().trim().toLowerCase().max(320).pipe(z.string().email()),
+  note: z.string().trim().max(200).optional(),
+})
+
+export const BrandAllowlistRemoveSchema = z.object({
+  id: z.string().uuid(),
+})
+
+// ============================================================
+// Kundorder (sales orders) schemas
+// ============================================================
+
+// Order lines mirror the invoice line shape (same editor, same line math)
+// minus the invoice-only fields (ROT/RUT, periodisering). Text rows carry a
+// description only.
+export const SalesOrderItemSchema = z
+  .object({
+    id: uuid.optional(),
+    line_type: z.enum(['product', 'text']).optional(),
+    description: z.string().max(2000),
+    quantity: z.number().nonnegative(),
+    unit: z.string().max(32),
+    unit_price: z.number(),
+    discount_percent: z.number().min(0).max(100).nullable().optional(),
+    vat_rate: z.number().min(0).max(100).optional(),
+    article_id: uuid.nullable().optional(),
+    revenue_account: invoicePostingAccount.nullable().optional(),
+    dimensions: DimensionsBagSchema.optional(),
+  })
+  .superRefine((item, ctx) => {
+    if (item.line_type === 'text') return
+    if (!item.description.trim()) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['description'], message: 'Beskrivning krävs' })
+    }
+  })
+
+export const CreateSalesOrderSchema = z.object({
+  customer_id: uuid,
+  order_date: isoDate.optional(),
+  requested_delivery_date: isoDate.nullable().optional(),
+  currency: CurrencySchema.optional(),
+  your_reference: z.string().max(200).nullable().optional(),
+  our_reference: z.string().max(200).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
+  default_dimensions: DimensionsBagSchema.optional(),
+  items: z.array(SalesOrderItemSchema).min(1, 'Minst en orderrad krävs').max(500),
+})
+
+// Full replace of header + lines. Lines that carry an `id` keep their
+// delivered/invoiced history (the DB refuses lowering quantity below the
+// invoiced quantity); lines without an id are new; omitted ids are deleted.
+export const UpdateSalesOrderSchema = CreateSalesOrderSchema.partial().extend({
+  items: z.array(SalesOrderItemSchema).min(1).max(500).optional(),
+})
+
+export const SalesOrderTransitionSchema = z.object({
+  action: z.enum(['confirm', 'cancel', 'reopen']),
+})
+
+export const RegisterSalesOrderDeliverySchema = z.object({
+  delivery_date: isoDate.optional(),
+  lines: z
+    .array(
+      z.object({
+        sales_order_item_id: uuid,
+        // Cumulative delivered quantity after this registration (not a delta):
+        // idempotent on retry, and what the user sees in the dialog.
+        delivered_qty: z.number().nonnegative(),
+      }),
+    )
+    .min(1)
+    .max(500),
+})
+
+export const CreateInvoiceFromSalesOrderSchema = z.object({
+  // Explicit picks win. Without them, `mode` selects the lines:
+  //   remaining  = every line with quantity left to invoice (default)
+  //   delivered  = only what has been delivered but not yet invoiced
+  mode: z.enum(['remaining', 'delivered']).optional(),
+  lines: z
+    .array(
+      z.object({
+        sales_order_item_id: uuid,
+        quantity: z.number().positive(),
+      }),
+    )
+    .max(500)
+    .optional(),
+  invoice_date: isoDate.optional(),
+  due_date: isoDate.optional(),
+})
+
+export const SalesOrderListQuerySchema = z.object({
+  status: z.enum(['draft', 'confirmed', 'completed', 'cancelled']).optional(),
+  customer_id: uuid.optional(),
+  q: z.string().max(200).optional(),
+})
+
+// ── Parties (Kontakter register) ───────────────────────────────────────────
+
+export const PartiesRegisterQuerySchema = z.object({
+  view: z.enum(['suggested', 'observed']).optional(),
+  q: z.string().max(120).optional(),
+  period: z.enum(['12m', 'all']).optional(),
+})
+
+export const PartyDecideSchema = z.object({
+  partyIds: z.array(uuid).min(1).max(500),
+  kind: z.enum(['confirm', 'dismiss']),
+  note: z.string().max(500).optional(),
+})
+
+export const PartyPromoteSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        partyId: uuid,
+        roles: z.array(z.enum(['supplier', 'customer'])).min(1).max(2),
+      }),
+    )
+    .min(1)
+    .max(500),
+})
+
+export const PartyUndoDecisionsSchema = z.object({
+  partyIds: z.array(uuid).min(1).max(500),
+})
+
+export const PartyMergeSchema = z.object({
+  survivorId: uuid,
+  mergedIds: z.array(uuid).min(1).max(50),
+  note: z.string().max(500).optional(),
+})
+
+export const PartyEnrichSchema = z.object({
+  /** Chosen from the SCB picker: sets the party's org number before the fetch. */
+  orgNumber: z
+    .string()
+    .transform((v) => v.replace(/[^0-9]/g, ''))
+    .pipe(z.string().regex(/^\d{10}$/))
+    .optional(),
+})
+
+export const PartySearchRegistryQuerySchema = z.object({
+  q: z.string().max(120).optional(),
+})
+
+export const PartyUndoMergeSchema = z.object({
+  decisionId: uuid,
 })

@@ -26,6 +26,8 @@ import { deriveTemplateLinesFromBooking } from '@/lib/bookkeeping/template-libra
 import { sourceTypeForTemplateCategory } from '@/lib/bookkeeping/template-source-type'
 import { TemplateForm } from '@/components/settings/TemplateForm'
 import CreatePeriodDialog from '@/components/bookkeeping/CreatePeriodDialog'
+import { useAccounts, useCompanySettings, useFiscalPeriods } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { ActivateAccountsDialog } from '@/components/bookkeeping/ActivateAccountsDialog'
 import { AddAccountDialog } from '@/components/bookkeeping/AddAccountDialog'
 import { splitCreateAccountPrefill } from '@/lib/bookkeeping/create-account-prefill'
@@ -43,12 +45,12 @@ import {
 } from '@/lib/documents/link-documents'
 import { formatCurrency } from '@/lib/utils'
 import { roundOre } from '@/lib/money'
-import { formatVoucher, resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
+import { formatVoucher, resolveDefaultSeriesForSource, VOUCHER_SERIES_PRESETS } from '@/lib/bookkeeping/voucher-series-resolver'
 import { resolveFxLineSlot } from '@/lib/bookkeeping/fx-line-slot'
 import { useUnsavedChanges } from '@/lib/hooks/use-unsaved-changes'
 import { useCompany } from '@/contexts/CompanyContext'
 import type { UploadedFile } from '@/components/bookkeeping/DocumentUploadZone'
-import type { CreateJournalEntryLineInput, FiscalPeriod, BASAccount, JournalEntrySourceType, Currency, BookingTemplateLibrary, BookingTemplateCategory } from '@/types'
+import type { CreateJournalEntryLineInput, FiscalPeriod, JournalEntrySourceType, Currency, BookingTemplateLibrary, BookingTemplateCategory } from '@/types'
 import type { BookedDuplicateCandidate } from '@/lib/transactions/booking-duplicate-detection'
 
 const CURRENCIES: { value: Currency; label: string }[] = [
@@ -103,7 +105,21 @@ interface Props {
   /** The bank transaction being booked (set by TransactionBookingDialog).
    *  Enables the duplicate guard's "Matcha mot verifikatet" action for
    *  ledger-only voucher candidates. */
+  /**
+   * Extra keys for the submit body, for endpoints that need something this
+   * form does not model. The invoice-inbox book-direct route needs
+   * transaction_id to book the underlag against its bank line; without it the
+   * entry posts standalone and the match is cleared.
+   */
+  extraBody?: Record<string, unknown>
   duplicateMatchTransaction?: DuplicateMatchTransaction
+  /** Embedded variant only: show the series picker anyway. The series is
+   *  seeded from the server (source type + cash account override) so the
+   *  dialog and the booking route can never disagree. */
+  seriesPicker?: boolean
+  /** Bank account the entry is booked from; its voucher_series override
+   *  (Inställningar → Bokföring) seeds the picker. */
+  cashAccountId?: string | null
   /** Fired after the duplicate guard's match action links the transaction to
    *  the existing voucher (no new entry was created). */
   onDuplicateMatched?: (journalEntryId: string) => void
@@ -129,7 +145,10 @@ export default function JournalEntryForm({
   initialExchangeRate,
   initialForeignAmount,
   onUpdated,
+  extraBody,
   duplicateMatchTransaction,
+  seriesPicker,
+  cashAccountId,
   onDuplicateMatched,
 }: Props) {
   const { canWrite } = useCanWrite()
@@ -142,7 +161,12 @@ export default function JournalEntryForm({
   // copy from this namespace.
   const tTpl = useTranslations('settings_booking_templates')
   const locale = useLocale()
-  const [periods, setPeriods] = useState<FiscalPeriod[]>([])
+  // Session-cached reference data (lib/reference-data): seeded by the
+  // dashboard layout, so the period select, the account picker and the
+  // settings-driven defaults render populated on the first paint instead of
+  // after four round trips, and re-opening the dialog costs no requests.
+  const { periods } = useFiscalPeriods()
+  const { settings: companySettings } = useCompanySettings()
   const [selectedPeriod, setSelectedPeriod] = useState('')
   const [entryDate, setEntryDate] = useState(initialDate ?? new Date().toISOString().split('T')[0])
   const [description, setDescription] = useState(initialDescription ?? '')
@@ -152,7 +176,7 @@ export default function JournalEntryForm({
   // when company_settings.dimensions_enabled: a UI-visibility gate; lines
   // that already carry dimensions (e.g. a draft being edited) still round-trip
   // untouched when the toggle is off.
-  const [dimensionsEnabled, setDimensionsEnabled] = useState(false)
+  const dimensionsEnabled = companySettings?.dimensions_enabled === true
   const [showDims, setShowDims] = useState(false)
   // Header-level default dims ("gäller alla rader"). The per-row maps on
   // `lines` are the ONE source of truth: this state only drives the header
@@ -166,6 +190,14 @@ export default function JournalEntryForm({
     initialLines ?? [{ ...BLANK_LINE }, { ...BLANK_LINE }]
   )
   const [voucherSeries, setVoucherSeries] = useState(initialVoucherSeries ?? 'A')
+  // Embedded forms show the picker only on request (bank transaction dialog).
+  const showSeries = !embedded || !!seriesPicker
+  // Whether voucherSeries is authoritative. The standalone form seeds it from
+  // company settings; the embedded picker asks the server once (source type +
+  // cash account override) and marks it resolved, or when the user picks. Until
+  // then the submit omits voucher_series so the route resolves it itself: an
+  // unresolved 'A' must never override the bank account's own series.
+  const [seriesResolved, setSeriesResolved] = useState(!embedded)
   // The source_type the entry will be committed with. Seeded from the prop
   // (undefined -> 'manual' for the standalone form). Applying a booking template
   // whose category maps to a dedicated source type (e.g. VAT -> vat_settlement)
@@ -178,6 +210,11 @@ export default function JournalEntryForm({
   // effect below.
   const seriesMapRef = useRef<Record<string, string> | null>(null)
   const defaultSeriesRef = useRef<string>('A')
+  // Series letters this company has configured beyond the fixed presets. The
+  // dropdown is a closed list, so anything already in use (a legacy letter, an
+  // override in the per-source-type map) has to stay selectable: otherwise the
+  // Select would render blank on a value it does not offer.
+  const [configuredSeries, setConfiguredSeries] = useState<string[]>([])
   // Mirror of effectiveSourceType for the settings-fetch callback: if a template
   // routed the source type before /api/settings resolved, the late callback must
   // re-apply the series for the ROUTED type, not the mount-time base (otherwise
@@ -196,8 +233,12 @@ export default function JournalEntryForm({
   const [isSavingDraft, setIsSavingDraft] = useState(false)
   const saveAsDraftRef = useRef(false)
   const [showNoDocWarning, setShowNoDocWarning] = useState(false)
+  // The what's-missing lines render only after a submit attempt (error-on-
+  // submit), never as standing chrome on an empty form. The buttons stay
+  // enabled so the attempt can happen; the handlers gate on validity.
+  const [showValidationHints, setShowValidationHints] = useState(false)
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const { accounts } = useAccounts()
   // Full BAS catalogue (static reference data, fetched once per session). Lets
   // the account picker surface standard accounts the company hasn't activated
   // yet; picking one activates it at commit via the existing rail.
@@ -246,31 +287,6 @@ export default function JournalEntryForm({
     uploadedFiles.length > 0
   useUnsavedChanges(hasContent)
 
-  async function fetchPeriods() {
-    const res = await fetch('/api/bookkeeping/fiscal-periods')
-    const { data } = await res.json()
-    const fetched: FiscalPeriod[] = data || []
-    setPeriods(fetched)
-
-    // Auto-select period matching the current entry date
-    const match = fetched.find(
-      (p) => entryDate >= p.period_start && entryDate <= p.period_end
-    )
-    if (match) {
-      setSelectedPeriod(match.id)
-      setPeriodMismatch(null)
-    } else if (fetched.length > 0) {
-      setSelectedPeriod(fetched[0].id)
-      setPeriodMismatch('no_period')
-    }
-  }
-
-  async function fetchAccounts() {
-    const res = await fetch('/api/bookkeeping/accounts')
-    const { data } = await res.json()
-    setAccounts(data || [])
-  }
-
   // Resolve + set the default voucher series for a source type from the cached
   // company config: prefer the per-source-type mapping, fall back to the legacy
   // default_voucher_series, then to 'A'. Reads refs (stable), so it can run both
@@ -280,29 +296,51 @@ export default function JournalEntryForm({
     setVoucherSeries(perSource !== 'A' ? perSource : defaultSeriesRef.current || 'A')
   }, [])
 
-  useEffect(() => {
-    fetchPeriods()
-    fetchAccounts()
-    loadBasCatalog().then(setCatalog).catch(() => {/* search degrades to the active chart */})
-    // Company settings power two things here: dimensions_enabled gates the
-    // tagging affordances (all modes, incl. the TransactionBookingDialog
-    // embed), and the default voucher series seeds the standalone form:
-    // prefer the per-source-type mapping when present; fall back to the legacy
-    // default_voucher_series, then to 'A'. In edit mode the draft's own series
-    // is pre-filled: never override it from the company defaults.
-    fetch('/api/settings').then(r => r.json()).then(({ data }) => {
-      if (!data) return
-      setDimensionsEnabled(data.dimensions_enabled === true)
-      seriesMapRef.current =
-        (data.default_voucher_series_per_source_type as Record<string, string> | null) ?? null
-      defaultSeriesRef.current = data.default_voucher_series || 'A'
-      if (!embedded && !editEntryId) {
-        applySeriesForSourceType(effectiveSourceTypeRef.current)
-      }
-    }).catch(() => {/* keep 'A' + hidden dimension affordances */})
-  }, [embedded, sourceType, editEntryId, applySeriesForSourceType])
+  // The series picker: the fixed Swedish presets first, then any letter this
+  // company already uses (settings map, global default, or the series a draft
+  // was saved with) so no existing value falls out of the list.
+  const seriesOptions = useMemo(() => {
+    const options = VOUCHER_SERIES_PRESETS.map((p) => ({ letter: p.letter, label: p.label }))
+    const seen = new Set(options.map((o) => o.letter))
+    const extras = [...configuredSeries, voucherSeries]
+      .filter((letter) => /^[A-Z]$/.test(letter) && !seen.has(letter) && seen.add(letter))
+      .sort()
+    return [...options, ...extras.map((letter) => ({ letter, label: '' }))]
+  }, [configuredSeries, voucherSeries])
 
-  // Auto-select period when entry date changes
+  useEffect(() => {
+    loadBasCatalog().then(setCatalog).catch(() => {/* search degrades to the active chart */})
+  }, [])
+
+  // Company settings seed the default voucher series for the standalone form:
+  // prefer the per-source-type mapping when present; fall back to the legacy
+  // default_voucher_series, then to 'A'. In edit mode the draft's own series
+  // is pre-filled: never override it from the company defaults. (dimensions_
+  // enabled, which gates the tagging affordances in all modes incl. the
+  // TransactionBookingDialog embed, is derived directly above.)
+  useEffect(() => {
+    if (!companySettings) return
+    seriesMapRef.current =
+      (companySettings.default_voucher_series_per_source_type as Record<string, string> | null) ?? null
+    defaultSeriesRef.current = companySettings.default_voucher_series || 'A'
+    setConfiguredSeries(
+      Array.from(
+        new Set(
+          [
+            ...Object.values(seriesMapRef.current || {}),
+            defaultSeriesRef.current,
+          ].filter((v): v is string => typeof v === 'string' && /^[A-Z]$/.test(v)),
+        ),
+      ),
+    )
+    if (!embedded && !editEntryId) {
+      applySeriesForSourceType(effectiveSourceTypeRef.current)
+    }
+  }, [companySettings, embedded, sourceType, editEntryId, applySeriesForSourceType])
+
+  // Auto-select the period matching the entry date (on load and whenever the
+  // date changes). With no match, fall back to the newest period only when
+  // nothing is selected yet, and flag the mismatch either way.
   useEffect(() => {
     if (periods.length === 0) return
     const match = periods.find(
@@ -312,26 +350,63 @@ export default function JournalEntryForm({
       setSelectedPeriod(match.id)
       setPeriodMismatch(null)
     } else {
+      setSelectedPeriod((current) => current || periods[0].id)
       setPeriodMismatch('no_period')
     }
   }, [entryDate, periods])
+
+  // Earliest fiscal period, for the pre-FY affordance in the no_period block:
+  // a date before the company's first rakenskapsar (e.g. the aktiekapital
+  // deposit paid in before the Bolagsverket registration) must not lead to
+  // creating a pre-registration year. The correct remedy per BFL is to book
+  // the event on the first fiscal year's first day, so we offer exactly that
+  // when the earliest period is open and unlocked (issue #1825).
+  const preFyClampTarget = useMemo(() => {
+    const earliest = periods.reduce<FiscalPeriod | null>(
+      (min, p) => (min === null || p.period_start < min.period_start ? p : min),
+      null,
+    )
+    if (!earliest) return null
+    if (entryDate >= earliest.period_start) return null
+    if (earliest.is_closed || earliest.locked_at) return null
+    return earliest
+  }, [periods, entryDate])
 
   // Preview the upcoming voucher number for the selected period + series.
   // Read-only hint; the actual number is reserved atomically at commit time,
   // so this may shift by one if another entry lands first.
   useEffect(() => {
-    if (embedded || !selectedPeriod || !voucherSeries) {
+    if (!showSeries || !entryDate || !voucherSeries) {
       setNextVoucherNumber(null)
       return
     }
     let cancelled = false
-    const qs = new URLSearchParams({ period_id: selectedPeriod, series: voucherSeries })
+    // Keyed on the entry date rather than the resolved period so the preview
+    // fires as soon as the series is known: the route resolves the period
+    // from the date itself, which is exactly how selectedPeriod is derived.
+    // Before the embedded picker is resolved, ask by source type + cash
+    // account instead of by series: the route answers with the series the
+    // booking would actually get, and that seeds the picker.
+    const qs = new URLSearchParams({ date: entryDate })
+    if (seriesResolved) {
+      qs.set('series', voucherSeries)
+    } else {
+      if (sourceType) qs.set('source_type', sourceType)
+      if (cashAccountId) qs.set('cash_account_id', cashAccountId)
+    }
     fetch(`/api/bookkeeping/voucher-sequences/next?${qs}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
         if (cancelled) return
         const next = body?.data?.next
         setNextVoucherNumber(typeof next === 'number' ? next : null)
+        if (!seriesResolved && body) {
+          const resolved = body?.data?.series
+          if (typeof resolved === 'string' && /^[A-Z]$/.test(resolved)) {
+            setVoucherSeries(resolved)
+          }
+          setSeriesResolved(true)
+        }
       })
       .catch(() => {
         if (!cancelled) setNextVoucherNumber(null)
@@ -339,7 +414,7 @@ export default function JournalEntryForm({
     return () => {
       cancelled = true
     }
-  }, [embedded, selectedPeriod, voucherSeries])
+  }, [showSeries, seriesResolved, entryDate, voucherSeries, sourceType, cashAccountId])
 
   // Fetch exchange rate from Riksbanken when currency changes
   const fetchRate = useCallback(async (currency: Currency) => {
@@ -607,6 +682,28 @@ export default function JournalEntryForm({
     updateLine(index, side === 'debit' ? 'debit_amount' : 'credit_amount', fill.toFixed(2))
   }
 
+  // Tabbing (or clicking) into an untouched amount proposes the outstanding
+  // difference, so the closing row of a moms-split voucher fills itself. The
+  // proposal is pre-selected: typing replaces it, which keeps a multi-row split
+  // exactly as fast as before. Guards: the row must already have an account (so
+  // you can tab through the trailing blank row), both amounts must still be
+  // empty (never overwrite a typed figure), and the difference must belong on
+  // this side.
+  const handleAmountFocus =
+    (index: number, side: 'debit' | 'credit') =>
+    (e: React.FocusEvent<HTMLInputElement>) => {
+      const target = e.currentTarget
+      const line = lines[index]
+      if (!line || !line.account_number) return
+      if (line.debit_amount || line.credit_amount) return
+      const diff = computeBalancingDiff(index)
+      const fill = side === 'debit' ? diff : -diff
+      if (fill <= 0) return
+      updateLine(index, side === 'debit' ? 'debit_amount' : 'credit_amount', fill.toFixed(2))
+      // Select after the controlled re-render has written the value.
+      requestAnimationFrame(() => target.select())
+    }
+
   // Move focus to a row's input. Deferred a frame so it runs after any
   // re-render (e.g. the auto-appended trailing row). offsetParent is null for
   // display:none elements, so this picks whichever layout is currently visible.
@@ -792,7 +889,7 @@ export default function JournalEntryForm({
   // reactivating an existing account, where the rest of the row is whatever
   // the company already had stored and is picked up by fetchAccounts.
   const handleAccountCreated = async (account: { account_number: string }) => {
-    await fetchAccounts()
+    await invalidateReferenceData('ref:accounts')
     if (creatingAccountForLine != null) {
       updateLine(creatingAccountForLine, 'account_number', account.account_number)
     }
@@ -801,7 +898,11 @@ export default function JournalEntryForm({
   }
 
   const handleReview = () => {
-    if (!selectedPeriod || !description || !isBalanced || periodMismatch) return
+    if (!selectedPeriod || !description || !isBalanced || periodMismatch) {
+      setShowValidationHints(true)
+      return
+    }
+    setShowValidationHints(false)
     const hasDocuments = uploadedFiles.some((f) => f.status === 'uploaded')
     if (!embedded && !bare && !hasDocuments) {
       setShowNoDocWarning(true)
@@ -810,17 +911,24 @@ export default function JournalEntryForm({
     setShowReview(true)
   }
 
-  // Whether an Enter should open the review: mirrors the review button's
-  // enable gate exactly, so Enter never submits something the button wouldn't.
+  // Nothing in flight and the user may write: the buttons' enable gate.
+  // Validity is deliberately NOT part of it; an attempt on an incomplete
+  // form is what surfaces the validation hints.
+  const processReady = () =>
+    !isUploading &&
+    canWrite &&
+    !isSubmitting &&
+    !isSavingDraft
+
+  // Whether the entry is actually submittable. The Enter-to-advance handlers
+  // below key off this: navigation fires while the entry is incomplete, and
+  // once it balances Enter falls through to the review instead.
   const canSubmitReview = () =>
     isBalanced &&
     !!description &&
     !!selectedPeriod &&
     !periodMismatch &&
-    !isUploading &&
-    canWrite &&
-    !isSubmitting &&
-    !isSavingDraft
+    processReady()
 
   // Enter anywhere in the form = "Granska & skapa": opens the review exactly as
   // the button does, from any field. Navigation is Tab's job. Two Enter
@@ -832,7 +940,7 @@ export default function JournalEntryForm({
     if (e.defaultPrevented || showReview) return
     if ((e.target as HTMLElement).tagName === 'TEXTAREA') return
     e.preventDefault()
-    if (canSubmitReview()) handleReview()
+    if (processReady()) handleReview()
   }
 
   // Enter-to-advance inside the konteringsrader: konto → debet → kredit →
@@ -967,17 +1075,23 @@ export default function JournalEntryForm({
         description,
         source_type: effectiveSourceType,
         source_id: sourceId,
-        voucher_series: voucherSeries || 'A',
+        // Omitted while an embedded picker is still unresolved: see
+        // seriesResolved. Endpoints that do not declare the key strip it.
+        ...(seriesResolved ? { voucher_series: voucherSeries || 'A' } : {}),
         notes: notes || undefined,
         lines: entryLines,
         // Set only when retrying past the booking-time duplicate guard (see
         // handleBookAnyway). Stripped by schemas that don't declare it, so a
         // stray value never reaches the manual journal-entry endpoint.
         ...(forceDuplicateRef.current ?? {}),
+        // Fields only the caller's endpoint knows about. Same safety as above:
+        // a schema that does not declare a key strips it, so this cannot leak
+        // into the manual journal-entry route.
+        ...(extraBody ?? {}),
       }),
     })
     return (await throwOnStructuredError(res)) as { data?: { id?: string; voucher_series?: string; voucher_number?: number }; journal_entry_id?: string }
-  }, [lines, rate, entryCurrency, computedForeignAmount, t, submitUrl, editEntryId, selectedPeriod, entryDate, description, effectiveSourceType, sourceId, voucherSeries, notes])
+  }, [lines, rate, entryCurrency, computedForeignAmount, t, submitUrl, editEntryId, selectedPeriod, entryDate, description, effectiveSourceType, sourceId, voucherSeries, seriesResolved, notes, extraBody])
 
   const { runSubmit, dialog: activationDialog, confirm: confirmActivation, cancel: cancelActivation } =
     useSubmitWithAccountActivation(postJournalEntry)
@@ -1120,7 +1234,11 @@ export default function JournalEntryForm({
   }
 
   const handleSaveDraft = async () => {
-    if (!selectedPeriod || !description || !isBalanced || periodMismatch) return
+    if (!selectedPeriod || !description || !isBalanced || periodMismatch) {
+      setShowValidationHints(true)
+      return
+    }
+    setShowValidationHints(false)
     setIsSavingDraft(true)
     saveAsDraftRef.current = true
     try {
@@ -1186,7 +1304,11 @@ export default function JournalEntryForm({
   // editEntryId URL) and keep it a draft. No field reset: the host dialog
   // closes on success via onUpdated.
   const handleSaveEdit = async () => {
-    if (!selectedPeriod || !description || !isBalanced || periodMismatch) return
+    if (!selectedPeriod || !description || !isBalanced || periodMismatch) {
+      setShowValidationHints(true)
+      return
+    }
+    setShowValidationHints(false)
     setIsSavingDraft(true)
     try {
       await runSubmit()
@@ -1242,9 +1364,9 @@ export default function JournalEntryForm({
       </div>
 
       {(monthChanged || selectedPeriodLocked) && (
-        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3">
-          <AlertTriangle className="h-5 w-5 text-warning-foreground mt-0.5 shrink-0" />
-          <div className="flex-1 text-sm text-warning-foreground space-y-0.5">
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+          <AlertTriangle className="h-5 w-5 text-attn mt-0.5 shrink-0" />
+          <div className="flex-1 text-sm text-attn space-y-0.5">
             {monthChanged && (
               <p className="font-medium">
                 {t('review_month_changed', { prev: monthLabel(lastPostedMonth as string), current: monthLabel(entryMonth) })}
@@ -1256,7 +1378,7 @@ export default function JournalEntryForm({
       )}
 
       {uploadedFiles.filter((f) => f.status === 'uploaded').length === 0 && (
-        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning-foreground">
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3 text-sm text-attn">
           <AlertTriangle className="h-5 w-5 mt-0.5 shrink-0" />
           <p>{t('no_doc_body')}</p>
         </div>
@@ -1323,56 +1445,53 @@ export default function JournalEntryForm({
               className="mt-1 h-8"
             />
           </div>
-          {!embedded && (
-            <div className="w-16">
+          {showSeries && (
+            // Closed list, not free text: the letters carry fixed meanings
+            // (A = redovisning, B = kundfakturor, ...) and a typo here silently
+            // starts a new series with its own number sequence.
+            <div className="w-full sm:w-72">
               <Label className="text-xs text-muted-foreground">{t('series')}</Label>
-              <Input
+              <Select
                 value={voucherSeries}
-                onChange={(e) => {
-                  const v = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(-1)
+                onValueChange={(v) => {
                   setVoucherSeries(v)
+                  setSeriesResolved(true)
                 }}
-                onFocus={(e) => {
-                  const target = e.target
-                  setTimeout(() => target.select(), 0)
-                }}
-                onBlur={() => {
-                  if (!voucherSeries) setVoucherSeries('A')
-                }}
-                className="mt-1 h-8 text-center font-mono"
-                maxLength={1}
-              />
+              >
+                <SelectTrigger className="mt-1 h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {seriesOptions.map((option) => (
+                    <SelectItem key={option.letter} value={option.letter}>
+                      <span className="font-mono">{option.letter}</span>
+                      {option.label && (
+                        <span className="ml-2 text-muted-foreground">{option.label}</span>
+                      )}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
         </div>
 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
-          {embedded ? (
-            <div className="flex items-center gap-2">
-              <Label className="text-xs text-muted-foreground">{t('fiscal_year')}</Label>
-              <Select value={selectedPeriod} onValueChange={setSelectedPeriod}>
-                <SelectTrigger className="h-7 w-auto text-xs">
-                  <SelectValue placeholder={t('fiscal_year_placeholder')} />
-                </SelectTrigger>
-                <SelectContent>
-                  {periods.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          ) : (
-            selectedPeriodObj && (
-              <span className="text-muted-foreground">
-                {t('fiscal_year')}:{' '}
-                <span className="text-foreground">{selectedPeriodObj.name}</span>
-                {nextVoucherNumber != null && (
-                  <span className="ml-2 font-mono text-foreground">
-                    {voucherSeries}{nextVoucherNumber}
-                  </span>
-                )}
-              </span>
-            )
+          {/* The period is a total function of the entry date (Swedish fiscal
+              periods never overlap), so it renders as derived text in both
+              variants. The embedded Select this replaces allowed hand-picking
+              a period that disagreed with the date, which only the DB period
+              trigger would catch. */}
+          {selectedPeriodObj && (
+            <span className="text-muted-foreground">
+              {t('fiscal_year')}:{' '}
+              <span className="text-foreground">{selectedPeriodObj.name}</span>
+              {nextVoucherNumber != null && (
+                <span className="ml-2 font-mono text-foreground">
+                  {voucherSeries}{nextVoucherNumber}
+                </span>
+              )}
+            </span>
           )}
           <div className="flex items-center gap-2">
             <Label className="text-xs text-muted-foreground">{t('currency')}</Label>
@@ -1482,26 +1601,45 @@ export default function JournalEntryForm({
               onChange={setHeaderDimension}
               inputClassName="h-8"
             />
-            <p className="text-xs text-muted-foreground">{t('dimensions_apply_all_hint')}</p>
           </div>
         )}
 
         {periodMismatch === 'no_period' && (
-          <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3">
-            <AlertTriangle className="h-5 w-5 text-warning-foreground mt-0.5 shrink-0" />
-            <div className="flex-1 text-sm text-warning-foreground">
+          <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+            <AlertTriangle className="h-5 w-5 text-attn mt-0.5 shrink-0" />
+            <div className="flex-1 text-sm text-attn">
               <p className="font-medium">{t('no_period_warning', { date: entryDate })}</p>
-              <p className="mt-0.5">{t('no_period_help')}</p>
+              <p className="mt-0.5">
+                {preFyClampTarget ? t('pre_fy_help') : t('no_period_help')}
+              </p>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowCreatePeriod(true)}
-              className="shrink-0"
-            >
-              <CalendarPlus className="h-3.5 w-3.5 mr-1.5" />
-              {t('create_period')}
-            </Button>
+            {/* Pre-FY: the date predates the first rakenskapsar. Offering
+                "Skapa räkenskapsår" here would propose a pre-registration year
+                (legally wrong); the correct remedy is booking on the first
+                fiscal year's first day, so offer that instead. Setting the
+                entry date state drives the /book payload even in embedded mode
+                where the date input is hidden. */}
+            {preFyClampTarget ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setEntryDate(preFyClampTarget.period_start)}
+                className="shrink-0"
+              >
+                <CalendarPlus className="h-3.5 w-3.5 mr-1.5" />
+                {t('pre_fy_book_on_first_day', { date: preFyClampTarget.period_start })}
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowCreatePeriod(true)}
+                className="shrink-0"
+              >
+                <CalendarPlus className="h-3.5 w-3.5 mr-1.5" />
+                {t('create_period')}
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -1548,6 +1686,7 @@ export default function JournalEntryForm({
                   value={line.debit_amount}
                   onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
                   onKeyDown={handleAmountKeyDown(index, 'debit')}
+                  onFocus={handleAmountFocus(index, 'debit')}
                   onDoubleClick={() => handleFillBalance(index, 'debit')}
                   title={t('fill_balance_tooltip')}
                   placeholder="0,00"
@@ -1565,6 +1704,7 @@ export default function JournalEntryForm({
                   value={line.credit_amount}
                   onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
                   onKeyDown={handleAmountKeyDown(index, 'credit')}
+                  onFocus={handleAmountFocus(index, 'credit')}
                   onDoubleClick={() => handleFillBalance(index, 'credit')}
                   title={t('fill_balance_tooltip')}
                   placeholder="0,00"
@@ -1690,7 +1830,7 @@ export default function JournalEntryForm({
                   {line.dimensions &&
                     Object.keys(line.dimensions).length > 0 &&
                     (line.account_number || line.debit_amount || line.credit_amount) && (
-                      <Badge variant="outline" className="mt-1 font-mono text-[11px] font-normal">
+                      <Badge data-ph-mask="" variant="outline" className="mt-1 font-mono text-[11px] font-normal">
                         {compactDims(line.dimensions)}
                       </Badge>
                     )}
@@ -1702,6 +1842,7 @@ export default function JournalEntryForm({
                     value={line.debit_amount}
                     onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
                     onKeyDown={handleAmountKeyDown(index, 'debit')}
+                    onFocus={handleAmountFocus(index, 'debit')}
                     onDoubleClick={() => handleFillBalance(index, 'debit')}
                     title={t('fill_balance_tooltip')}
                     placeholder="0,00"
@@ -1718,6 +1859,7 @@ export default function JournalEntryForm({
                     value={line.credit_amount}
                     onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
                     onKeyDown={handleAmountKeyDown(index, 'credit')}
+                    onFocus={handleAmountFocus(index, 'credit')}
                     onDoubleClick={() => handleFillBalance(index, 'credit')}
                     title={t('fill_balance_tooltip')}
                     placeholder="0,00"
@@ -1769,7 +1911,7 @@ export default function JournalEntryForm({
                         </Button>
                         {dimPopoverRow === index && (
                           <div
-                            className="absolute right-0 top-full z-50 mt-1 w-64 rounded-md border bg-card p-3 shadow-md"
+                            className="absolute right-0 top-full z-50 mt-1 w-64 rounded-lg border bg-card p-3 shadow-md"
                             onKeyDown={(e) => {
                               // The comboboxes preventDefault their own Escape
                               // (closing their dropdown): only an unhandled
@@ -1854,9 +1996,6 @@ export default function JournalEntryForm({
             {t('save_as_template')}
           </Button>
         </div>
-        <p className="mt-1.5 text-xs text-muted-foreground">
-          {t('fill_balance_hint')} {t('keyboard_hint')}
-        </p>
       </div>
 
       {/* Document attachments: hidden when editing a draft; underlag is
@@ -1882,7 +2021,7 @@ export default function JournalEntryForm({
           {editEntryId ? (
             <Button
               onClick={handleSaveEdit}
-              disabled={!isBalanced || !description || !selectedPeriod || !!periodMismatch || isSubmitting || isSavingDraft || isUploading || !canWrite}
+              disabled={isSubmitting || isSavingDraft || isUploading || !canWrite}
               title={!canWrite ? t('read_only_tooltip') : undefined}
             >
               {!canWrite ? <Lock className="mr-2 h-4 w-4" /> : isSavingDraft && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
@@ -1909,7 +2048,7 @@ export default function JournalEntryForm({
                 <Button
                   variant="outline"
                   onClick={handleSaveDraft}
-                  disabled={!isBalanced || !description || !selectedPeriod || !!periodMismatch || isSubmitting || isSavingDraft || isUploading || !canWrite}
+                  disabled={isSubmitting || isSavingDraft || isUploading || !canWrite}
                   title={!canWrite ? t('read_only_tooltip') : t('save_draft_tooltip')}
                 >
                   {!canWrite ? <Lock className="mr-2 h-4 w-4" /> : isSavingDraft && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
@@ -1918,7 +2057,7 @@ export default function JournalEntryForm({
               )}
               <Button
                 onClick={handleReview}
-                disabled={!isBalanced || !description || !selectedPeriod || !!periodMismatch || isSubmitting || isSavingDraft || isUploading || !canWrite}
+                disabled={isSubmitting || isSavingDraft || isUploading || !canWrite}
                 title={!canWrite ? t('read_only_tooltip') : undefined}
               >
                 {!canWrite && <Lock className="mr-2 h-4 w-4" />}
@@ -1927,11 +2066,13 @@ export default function JournalEntryForm({
             </>
           )}
         </div>
-        {(!description || !selectedPeriod || isUploading || periodMismatch || incompleteLineCount > 0 || (!isBalanced && submittableLines.length < 2)) && (
-          <div className="text-xs text-muted-foreground space-y-0.5 text-right">
+        {showValidationHints && (!description || !selectedPeriod || isUploading || periodMismatch || incompleteLineCount > 0 || (!isBalanced && submittableLines.length < 2)) && (
+          <div className="text-xs text-destructive space-y-0.5 text-right">
             {!description && <p>{t('validation_description')}</p>}
             {!selectedPeriod && <p>{t('validation_period')}</p>}
-            {periodMismatch === 'no_period' && <p>{t('validation_no_matching_period')}</p>}
+            {periodMismatch === 'no_period' && (
+              <p>{preFyClampTarget ? t('validation_pre_fy') : t('validation_no_matching_period')}</p>
+            )}
             {isUploading && <p>{t('validation_uploading')}</p>}
             {incompleteLineCount > 0 && (
               <p>{t('validation_incomplete_lines')}</p>
@@ -2023,9 +2164,9 @@ export default function JournalEntryForm({
         warningText={embedded ? '' : t('review_warning')}
       >
         {(monthChanged || selectedPeriodLocked) && (
-          <div className="mb-4 flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3">
-            <AlertTriangle className="h-5 w-5 text-warning-foreground mt-0.5 shrink-0" />
-            <div className="flex-1 text-sm text-warning-foreground space-y-0.5">
+          <div className="mb-4 flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+            <AlertTriangle className="h-5 w-5 text-attn mt-0.5 shrink-0" />
+            <div className="flex-1 text-sm text-attn space-y-0.5">
               {monthChanged && (
                 <p className="font-medium">
                   {t('review_month_changed', {
@@ -2077,7 +2218,7 @@ export default function JournalEntryForm({
         onOpenChange={setShowCreatePeriod}
         entryDate={entryDate}
         periods={periods}
-        onCreated={fetchPeriods}
+        onCreated={() => void invalidateReferenceData('ref:fiscal-periods')}
       />
 
       {/* Clear-all confirmation */}

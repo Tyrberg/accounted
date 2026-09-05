@@ -14,7 +14,7 @@ import { z } from 'zod'
 import { accepted } from '@/lib/api/v1/response'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
 import { ownsFiscalPeriod } from '@/lib/api/v1/owns-fiscal-period'
 import { startOperation, completeOperation, failOperation } from '@/lib/api/v1/operations'
 import { executeCurrencyRevaluation } from '@/lib/bookkeeping/currency-revaluation'
@@ -49,6 +49,7 @@ registerEndpoint({
     'as_of_date defaults to period_end if omitted.',
   ],
   example: {
+    request: { as_of_date: '2026-12-31' },
     response: {
       data: { operation_id: '0e9c…', type: 'fiscal_periods.currency_revaluation', status: 'succeeded', poll_url: '/api/v1/operations/0e9c…', webhook_event: 'operation.completed' },
       meta: { request_id: 'req_…', api_version: '2026-05-12' },
@@ -89,12 +90,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     }
     if (rawBody) {
       const parsed = Body.safeParse(rawBody)
-      if (!parsed.success) {
-        return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-          requestId: ctx.requestId,
-          details: { issues: parsed.error.issues.map((i) => ({ field: i.path.join('.'), message: i.message })) },
-        })
-      }
+      if (!parsed.success) return v1ValidationError(ctx, parsed.error)
       bodyAsOfDate = parsed.data.as_of_date
     }
 

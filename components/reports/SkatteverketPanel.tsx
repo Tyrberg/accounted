@@ -2,6 +2,7 @@
 
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import React, { useState, useEffect, useCallback } from 'react'
+import { useCompanySettings } from '@/lib/reference-data/hooks'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -31,10 +32,11 @@ import {
 } from 'lucide-react'
 import type { VatPeriodType } from '@/types'
 import { formatRedovisare, formatRedovisningsperiod } from '@/lib/skatteverket/format'
-import { useCapability } from '@/contexts/CompanyContext'
+import { useCapability, useCompanyOptional } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { UpgradeNote } from '@/components/billing/UpgradeNote'
 import { InfoTooltip } from '@/components/ui/info-tooltip'
+import { formatAmount } from '@/lib/utils'
 
 interface SkatteverketStatus {
   connected: boolean
@@ -104,10 +106,6 @@ interface SkatteverketPanelProps {
 interface Notice {
   kind: 'error' | 'success' | 'info'
   text: string
-}
-
-function formatAmount(amount: number): string {
-  return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 const ORG_NUMBER_MISSING_NOTICE: Notice = {
@@ -367,13 +365,15 @@ function SkatteverketPanelInner({
     }
   }
 
-  // Helper to get redovisare from settings
+  // Redovisare from the session-cached settings row (lib/reference-data).
+  // entity_type falls back to the company row, as /api/settings did.
+  const { settings: companySettings } = useCompanySettings()
+  const companyEntityType = useCompanyOptional()?.company?.entity_type ?? null
   const getRedovisare = useCallback(async (): Promise<string> => {
-    const res = await fetch('/api/settings')
-    const { data } = await res.json()
-    if (!data?.org_number) throw new Error('Organisationsnummer saknas')
-    return formatRedovisare(data.org_number, data.entity_type)
-  }, [])
+    const orgNumber = companySettings?.org_number
+    if (!orgNumber) throw new Error('Organisationsnummer saknas')
+    return formatRedovisare(orgNumber, companySettings?.entity_type ?? companyEntityType)
+  }, [companySettings, companyEntityType])
 
   const getRedovisningsperiod = useCallback((): string => {
     return formatRedovisningsperiod(periodType, year, period, fiscalYearEnd)

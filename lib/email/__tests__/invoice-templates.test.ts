@@ -3,6 +3,9 @@ import {
   generateInvoiceEmailHtml,
   generateInvoiceEmailText,
   generateInvoiceEmailSubject,
+  generatePaymentConfirmationEmailHtml,
+  generatePaymentConfirmationEmailSubject,
+  generatePaymentConfirmationEmailText,
 } from '../invoice-templates'
 import { makeCustomer, makeInvoice, makeCompanySettings } from '@/tests/helpers'
 
@@ -356,6 +359,119 @@ describe('invoice email templates', () => {
       expect(generateInvoiceEmailSubject({ invoice: deliveryNote, customer: svCustomer, company: fullOverrides }))
         .toBe('F\u00f6ljesedel 1045 fr\u00e5n Acme AB')
     })
+
+    it('ignores overrides on quotes', () => {
+      const quote = makeInvoice({
+        invoice_number: 'OF-001',
+        document_type: 'quote',
+        valid_until: '2026-10-02',
+        quote_status: 'open',
+      })
+      const html = generateInvoiceEmailHtml({ invoice: quote, customer: svCustomer, company: fullOverrides })
+      expect(html).toContain('Bifogat hittar du v\u00e5r offert')
+      expect(html).not.toContain('H\u00e4r kommer m\u00e5nadens faktura.')
+      expect(generateInvoiceEmailSubject({ invoice: quote, customer: svCustomer, company: fullOverrides }))
+        .toBe('Offert OF-001 fr\u00e5n Acme AB')
+    })
+  })
+
+  // A quote (offert) is not a payment request: the mail states the expiry
+  // instead of a due date and carries no payment details or pay-online CTA.
+  describe('quote (offert)', () => {
+    const quote = makeInvoice({
+      invoice_number: 'OF-001',
+      invoice_date: '2026-09-02',
+      due_date: '2026-10-02',
+      valid_until: '2026-10-02',
+      quote_status: 'open',
+      document_type: 'quote',
+      currency: 'SEK',
+      total: 12500,
+      payment_link_url: 'https://buy.stripe.com/test_quote',
+    })
+    const svCustomer = makeCustomer({ name: 'Erik Andersson', email: 'erik@example.se', language: 'sv' })
+    const enCustomer = makeCustomer({ name: 'Jane Doe', email: 'jane@example.com', language: 'en' })
+
+    it('uses the Swedish quote subject', () => {
+      expect(generateInvoiceEmailSubject({ invoice: quote, customer: svCustomer, company }))
+        .toBe('Offert OF-001 fr\u00e5n Acme AB')
+    })
+
+    it('uses the English quote subject', () => {
+      expect(generateInvoiceEmailSubject({ invoice: quote, customer: enCustomer, company }))
+        .toBe('Quote OF-001 from Acme AB')
+    })
+
+    it('sv HTML: attached quote, Giltig till, no payment section and no pay-online button', () => {
+      const html = generateInvoiceEmailHtml({ invoice: quote, customer: svCustomer, company })
+      expect(html).toContain('Offert fr\u00e5n Acme AB')
+      expect(html).toContain('Offertnummer:')
+      expect(html).toContain('Offertdatum:')
+      expect(html).toContain('Bifogat hittar du v\u00e5r offert. Offerten \u00e4r giltig till 2026-10-02.')
+      expect(html).toContain('Giltig till:')
+      expect(html).toContain('2026-10-02')
+      expect(html).not.toContain('F\u00f6rfallodatum:')
+      expect(html).not.toContain('Betalningsinformation')
+      expect(html).not.toContain('Betala online')
+      expect(html).not.toContain('buy.stripe.com')
+      expect(html).toContain('Har du fr\u00e5gor om offerten?')
+      expect(html).not.toContain('Har du fr\u00e5gor om fakturan?')
+    })
+
+    it('en HTML: attached quote, Valid until, no payment section and no pay-online button', () => {
+      const html = generateInvoiceEmailHtml({ invoice: quote, customer: enCustomer, company })
+      expect(html).toContain('Quote from Acme AB')
+      expect(html).toContain('Quote number:')
+      expect(html).toContain('Attached you will find our quote. The quote is valid until 2026-10-02.')
+      expect(html).toContain('Valid until:')
+      expect(html).not.toContain('Due date:')
+      expect(html).not.toContain('Payment information')
+      expect(html).not.toContain('Pay online')
+      expect(html).toContain('Questions about the quote?')
+    })
+
+    it('plain text mirrors the HTML in both languages', () => {
+      const sv = generateInvoiceEmailText({ invoice: quote, customer: svCustomer, company })
+      expect(sv).toContain('Offert fr\u00e5n Acme AB')
+      expect(sv).toContain('Offerten \u00e4r giltig till 2026-10-02.')
+      expect(sv).toContain('Giltig till: 2026-10-02')
+      expect(sv).not.toContain('F\u00f6rfallodatum:')
+      expect(sv).not.toContain('Betalningsinformation')
+      expect(sv).not.toContain('Betala online')
+      expect(sv).not.toContain('buy.stripe.com')
+
+      const en = generateInvoiceEmailText({ invoice: quote, customer: enCustomer, company })
+      expect(en).toContain('Quote from Acme AB')
+      expect(en).toContain('The quote is valid until 2026-10-02.')
+      expect(en).toContain('Valid until: 2026-10-02')
+      expect(en).not.toContain('Due date:')
+      expect(en).not.toContain('Payment information')
+      expect(en).not.toContain('Pay online')
+    })
+
+    it('falls back to due_date when valid_until is missing on an older row', () => {
+      const legacy = makeInvoice({ ...quote, valid_until: null })
+      const text = generateInvoiceEmailText({ invoice: legacy, customer: svCustomer, company })
+      expect(text).toContain('Giltig till: 2026-10-02')
+    })
+
+    // The grand total sits right above the "not a payment request" notice,
+    // so it must not be labelled as an amount due.
+    it('labels the total Summa / Total, never Att betala / Total due', () => {
+      const svHtml = generateInvoiceEmailHtml({ invoice: quote, customer: svCustomer, company })
+      const svText = generateInvoiceEmailText({ invoice: quote, customer: svCustomer, company })
+      expect(svHtml).toContain('Summa:')
+      expect(svHtml).not.toContain('Att betala')
+      expect(svText).toContain('Summa: 12 500,00 SEK')
+      expect(svText).not.toContain('Att betala')
+
+      const enHtml = generateInvoiceEmailHtml({ invoice: quote, customer: enCustomer, company })
+      const enText = generateInvoiceEmailText({ invoice: quote, customer: enCustomer, company })
+      expect(enHtml).toContain('Total:')
+      expect(enHtml).not.toContain('Total due')
+      expect(enText).toContain('Total: 12,500.00 SEK')
+      expect(enText).not.toContain('Total due')
+    })
   })
 
   describe('payment link (payment_link_url)', () => {
@@ -484,6 +600,91 @@ describe('invoice email templates', () => {
       const oreInvoice = makeInvoice({ invoice_number: '1042', total: 1234.56 })
       const text = generateInvoiceEmailText({ invoice: oreInvoice, customer: svCustomer, company: withBelopp })
       expect(text).toMatch(/Summa: 1[\s ]235,00 SEK/)
+    })
+  })
+})
+
+// #1693: the betalningsbekräftelse mail. Customer-language driven like the
+// invoice mail, but it never lists payment details (nothing is due) and never
+// applies the company's custom invoice texts.
+describe('payment confirmation email templates', () => {
+  const paidInvoice = makeInvoice({
+    invoice_number: '1042',
+    invoice_date: '2026-05-22',
+    currency: 'SEK',
+    total: 12500,
+    status: 'paid',
+    paid_amount: 12500,
+    remaining_amount: 0,
+    paid_at: '2026-06-10T12:00:00+00:00',
+  })
+  const customText = makeCompanySettings({
+    company_name: 'Acme AB',
+    invoice_email_texts: { sv: { subject: 'Egen rubrik {fakturanummer}', body: 'Egen text' } },
+  })
+
+  describe('Swedish customer', () => {
+    const customer = makeCustomer({ name: 'Erik Andersson', email: 'erik@example.se', language: 'sv' })
+    const data = { invoice: paidInvoice, customer, company }
+
+    it('subject names the invoice and the sender', () => {
+      expect(generatePaymentConfirmationEmailSubject(data)).toBe(
+        'Betalningsbekräftelse för faktura 1042 från Acme AB',
+      )
+    })
+
+    it('html confirms the payment with date and amount, without payment details', () => {
+      const html = generatePaymentConfirmationEmailHtml(data)
+      expect(html).toContain('<html lang="sv">')
+      expect(html).toContain('Betalningsbekräftelse från Acme AB')
+      expect(html).toContain('Hej Erik,')
+      expect(html).toContain('faktura 1042 är betald i sin helhet')
+      expect(html).toContain('2026-06-10')
+      expect(html).toContain('12\u00a0500,00 SEK')
+      expect(html).not.toContain('Betalningsinformation')
+      expect(html).not.toContain('Att betala:')
+    })
+
+    it('text mirrors the html', () => {
+      const text = generatePaymentConfirmationEmailText(data)
+      expect(text).toContain('Betalningsbekräftelse från Acme AB')
+      expect(text).toContain('Betald: 2026-06-10')
+      expect(text).toContain('Betalt belopp: 12\u00a0500,00 SEK')
+      expect(text).not.toContain('IBAN')
+    })
+
+    it('ignores the company custom invoice texts', () => {
+      const subject = generatePaymentConfirmationEmailSubject({ ...data, company: customText })
+      expect(subject).toBe('Betalningsbekräftelse för faktura 1042 från Acme AB')
+      expect(generatePaymentConfirmationEmailHtml({ ...data, company: customText })).not.toContain('Egen text')
+    })
+
+    it('omits the paid date when paid_at was never recorded', () => {
+      const text = generatePaymentConfirmationEmailText({
+        ...data,
+        invoice: { ...paidInvoice, paid_at: null },
+      })
+      expect(text).not.toContain('Betald:')
+      expect(text).toContain('Betalt belopp:')
+    })
+  })
+
+  describe('English customer', () => {
+    const customer = makeCustomer({ name: 'John Smith', email: 'john@example.com', language: 'en' })
+    const data = { invoice: paidInvoice, customer, company }
+
+    it('uses English chrome', () => {
+      expect(generatePaymentConfirmationEmailSubject(data)).toBe(
+        'Payment confirmation for invoice 1042 from Acme AB',
+      )
+      const html = generatePaymentConfirmationEmailHtml(data)
+      expect(html).toContain('<html lang="en">')
+      expect(html).toContain('Hi John,')
+      expect(html).toContain('invoice 1042 has been paid in full')
+      expect(html).toContain('12,500.00 SEK')
+      const text = generatePaymentConfirmationEmailText(data)
+      expect(text).toContain('Paid on: 2026-06-10')
+      expect(text).toContain('Amount paid: 12,500.00 SEK')
     })
   })
 })

@@ -4,8 +4,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence, useReducedMotion, animate } from 'framer-motion'
 import { RotateCw } from 'lucide-react'
 import { getAccountDescription } from '@/lib/bookkeeping/account-descriptions'
+import { useBasReference } from '@/lib/bookkeeping/use-bas-reference'
 import { useTranslations } from 'next-intl'
-import { formatCurrency } from '@/lib/utils'
+import { formatAmount, formatCurrency } from '@/lib/utils'
 import type { DeepEntity, DeepLedgerContext } from '@/lib/agent-context/ledger-deep'
 import { entityMagnitude, selectAccountRing, type RingBasis } from './ledger-graph-magnitude'
 
@@ -240,6 +241,9 @@ const PULSE_DUR: Record<Cadence, number> = { weekly: 1.15, monthly: 2.7, irregul
 
 export function LedgerGraph({ deep, companyName }: { deep: DeepLedgerContext; companyName: string }) {
   const t = useTranslations('agentKnowledge')
+  // Loads the BAS chart chunk after mount and re-renders once names and
+  // descriptions for non-hardcoded accounts are available.
+  useBasReference()
   const reduce = useReducedMotion() ?? false
   const model = useMemo(() => buildModel(deep), [deep])
 
@@ -277,7 +281,7 @@ export function LedgerGraph({ deep, companyName }: { deep: DeepLedgerContext; co
   if (model.payees.length === 0) {
     return (
       <div
-        className="rounded-xl border p-16 text-center text-sm"
+        className="rounded-lg border border-border p-16 text-center text-sm"
         style={{ background: INK, borderColor: HAIR, color: MUTED }}
       >
         {t('none_cp')}
@@ -304,7 +308,7 @@ export function LedgerGraph({ deep, companyName }: { deep: DeepLedgerContext; co
 
   return (
     <div
-      className="relative overflow-hidden rounded-xl border"
+      className="relative overflow-hidden rounded-lg border border-border"
       style={{
         borderColor: HAIR_STRONG,
         background: `radial-gradient(120% 120% at 50% 42%, #17171b 0%, ${INK} 62%)`,
@@ -329,7 +333,7 @@ export function LedgerGraph({ deep, companyName }: { deep: DeepLedgerContext; co
           <button
             type="button"
             onClick={() => setRunKey((k) => k + 1)}
-            className="inline-flex shrink-0 items-center gap-2 rounded-md border px-3 py-1.5 text-xs transition-colors"
+            className="inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors"
             style={{ borderColor: HAIR_STRONG, color: MUTED }}
           >
             <RotateCw className="h-3.5 w-3.5" />
@@ -747,7 +751,7 @@ function DetailCard({ p, t }: { p: Payee; t: ReturnType<typeof useTranslations> 
         <div className="flex justify-between gap-3">
           <span>{t('card_amount')}</span>
           <span className="tabular-nums" style={{ color: PAPER }}>
-            {e.total_amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatAmount(e.total_amount)}
           </span>
         </div>
         <div className="mt-2 border-t pt-2" style={{ borderColor: HAIR }}>

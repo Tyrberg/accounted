@@ -1,150 +1,178 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
-import { ACCOUNT_TO_BOX } from '@/lib/vat/moms-box-mapping'
+import { ACCOUNT_TO_BOX, BOX_LABELS, type MomsBox } from '@/lib/vat/moms-box-mapping'
+import {
+  defaultRateForVatTreatment,
+  isAccountVatTreatment,
+  resolveVatTreatmentRuta,
+  type AccountVatRutaMapping,
+} from '@/lib/vat/account-vat-treatment'
 
-/**
- * Resolve which of a company's OWN revenue accounts belong in ruta 05
- * (momspliktig försäljning som inte ingår i någon annan ruta).
- *
- * ACCOUNT_RUTA is a fixed BAS whitelist and ruta 05 is literally 3001/3002/3003
- * there. That is only correct for a company that never touched its kontoplan:
- * the shipped BAS reference (lib/bookkeeping/bas-data/class-3-revenue.ts) has
- * no varugrupp accounts at all, so every 3011/3013/3041-style konto is added by
- * the user. Their revenue was not merely mapped to the wrong ruta, it was never
- * fetched from the ledger: ACCOUNT_RUTA's keys ARE the account filter passed to
- * get_vat_declaration_totals. Ruta 05 came out short and, because
- * runVatDeclarationChecks compares rutor 05-08 against 10-12, a perfectly
- * correct declaration got a blocking OUTPUT_VAT_WITHOUT_SALES error (#1261).
- *
- * The per-account "Standard moms" (chart_of_accounts.default_vat_rate) is the
- * resolver: a class 3 konto the user marked 25/12/6 % is by definition domestic
- * taxable sales, which is exactly what ruta 05 collects. The account dialogs
- * say so, since the field now carries declaration weight and not just line
- * prefill.
- */
-
-/**
- * Class 3 accounts that carry a moms-sats but belong in a DIFFERENT ruta, so
- * "has a rate" must not be read as "ruta 05". Per the SKV 4700 mapping in
- * .claude/skills/swedish-vat/references/vat-compliance-reference.md §7:
- *
- *   3211/3212/3220 → ruta 07 (vinstmarginalbeskattning)
- *   3231/3232/3233 → ruta 41 (försäljning där köparen är betalningsskyldig)
- *   3913           → ruta 08 (hyresinkomster, frivillig skattskyldighet)
- *
- * Rutor 07, 08 and 41 are not mappable yet (see the note in
- * vat-declaration-checks.ts). Until they are, these accounts stay out of the
- * declaration entirely: that understates one ruta, whereas sweeping them into
- * ruta 05 would file the amount in the wrong box.
- */
-export const RUTA_05_EXCLUDED_ACCOUNTS = new Set([
-  '3211', '3212', '3220',
-  '3231', '3232', '3233',
-  '3913',
-])
-
-/** VAT rates that mark a konto as momspliktig försäljning. 0 and NULL do not. */
 const TAXABLE_RATES = [0.25, 0.12, 0.06]
-
-/**
- * Ruta 05 accounts that ACCOUNT_TO_BOX already sums, but whose per-rate bucket
- * cannot be inferred from the account number.
- *
- * 3000 "Försäljning inom Sverige" is the BAS gruppkonto for the 30xx range. A
- * BAS-conformant company posts to 3001/3002/3003 and never to 3000, but a
- * company that does post to it has genuine domestic taxable sales, so ruta 05
- * stays the right box and the filed figure is already correct. What is missing
- * is only the rate split: unlike 3001/3002/3003 the number carries no sats, so
- * `breakdown.invoices.base25/12/6` would not add up to ruta 05.
- *
- * These accounts therefore contribute a RATE ONLY. Adding them to `accounts`
- * would double-count them, since ACCOUNT_TO_BOX already puts them in the sum.
- */
+export const RUTA_05_EXCLUDED_ACCOUNTS = new Set([
+  '3211', '3212', '3220', '3913',
+])
 const RUTA_05_STATIC_RATE_ACCOUNTS = new Set(['3000'])
+const DOMESTIC_SALES_RATE_BY_SUFFIX: Record<string, number> = { '1': 0.25, '2': 0.12, '3': 0.06 }
+const CONTRADICTING_ACCOUNT_NAME =
+  /momsfri|momsfritt|utan moms|omvänd|\bvmb\b|vinstmarginal|export|utanför|eu-land|unionsintern|\boss\b|\b0\s*%/i
 
-export interface DynamicRuta05Accounts {
-  /** Accounts to add to the ledger fetch and to the ruta 05 sum. */
-  accounts: string[]
-  /** account_number → 0.25 | 0.12 | 0.06, for the per-rate base breakdown. */
-  rateByAccount: Map<string, number>
-  /**
-   * Rates for accounts ALREADY counted in ruta 05 by the static map. Feeds the
-   * base breakdown only, never the sum. Empty unless the user set a
-   * "Standard moms" on one of RUTA_05_STATIC_RATE_ACCOUNTS.
-   */
-  staticRateByAccount: Map<string, number>
-}
-
-const EMPTY: DynamicRuta05Accounts = {
-  accounts: [],
-  rateByAccount: new Map(),
-  staticRateByAccount: new Map(),
+/**
+ * Infer the domestic-sales VAT rate a class 3 account represents from its
+ * number pattern (30x1/30x2/30x3) and a rate-naming account name. Exported
+ * for the webshop bulk sweep's revenue-template guard, which must accept an
+ * account for a rate exactly when this report logic would count it toward
+ * ruta 05 for that rate.
+ */
+export function inferDomesticSalesRate(accountNumber: string, accountName: string): number | null {
+  const accountMatch = /^30\d([123])$/.exec(accountNumber)
+  if (!accountMatch || CONTRADICTING_ACCOUNT_NAME.test(accountName)) return null
+  const expectedRate = DOMESTIC_SALES_RATE_BY_SUFFIX[accountMatch[1]]
+  const namedRates = new Set(
+    [...accountName.matchAll(/\b(25|12|6)\s*%\s*moms\b/gi)].map((match) => Number(match[1]) / 100),
+  )
+  return namedRates.size === 1 && namedRates.has(expectedRate) ? expectedRate : null
 }
 
 /**
- * Fetch the company-specific ruta 05 accounts.
- *
- * Excluded:
- *   - every account in ACCOUNT_TO_BOX. This covers all of ACCOUNT_RUTA (the
- *     alignment test in lib/vat/__tests__/moms-box-mapping.test.ts fails if the
- *     mirror ever stops being a superset) and additionally the accounts only
- *     the mirror maps (3106, 3109, 3521, 3522). Filtering on the superset alone
- *     keeps this module off vat-declaration.ts, which imports it.
- *
- *     This exclusion is what makes the BAS backfill safe: it sets 3001 = 25 %,
- *     and without it 3001 would be counted once by ACCOUNT_RUTA and once here,
- *     doubling ruta 05.
- *   - RUTA_05_EXCLUDED_ACCOUNTS above.
- *
- * The company_id filter is explicit rather than left to RLS:
- * calculateVatDeclaration is also reached from /api/v1/* on a service client,
- * which has no RLS.
+ * The chart_of_accounts columns that classify an account for VAT purposes.
+ * account_class is optional so callers holding only the number can pass a
+ * row straight from a narrower select; it then falls back to the number's
+ * leading digit (BAS class).
  */
-export async function fetchDynamicRuta05Accounts(
+export interface VatAccountClassificationRow {
+  account_number: string
+  account_name: string
+  account_class?: number
+  default_vat_rate: number | string | null
+  default_vat_treatment: string | null
+}
+
+function accountClassOf(row: VatAccountClassificationRow): number {
+  return row.account_class ?? Number(row.account_number.charAt(0))
+}
+
+/**
+ * The single source of truth for an account's effective VAT rate, precedence
+ * included: an explicit momssats always wins, then the rate implied by a
+ * configured treatment, and number+name inference (class 3 only) when
+ * nothing is configured. fetchDynamicVatAccounts (ruta 05 arithmetic) and
+ * the webshop bulk sweep's revenue-template guard both call this, so an
+ * account is accepted for a rate exactly when the declaration would count
+ * it toward that rate (#1912). Returns null when no rate can be resolved.
+ */
+export function resolveEffectiveVatRate(row: VatAccountClassificationRow): number | null {
+  const accountClass = accountClassOf(row)
+  const configured = row.default_vat_rate === null ? null : Number(row.default_vat_rate)
+  if (isAccountVatTreatment(row.default_vat_treatment)) {
+    return configured ?? defaultRateForVatTreatment(row.default_vat_treatment, accountClass)
+  }
+  if (accountClass === 3) {
+    return configured ?? inferDomesticSalesRate(row.account_number, row.account_name)
+  }
+  return configured
+}
+
+/**
+ * The momsdeklaration box a revenue (class 3) account feeds: a configured
+ * treatment wins (its ruta, or null for OSS which is declared outside the
+ * momsdeklaration), otherwise the static BAS map. Null when neither
+ * classifies the account, which is the common case for company-specific
+ * momsfri/export accounts that were never configured.
+ */
+export function resolveRevenueVatBox(row: VatAccountClassificationRow): MomsBox | null {
+  if (isAccountVatTreatment(row.default_vat_treatment)) {
+    const mapping = resolveVatTreatmentRuta(
+      row.default_vat_treatment,
+      accountClassOf(row),
+      row.account_number,
+    )
+    if (!mapping) return null
+    const code = mapping.box.replace(/^ruta/, '')
+    return code in BOX_LABELS ? (code as MomsBox) : null
+  }
+  return ACCOUNT_TO_BOX[row.account_number] ?? null
+}
+
+export interface DynamicVatAccounts {
+  accounts: string[]
+  mappingByAccount: Map<string, AccountVatRutaMapping>
+  explicitAccounts: Set<string>
+  rateByAccount: Map<string, number>
+  staticRateByAccount: Map<string, number>
+  rcBasisRateByAccount: Map<string, number>
+}
+
+const emptyDynamicVatAccounts = (): DynamicVatAccounts => ({
+  accounts: [], mappingByAccount: new Map(), explicitAccounts: new Set(),
+  rateByAccount: new Map(), staticRateByAccount: new Map(),
+  rcBasisRateByAccount: new Map(),
+})
+
+/** Explicit account treatments win; accounts without one keep BAS fallback. */
+export async function fetchDynamicVatAccounts(
   supabase: SupabaseClient,
-  companyId: string
-): Promise<DynamicRuta05Accounts> {
-  const rows = await fetchAllRows<{ account_number: string; default_vat_rate: number | string | null }>(
-    ({ from, to }) =>
-      supabase
-        .from('chart_of_accounts')
-        .select('account_number, default_vat_rate')
-        .eq('company_id', companyId)
-        .eq('account_class', 3)
-        // Deactivated accounts only. is_active is nullable (boolean DEFAULT
-        // true, never made NOT NULL) and the accounts API treats only an
-        // explicit false as deactivated, so `eq(true)` would silently drop a
-        // NULL-flagged konto: the same kind of quiet omission this whole fix
-        // exists to remove.
-        .not('is_active', 'is', false)
-        .in('default_vat_rate', TAXABLE_RATES)
-        .order('account_number', { ascending: true })
-        .range(from, to)
+  companyId: string,
+): Promise<DynamicVatAccounts> {
+  const rows = await fetchAllRows<{
+    account_number: string
+    account_name: string
+    account_class: number
+    default_vat_rate: number | string | null
+    default_vat_treatment: string | null
+  }>(
+    ({ from, to }) => supabase.from('chart_of_accounts')
+      .select('account_number, account_name, account_class, default_vat_rate, default_vat_treatment')
+      .eq('company_id', companyId)
+      .in('account_class', [3, 4, 5, 6])
+      .order('account_number', { ascending: true })
+      .range(from, to),
   )
 
-  if (rows.length === 0) return EMPTY
-
-  const accounts: string[] = []
-  const rateByAccount = new Map<string, number>()
-  const staticRateByAccount = new Map<string, number>()
+  const result = emptyDynamicVatAccounts()
   for (const row of rows) {
     const account = row.account_number
-    const rate = Number(row.default_vat_rate)
-    if (!TAXABLE_RATES.includes(rate)) continue
 
-    // Checked before the ACCOUNT_TO_BOX skip: these accounts ARE in that map,
-    // which is precisely why they need the rate surfaced separately.
-    if (RUTA_05_STATIC_RATE_ACCOUNTS.has(account)) {
-      staticRateByAccount.set(account, rate)
+    if (isAccountVatTreatment(row.default_vat_treatment)) {
+      result.explicitAccounts.add(account)
+      const mapping = resolveVatTreatmentRuta(
+        row.default_vat_treatment,
+        row.account_class,
+        row.account_number,
+      )
+      if (!mapping) continue
+      result.mappingByAccount.set(account, mapping)
+      // Always include an explicit account in the ledger filter. The Set in
+      // fetchVatAccountTotals deduplicates static BAS accounts, while this also
+      // covers accounts that exist only in the separate moms-box mirror.
+      result.accounts.push(account)
+      const rate = resolveEffectiveVatRate(row)
+      if (mapping.box === 'ruta05' && rate !== null && TAXABLE_RATES.includes(rate)) {
+        const target = ACCOUNT_TO_BOX[account] ? result.staticRateByAccount : result.rateByAccount
+        target.set(account, rate)
+      }
+      if (
+        ['ruta20', 'ruta21', 'ruta22', 'ruta23', 'ruta24'].includes(mapping.box) &&
+        rate !== null && TAXABLE_RATES.includes(rate)
+      ) {
+        result.rcBasisRateByAccount.set(account, rate)
+      }
       continue
     }
 
-    if (ACCOUNT_TO_BOX[account]) continue
+    if (row.account_class !== 3) continue
+    const rate = resolveEffectiveVatRate(row)
+    if (rate === null || !TAXABLE_RATES.includes(rate)) continue
+    if (ACCOUNT_TO_BOX[account]) {
+      if (RUTA_05_STATIC_RATE_ACCOUNTS.has(account)) {
+        result.staticRateByAccount.set(account, rate)
+      }
+      continue
+    }
     if (RUTA_05_EXCLUDED_ACCOUNTS.has(account)) continue
-
-    accounts.push(account)
-    rateByAccount.set(account, rate)
+    result.accounts.push(account)
+    result.mappingByAccount.set(account, { box: 'ruta05', side: 'credit' })
+    result.rateByAccount.set(account, rate)
   }
-
-  return { accounts, rateByAccount, staticRateByAccount }
+  return result
 }

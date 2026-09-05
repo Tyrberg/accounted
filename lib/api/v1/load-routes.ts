@@ -52,6 +52,7 @@ import '@/app/api/v1/companies/[companyId]/invoices/[id]/mark-sent/route'
 import '@/app/api/v1/companies/[companyId]/invoices/[id]/mark-paid/route'
 import '@/app/api/v1/companies/[companyId]/invoices/[id]/credit/route'
 import '@/app/api/v1/companies/[companyId]/invoices/[id]/send/route'
+import '@/app/api/v1/companies/[companyId]/invoices/[id]/quote-status/route'
 import '@/app/api/v1/companies/[companyId]/invoices/bulk-create/route'
 // Phase 2 PR-B-3: invoice PDF + customer bulk-create.
 import '@/app/api/v1/companies/[companyId]/invoices/[id]/pdf/route'
@@ -64,12 +65,19 @@ import '@/app/api/v1/companies/[companyId]/accounts/route'
 import '@/app/api/v1/companies/[companyId]/fiscal-periods/route'
 import '@/app/api/v1/companies/[companyId]/transactions/[id]/categorize/route'
 import '@/app/api/v1/companies/[companyId]/transactions/[id]/uncategorize/route'
+import '@/app/api/v1/companies/[companyId]/transactions/[id]/ignore/route'
 import '@/app/api/v1/companies/[companyId]/transactions/[id]/match-invoice/route'
 import '@/app/api/v1/companies/[companyId]/transactions/[id]/match-supplier-invoice/route'
 import '@/app/api/v1/companies/[companyId]/transactions/ingest/route'
 import '@/app/api/v1/companies/[companyId]/transactions/batch-categorize/route'
 import '@/app/api/v1/companies/[companyId]/reconciliation/bank/run/route'
 import '@/app/api/v1/companies/[companyId]/reconciliation/bank/status/route'
+import '@/app/api/v1/companies/[companyId]/cash-accounts/route'
+
+// F2: PSD2 bank-connection health (last_synced_at, consent_expires) so
+// integrations can detect stale bank data instead of trusting it blindly.
+import '@/app/api/v1/companies/[companyId]/bank-connections/route'
+import '@/app/api/v1/companies/[companyId]/bank-connections/[connectionId]/sync/route'
 
 // Phase 4 PR-1: AP world: suppliers + supplier-invoices verticals.
 import '@/app/api/v1/companies/[companyId]/suppliers/route'
@@ -124,7 +132,9 @@ import '@/app/api/v1/companies/[companyId]/salary/vacation-year-close/route'
 // to a follow-up PR (different lib-module structures).
 import '@/app/api/v1/companies/[companyId]/reports/trial-balance/route'
 import '@/app/api/v1/companies/[companyId]/reports/balance-sheet/route'
+import '@/app/api/v1/companies/[companyId]/reports/balance-sheet/pdf/route'
 import '@/app/api/v1/companies/[companyId]/reports/income-statement/route'
+import '@/app/api/v1/companies/[companyId]/reports/income-statement/pdf/route'
 import '@/app/api/v1/companies/[companyId]/reports/general-ledger/route'
 import '@/app/api/v1/companies/[companyId]/reports/journal-register/route'
 import '@/app/api/v1/companies/[companyId]/reports/vat-declaration/route'
@@ -152,6 +162,18 @@ import '@/app/api/v1/companies/[companyId]/webhooks/[id]/rotate-secret/route'
 // Inbox item stamp.
 import '@/app/api/v1/companies/[companyId]/inbox-items/[id]/stamp/route'
 
+// Reconciliation, account-keyed (bank:<cash_account_id> | skattekonto): the
+// account list, the bridge per account, item buckets, links and ignore flags.
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/items/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/links/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/links/[linkId]/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/items/[itemId]/ignore/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/signoff/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/signoff/[signoffId]/reopen/route'
+import '@/app/api/v1/companies/[companyId]/reconciliation/accounts/[accountKey]/residual/route'
+
 // Dimensions PR2: registry list + value creation (kostnadsställe/projekt).
 import '@/app/api/v1/companies/[companyId]/dimensions/route'
 import '@/app/api/v1/companies/[companyId]/dimensions/[id]/values/route'
@@ -160,5 +182,11 @@ import '@/app/api/v1/companies/[companyId]/dimensions/[id]/values/[valueId]/rout
 
 // #895: articles read (artikelregister) for invoice line linkage.
 import '@/app/api/v1/companies/[companyId]/articles/route'
+
+// #1348: company-settings write (PATCH, MCP-tool-identical field set).
+import '@/app/api/v1/companies/[companyId]/settings/route'
+
+// #1663: filed momsdeklaration read (SKV inlamnat/beslutat).
+import '@/app/api/v1/companies/[companyId]/skatteverket/vat-declarations/route'
 
 export {}

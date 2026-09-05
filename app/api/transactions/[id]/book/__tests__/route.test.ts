@@ -10,7 +10,7 @@ import {
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
 
 const requireAuthMock = vi.fn()
 vi.mock('@/lib/auth/require-auth', () => ({
@@ -34,6 +34,11 @@ vi.mock('@/lib/auth/require-write', () => ({
 const mockCreateJournalEntry = vi.fn()
 vi.mock('@/lib/bookkeeping/engine', () => ({
   createJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
+}))
+
+const mockReverseOrphanedJournalEntry = vi.fn()
+vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
+  reverseOrphanedJournalEntry: (...args: unknown[]) => mockReverseOrphanedJournalEntry(...args),
 }))
 
 // Booking-time duplicate guard: mocked so route tests exercise the WIRING
@@ -79,6 +84,7 @@ describe('POST /api/transactions/[id]/book', () => {
     // No booking-duplicate by default; guard tests override per-case.
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
+    mockReverseOrphanedJournalEntry.mockResolvedValue(undefined)
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -197,7 +203,7 @@ describe('POST /api/transactions/[id]/book', () => {
     mockCreateJournalEntry.mockResolvedValue(je)
 
     // Update transaction
-    enqueue({ data: null, error: null })
+    enqueue({ data: [{ id: 'tx-1' }], error: null })
 
     const emitSpy = vi.spyOn(eventBus, 'emit')
 
@@ -231,6 +237,233 @@ describe('POST /api/transactions/[id]/book', () => {
     )
   })
 
+  it("books into the bank account's own verifikationsserie when the cash account carries one", async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      journal_entry_id: null,
+      cash_account_id: 'ca-card',
+    })
+    const je = makeJournalEntry({ id: 'je-new', voucher_series: 'M' })
+
+    // Fetch transaction
+    enqueue({ data: tx, error: null })
+    // guardBookedCounterLines own-row lookup (1930 matches the own ledger: clean)
+    enqueue({ data: { ledger_account: '1930' }, error: null })
+    // Cash account series override
+    enqueue({ data: { voucher_series: 'M' }, error: null })
+    mockCreateJournalEntry.mockResolvedValue(je)
+    // Update transaction
+    enqueue({ data: [{ id: 'tx-1' }], error: null })
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: validBody,
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(mockCreateJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({ source_type: 'bank_transaction', voucher_series: 'M' }),
+    )
+  })
+
+  it('lets an explicit voucher_series from the dialog win over the cash account override', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      journal_entry_id: null,
+      cash_account_id: 'ca-card',
+    })
+    const je = makeJournalEntry({ id: 'je-new', voucher_series: 'V' })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { ledger_account: '1930' }, error: null })
+    mockCreateJournalEntry.mockResolvedValue(je)
+    enqueue({ data: [{ id: 'tx-1' }], error: null })
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: { ...validBody, voucher_series: 'V' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(mockCreateJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({ voucher_series: 'V' }),
+    )
+    // No cash_accounts series lookup: the explicit pick short-circuits it.
+    const seriesLookups = findCalls('cash_accounts', 'select').filter((args) => args[0] === 'voucher_series')
+    expect(seriesLookups).toHaveLength(0)
+  })
+
+  it('rejects a malformed voucher_series with 400', async () => {
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: { ...validBody, voucher_series: 'ab' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    expect(response.status).toBe(400)
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 TX_CATEGORIZE_ORPHANED_COUNTER_ACCOUNT when a line books the settlement row against its active twin (#1643)', async () => {
+    // The issue's dialog shape: 1930 and 1931 both enabled on one active
+    // connection; "Ändra rader" pre-filled 1930 debit / 1931 credit from a
+    // template learned on 1931. Booking it would move money between two
+    // ledgers of one physical account with nothing reaching the P&L.
+    const iban = 'SE4550000000058398257466'
+    const tx = makeTransaction({ id: 'tx-1', amount: 500, journal_entry_id: null, cash_account_id: 'ca-1930' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    enqueue({
+      data: [
+        { id: 'ca-1930', ledger_account: '1930', iban, currency: 'SEK', enabled: true, bank_connection_id: 'conn-live' },
+        { id: 'ca-1931', ledger_account: '1931', iban, currency: 'SEK', enabled: true, bank_connection_id: 'conn-live' },
+      ],
+    }) // cash_accounts topology
+    enqueue({ data: [{ id: 'conn-live', status: 'active' }] }) // bank_connections statuses
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: {
+        ...validBody,
+        lines: [
+          { account_number: '1930', debit_amount: 500, credit_amount: 0 },
+          { account_number: '1931', debit_amount: 0, credit_amount: 500 },
+        ],
+      },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string; details: { accountNumber: string } } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('TX_CATEGORIZE_ORPHANED_COUNTER_ACCOUNT')
+    expect(body.error.details.accountNumber).toBe('1931')
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('re-points a stranded row onto the live sibling when its single bank line is that ledger (#1643 round 4)', async () => {
+    // Nyte-shape: the transaction sits on the demoted 1931, the user books it
+    // with the bank leg on the live 1940 against a P&L account. The voucher
+    // posts on 1940 and the row moves there in the same locked UPDATE, so
+    // neither ledger's reconciliation is left with a half.
+    const iban = 'SE4550000000058398257466'
+    const tx = makeTransaction({ id: 'tx-1', amount: 500, journal_entry_id: null, cash_account_id: 'ca-orphan' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    enqueue({ data: { ledger_account: '1931' } }) // own row
+    enqueue({
+      data: [
+        { id: 'ca-orphan', ledger_account: '1931', iban, currency: 'SEK', enabled: true, bank_connection_id: null },
+        { id: 'ca-live', ledger_account: '1940', iban, currency: 'SEK', enabled: true, bank_connection_id: 'conn-live' },
+      ],
+    }) // cash_accounts topology
+    enqueue({ data: [{ id: 'conn-live', status: 'active' }] }) // bank_connections statuses
+    enqueue({ data: { voucher_series: 'M' } }) // series override of the LIVE twin the row moves to
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // link update
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: {
+        ...validBody,
+        lines: [
+          { account_number: '1940', debit_amount: 500, credit_amount: 0 },
+          { account_number: '8311', debit_amount: 0, credit_amount: 500 },
+        ],
+      },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+
+    expect(response.status).toBe(200)
+    expect(mockCreateJournalEntry).toHaveBeenCalledTimes(1)
+    expect(findCalls('transactions', 'update')).toContainEqual([
+      expect.objectContaining({ journal_entry_id: 'je-new', cash_account_id: 'ca-live' }),
+    ])
+    // The series follows the account the row ends up on, not the stale one.
+    expect(findCalls('cash_accounts', 'eq')).toContainEqual(['id', 'ca-live'])
+    expect(mockCreateJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({ voucher_series: 'M' }),
+    )
+  })
+
+  it('returns 400 TX_CATEGORIZE_ORPHANED_COUNTER_ACCOUNT when the single bank line sits on a dead twin of the live own row (#1643 round 5)', async () => {
+    // Problem 4: the transaction sits on the live 1940, the dialog pre-fills
+    // [1931, 3011] from a template learned before the reconnect, and 1931 is
+    // the revoked twin. Posting would strand the only bank leg on 1931 while
+    // the transaction stays on 1940, so it is refused before the engine runs.
+    const iban = 'SE4550000000058398257466'
+    const tx = makeTransaction({ id: 'tx-1', amount: 500, journal_entry_id: null, cash_account_id: 'ca-live' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    enqueue({ data: { ledger_account: '1940' } }) // own row
+    enqueue({
+      data: [
+        { id: 'ca-live', ledger_account: '1940', iban, currency: 'SEK', enabled: true, bank_connection_id: 'conn-live' },
+        { id: 'ca-orphan', ledger_account: '1931', iban, currency: 'SEK', enabled: true, bank_connection_id: 'conn-old' },
+      ],
+    }) // cash_accounts topology
+    enqueue({
+      data: [
+        { id: 'conn-live', status: 'active' },
+        { id: 'conn-old', status: 'revoked' },
+      ],
+    }) // bank_connections statuses
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: {
+        ...validBody,
+        lines: [
+          { account_number: '1931', debit_amount: 500, credit_amount: 0 },
+          { account_number: '3011', debit_amount: 0, credit_amount: 500 },
+        ],
+      },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string; details: { accountNumber: string } } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('TX_CATEGORIZE_ORPHANED_COUNTER_ACCOUNT')
+    expect(body.error.details.accountNumber).toBe('1931')
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('atomically unignores an ignored transaction when booking it', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      journal_entry_id: null,
+      is_ignored: true,
+    })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+    enqueue({ data: [{ id: 'tx-1' }], error: null })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(findCalls('transactions', 'update')).toContainEqual([
+      expect.objectContaining({
+        journal_entry_id: 'je-new',
+        is_business: true,
+        is_ignored: false,
+      }),
+    ])
+  })
+
   it('returns 500 when transaction update fails', async () => {
     const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
     const je = makeJournalEntry({ id: 'je-new' })
@@ -245,10 +478,151 @@ describe('POST /api/transactions/[id]/book', () => {
       body: validBody,
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; message: string }
+    }>(response)
 
     expect(status).toBe(500)
-    expect(body.error).toBe('Failed to update transaction')
+    expect(body.error).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      message: 'Ett oväntat serverfel uppstod. Försök igen senare.',
+    })
+    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      'je-new',
+      expect.any(String),
+    )
+  })
+
+  it('stornos the posted orphan when another booking wins the transaction-link race', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    const je = makeJournalEntry({ id: 'je-new' })
+
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(je)
+    enqueue({ data: [], error: null })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
+    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      'je-new',
+      expect.any(String),
+    )
+  })
+
+  it('maps the ignored-row constraint to a typed conflict and stornos the posted orphan', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null, is_ignored: true })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+    enqueue({
+      data: null,
+      error: {
+        code: '23514',
+        message:
+          'new row for relation "transactions" violates check constraint "transactions_is_ignored_no_journal_entry"',
+      },
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{ error: { code: string; message: string } }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('TX_CATEGORIZE_IGNORED_CONFLICT')
+    expect(body.error.message).not.toContain('check constraint')
+    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledTimes(1)
+  })
+
+  // ── Underlag propagation (pinned document + matched inbox items) ──────
+  // Attach-before-book: a document pinned to the transaction (or an inbox
+  // item hand-matched to it) must land on the new verifikat, or every
+  // underlag surface reads "Underlag saknas" for a booking that HAS its
+  // underlag (the 2026-08-13 user report).
+
+  it('anchors the pinned document to the new verifikat (attach-before-book)', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
+    const je = makeJournalEntry({ id: 'je-new' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    mockCreateJournalEntry.mockResolvedValue(je)
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // update transaction
+    enqueue({ data: { document_id: 'doc-1' } }) // propagate: tx pin lookup
+    enqueue({ data: { journal_entry_id: null } }) // pinned doc unanchored
+    enqueue({ data: { id: 'je-new' } }) // linkToJournalEntry: entry ownership check
+    enqueue({ data: { id: 'doc-1', journal_entry_id: 'je-new' } }) // doc update
+    enqueue({ data: [] }) // no matched inbox items
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: validBody,
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(findCalls('document_attachments', 'update')).toContainEqual([
+      { journal_entry_id: 'je-new', journal_entry_line_id: null },
+    ])
+  })
+
+  it('stamps a matched inbox item consumed by the booking', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
+    const je = makeJournalEntry({ id: 'je-new' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    mockCreateJournalEntry.mockResolvedValue(je)
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // update transaction
+    enqueue({ data: { document_id: null } }) // propagate: nothing pinned
+    enqueue({ data: [{ id: 'i1', document_id: null }] }) // matched inbox item
+    enqueue({ data: null }) // stamp update
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: validBody,
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(findCalls('invoice_inbox_items', 'update')).toContainEqual([
+      { created_journal_entry_id: 'je-new' },
+    ])
+  })
+
+  it('still returns success when underlag propagation fails (best-effort)', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
+    const je = makeJournalEntry({ id: 'je-new' })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    mockCreateJournalEntry.mockResolvedValue(je)
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // update transaction
+    enqueue({ data: { document_id: 'doc-1' } }) // propagate: tx pin lookup
+    enqueue({ data: { journal_entry_id: null } }) // pinned doc unanchored
+    enqueue({ data: null }) // linkToJournalEntry: entry lookup fails -> throws
+    enqueue({ data: [] }) // no matched inbox items
+
+    const request = createMockRequest('/api/transactions/tx-1/book', {
+      method: 'POST',
+      body: validBody,
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ success: boolean }>(response)
+
+    // The verifikat is already posted: a propagation failure is logged and
+    // repaired by re-running, never allowed to fail the booking.
+    expect(status).toBe(200)
+    expect(body.success).toBe(true)
+    expect(findCalls('document_attachments', 'update')).toEqual([])
   })
 
   // ── Booking-time duplicate guard ──────────────────────────────────────
@@ -285,7 +659,7 @@ describe('POST /api/transactions/[id]/book', () => {
     const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
     const je = makeJournalEntry({ id: 'je-new' })
     enqueue({ data: tx, error: null }) // fetch
-    enqueue({ data: null, error: null }) // update
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // update
     mockDetectDup.mockResolvedValue({
       transaction_id: SIBLING_UUID,
       journal_entry_id: 'je-existing',
@@ -352,7 +726,7 @@ describe('POST /api/transactions/[id]/book', () => {
     const tx = makeTransaction({ id: 'tx-1', amount: 98565, journal_entry_id: null })
     const je = makeJournalEntry({ id: 'je-new' })
     enqueue({ data: tx, error: null }) // fetch
-    enqueue({ data: null, error: null }) // update
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // update
     mockDetectDup.mockResolvedValue({
       transaction_id: null,
       journal_entry_id: VOUCHER_JE_UUID,

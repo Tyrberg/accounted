@@ -39,7 +39,7 @@ Systemdokumentationen ska förvaras tillsammans med övrig räkenskapsinformatio
 
 *Vid egen drift: ange var databasen driftas och vem som ansvarar för drift och säkerhetskopiering.*
 
-## 3. Kontoplan
+## 3. Kontoplan (BFNAR 2013:2 punkt 9.2 a, 9.3)
 
 3.1. Kontoplanen bygger på BAS-kontoplanen (BAS 2026) utgiven av BAS-intressenternas Förening.
 
@@ -58,7 +58,7 @@ Systemdokumentationen ska förvaras tillsammans med övrig räkenskapsinformatio
 3.4. Företagsspecifika anpassningar av kontoplanen:
 [BESKRIV EVENTUELLA TILLAGDA ELLER BORTTAGNA KONTON, t.ex. "Konto 4010 Inköp varor, 5010 Lokalhyra har lagts till. Inga standardkonton har tagits bort."]
 
-## 4. Samlingsplan
+## 4. Samlingsplan (BFNAR 2013:2 punkt 9.2 c, 9.4, 9.11)
 
 Samlingsplanen beskriver hur bokföringen är organiserad i form av delsystem, grundbokföring och huvudbokföring.
 
@@ -116,7 +116,7 @@ Följande delsystem matar journalen:
 | Banktransaktioner | Synkroniserade via PSD2 (Enable Banking) eller importerade bankfiler | Kontering via kategoriseringsregler och konteringsmallar |
 | Kvitto- och underlagshantering | Uppladdade eller inmejlade underlag, maskinellt avlästa | Kontering efter granskning |
 | Kreditnotor | Kreditering av utgående och inkommande fakturor | Omvänd kontering av originalfaktura |
-| Löner | Lönekörningar, arbetsgivardeklaration (AGI) | Debet 7xxx + 7510, kredit 2710/2730/1930 |
+| Löner | Lönekörningar, arbetsgivardeklaration (AGI) | Debet 7xxx + 7510, kredit 2710/2731/1930 |
 | Anläggningstillgångar | Anläggningsregister med årliga avskrivningar | Debet 78xx, kredit 12xx |
 | Periodiseringar | Periodiseringsscheman över flera perioder | Debet/kredit 17xx respektive 29xx |
 
@@ -132,7 +132,7 @@ Bankkonto 1930 avstäms via bankavstämningsmodulen (flerstegs matchning: exakt 
 
 ## 5. Verifikationer
 
-### 5.1 Verifikationsnumrering
+### 5.1 Verifikationsnumrering (BFNAR 2013:2 punkt 9.6)
 
 Verifikationsnummer tilldelas sekventiellt av systemet vid bokföring. Numreringen är unik per företag, räkenskapsår och verifikationsserie. Numren tilldelas via en databasfunktion som är säker vid samtidiga anrop och kan inte sättas manuellt.
 
@@ -214,7 +214,7 @@ Dokument som är kopplade till bokförda verifikationer kan inte raderas, efters
 8.4. Redovisningsmetod: [ ] Faktureringsmetod  [ ] Kontantmetod
 Momsperiod: [ ] Månad  [ ] Kvartal  [ ] Helår
 
-## 9. Behandlingshistorik
+## 9. Behandlingshistorik (BFL 5 kap. 11 §, BFNAR 2013:2 punkt 9.15-9.16)
 
 9.1. Systemet registrerar automatiskt en behandlingshistorik som inkluderar:
 - Registreringsdatum och tidpunkt för varje journalpost
@@ -227,7 +227,7 @@ Momsperiod: [ ] Månad  [ ] Kvartal  [ ] Helår
 
 9.2. Behandlingshistoriken genereras automatiskt av systemet och kan inte ändras av användaren.
 
-9.3. Behandlingshistoriken exporteras under **Importera/Exportera > Exportera > Säkerhetsbackup**. Exporten är en ZIP-fil som innehåller `revision/behandlingshistorik.json` (alla ändringar) och `revision/systemdokumentation.json` (kontoplan, verifikationsserier, arkiveringsprinciper), utöver SIE-filer, rapporter och underlag.
+9.3. Behandlingshistoriken tas fram under **Rapporter > Behandlingshistorik** per räkenskapsår eller datumintervall och kan laddas ner som PDF, CSV eller Excel. Rapporten visar registreringstidpunkt, utförare och detaljer för varje bokföringspost samt ändringar i bokföringssystemet (kontoplan, inställningar, räkenskapsår, importer, åtkomst) och anger programversionen. Behandlingshistoriken ingår även i säkerhetsbackupen under **Importera/Exportera > Exportera > Säkerhetsbackup**: ZIP-filen innehåller `revision/behandlingshistorik.json` (alla ändringar) och `revision/systemdokumentation.json` (kontoplan, verifikationsserier, arkiveringsprinciper, programversion), utöver SIE-filer, rapporter och underlag.
 
 ## 10. Import och export
 
@@ -252,12 +252,14 @@ Momsperiod: [ ] Månad  [ ] Kvartal  [ ] Helår
 |---|---|---|
 | Enable Banking (PSD2) | Bankkontosynkronisering | Bank -> Accounted (läsning av transaktioner och saldon) |
 | Skatteverket | Momsdeklaration, arbetsgivardeklaration (AGI), skattekonto | Accounted -> Skatteverket (inlämning signeras med BankID) |
-| Anthropic (Claude) | Maskinell kategorisering av transaktioner och avläsning av underlag | Accounted -> Anthropic -> Accounted (transaktions- och dokumentdata skickas, förslag returneras) |
+| Amazon Bedrock (AWS) | Maskinell kategorisering av transaktioner och avläsning av underlag. Modellerna som används är Anthropics Claude-modeller, körda inom Bedrock (eu-north-1, Stockholm) | Accounted -> Amazon Bedrock -> Accounted (transaktions- och dokumentdata skickas, förslag returneras; datan lämnar inte EU) |
 | Resend | E-postutskick | Accounted -> Resend -> mottagare (fakturor, påminnelser) |
 | BankID (via identitetsleverantör) | Inloggning och signering | Accounted -> leverantör -> Accounted |
 | PostHog | Användningsstatistik för tjänsten | Accounted -> PostHog |
 
 [ANGE YTTERLIGARE INTEGRATIONER OM TILLÄMPLIGT, t.ex. import från Fortnox, Visma, Bokio, Björn Lundén eller Briox]
+
+[SJÄLVHOSTAD DRIFT: raden för Amazon Bedrock ovan beskriver den hostade tjänstens standardkonfiguration. Om din installation använder en annan AI-leverantör (t.ex. AI_PROVIDER=anthropic med direkt Anthropic-API, eller en egen endpoint via AI_BASE_URL) gäller inte skrivningen "datan lämnar inte EU" automatiskt; uppdatera raden så att den beskriver din faktiska leverantör, region och ditt faktiska dataflöde]
 
 **Notering om maskinell behandling:** förslag från maskinella hjälpmedel bokförs aldrig automatiskt utan att en användare har granskat och godkänt dem. Godkännandet loggas i behandlingshistoriken.
 
@@ -302,7 +304,7 @@ Momsperiod: [ ] Månad  [ ] Kvartal  [ ] Helår
 
 13.6. Ansvarig för att tilldela och granska behörigheter: [NAMN]
 
-## 14. Säkerhetskopiering och arkivering
+## 14. Säkerhetskopiering och arkivering (BFNAR 2013:2 punkt 8.3, 9.2 d, 9.12)
 
 14.1. Räkenskapsinformationen lagras i EU och bevaras i minst 7 år enligt BFL 7 kap.
 

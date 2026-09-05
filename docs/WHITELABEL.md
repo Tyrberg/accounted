@@ -41,6 +41,7 @@ All branding can be set via env vars. Public ones use `NEXT_PUBLIC_BRANDING_*` (
 | `BRANDING_SECURITY_EMAIL` | `securityEmail` | `security@arcim.io` |
 | `NEXT_PUBLIC_BRANDING_AUTH_EMAIL_FROM` | `authEmailFrom`: From address Supabase Auth sends verification / reset emails from. Used to pre-populate the `from:` query on the "open in Gmail" button after signup. Set to whatever you configured in your Supabase Auth SMTP. | `noreply@gnubok.se` |
 | `NEXT_PUBLIC_APP_URL` | `appUrl` | `https://app.gnubok.se` |
+| `NEXT_PUBLIC_WHITELABEL_DOMAINS` | Exact comma-separated hostnames served by the same hosted deployment. No wildcards. Invite and auth redirects use a listed host and otherwise fall back to `NEXT_PUBLIC_APP_URL`. | `` |
 | `NEXT_PUBLIC_BRANDING_LOGO_PATH` | `logoPath` | `/gnubokiceon-removebg-preview.png` |
 | `NEXT_PUBLIC_BRANDING_FAVICON_PATH` | `faviconPath` | `/favicon.ico` |
 | `NEXT_PUBLIC_BRANDING_APPLE_ICON_PATH` | `appleTouchIconPath` | `/icons/icon-192.png` |
@@ -66,6 +67,18 @@ Resolution order (last wins): **defaults → env vars → extension override**.
 | `RESEND_INBOUND_WEBHOOK_SECRET` | Verifies the `/inbound` webhook signature from Resend |
 | `RESEND_DELIVERY_WEBHOOK_SECRET` | Verifies the `/delivery-status` webhook signature from Resend. Optional: without it, invoice delivery history shows "sent" but never the delivery outcome |
 
+### WhatsApp (when the `whatsapp-inbox` extension is enabled)
+
+| Env var | Purpose |
+|---|---|
+| `WHATSAPP_ACCESS_TOKEN` | Meta system-user permanent token (`whatsapp_business_messaging` scope only) |
+| `WHATSAPP_PHONE_NUMBER_ID` | Graph object id of your WhatsApp Business number |
+| `WHATSAPP_APP_SECRET` | Verifies `X-Hub-Signature-256` on the `/webhook` POST |
+| `WHATSAPP_VERIFY_TOKEN` | Shared secret for the GET subscription handshake (also entered in the Meta app dashboard) |
+| `WHATSAPP_PHONE_HASH_KEY` | Random pepper for phone lookup hashes (`openssl rand -hex 32`) |
+| `WHATSAPP_PHONE_ENCRYPTION_KEY` | 32-byte hex AES-256-GCM key for phone numbers at rest (`openssl rand -hex 32`) |
+| `WHATSAPP_PUBLIC_NUMBER` | Optional: the public number as E.164 digits (e.g. `46766867041`) for the wa.me deep link in settings; unset = resolved from the Graph API |
+
 ## Things you MUST NOT change
 
 These are stable contracts. Renaming them breaks existing data, sessions, or external clients (npm package consumers, MCP connectors, browser sessions, invite links). Leave them alone in your fork:
@@ -87,10 +100,30 @@ A few things that look brand-related but are configured elsewhere:
 - **Supabase auth emails** (password reset, magic link): set in the Supabase dashboard for your project, not in code.
 - **Resend sending domain**: verify `noreply@your-brand.se` (or wherever) in Resend, set `RESEND_FROM_EMAIL`.
 - **DNS / domain**: point `app.your-brand.se` at your Vercel deployment.
-- **OAuth redirect allowlist for MCP**: `app/api/mcp-oauth/authorize/route.ts` lists `claude.ai/api/*`, `claude.com/api/*`, and localhost. Your domain is the OAuth issuer, not a redirect target: no change needed unless you're integrating with new MCP clients.
+- **OAuth redirect allowlist for MCP**: `lib/auth/oauth-allowlist.ts` has built-in entries for Claude (`claude.ai/api/*`, `claude.com/api/*`), ChatGPT, Grok, Cursor and localhost; anything else is registered per user under Settings > API & MCP > OAuth clients. Your domain is the OAuth issuer, not a redirect target: no change needed unless you're integrating with new MCP clients.
 - **iCal feed PRODID** (`lib/calendar/ics-generator.ts`): defaults to `erp-base.se`, callers may pass their domain.
-- **`NEXT_PUBLIC_APP_URL`**: used as the OAuth issuer. Set this to your domain (e.g. `https://app.your-brand.se`).
+- **`NEXT_PUBLIC_APP_URL`**: used as the OAuth issuer and safe auth-link fallback. For a dedicated one-brand deployment, set this to your domain (e.g. `https://app.your-brand.se`). For a shared hosted deployment, keep the canonical main app URL here and register additional hosts through `NEXT_PUBLIC_WHITELABEL_DOMAINS`.
 - **Skatteverket submission identity**: `extensions/general/skatteverket/lib/api-client.ts` does not set a custom `User-Agent`; submissions go out with the Node/Vercel runtime default. If your deployment needs to identify itself to Skatteverket under a different brand, that's a future enhancement (env var + header), not something the current branding service covers.
+
+## Shared hosted deployment with custom domains
+
+Use this checklist when several white-label domains point at one hosted Accounted deployment:
+
+Accounted's hosted product serves its customers from the `accounted.se` zone: `app.accounted.se` plus one `<brand>.accounted.se` host per white-label byra. Every one of those hosts must be served by the production Supabase project `pwxtzglxptnnvjrpixpg`. The request proxy asserts that pairing instead of enumerating the hosts to protect: when the build answering a customer-facing production host is wired to any other backend (the staging project, a third project, or a URL it cannot parse), it emits an alerting structured error and returns an empty, non-cacheable `503` before session handling. The event records only the hostname and the `non_production` classification, never the configured backend URL or credentials.
+
+Because the rule is stated as "this namespace belongs to the production project", a newly launched `<brand>.accounted.se` host is protected as soon as it resolves. There is no list to remember to update. The first version of the guard did the opposite: it enumerated seven approved hostnames, and on 2026-08-26 it failed open on `improveone.accounted.se`, a customer host nobody had added, which a feature-branch preview served from the staging project for hours. Vercel preview domains (`*.vercel.app`) and local development names stay out of scope. A host inside the namespace that is deliberately not production has to be excluded explicitly in `lib/domains/production-white-label-backend.ts`, in the same change that creates it.
+
+Two kinds of host are not derivable from the namespace, so they are still classified by hand in `CUSTOMER_PRODUCTION_WHITE_LABEL_HOSTS` (`lib/domains/production-white-label-backend.ts`): Accounted's legacy canonical host `app.gnubok.se`, and a customer that brings its own domain (step 1 below). Add those as part of the same reviewed rollout. The set also still lists the `accounted.se` hosts the namespace rule already covers: there they are a checked-in inventory the tests pin host by host, not what makes those hosts protected. Do not derive the set from `NEXT_PUBLIC_WHITELABEL_DOMAINS`: that variable is an auth callback allowlist, not an authoritative production inventory, and it can also contain demo, pilot, or self-hosted domains.
+
+The guard contains a misrouted deployment. It does not classify domains outside the hosted namespace, prove cross-tenant isolation, or replace the operational work of placing customer environments under production ownership and controls. Its `alert: true` flag also pages nobody on its own: middleware never registers the observability sink, so the alerting rule is configured on the hosting side and matches `operation=white_label_backend_guard` in the emitted log line.
+
+1. Register the exact custom hostname on the hosting deployment and finish its DNS verification.
+2. Add that hostname to the comma-separated `NEXT_PUBLIC_WHITELABEL_DOMAINS` value. Entries are exact hostnames such as `portal.partner.se`; wildcard entries are ignored.
+3. Add `https://portal.partner.se/auth/callback` and `https://portal.partner.se/invite/*` to the Supabase Auth Redirect URLs allowlist. Keep the canonical `NEXT_PUBLIC_APP_URL` callback there too.
+4. Redeploy after changing the environment variable. It is public build-time configuration because the browser must validate password-reset callbacks before calling GoTrue.
+5. Test a new-user invitation, an existing-user invitation, and a password reset from the custom domain.
+
+The request `Host` header and `window.location.origin` are inputs, not trust anchors. Accounted uses them only when the hostname exactly matches the canonical app host or a configured white-label hostname. Unknown or spoofed hosts fall back to `NEXT_PUBLIC_APP_URL`, so they cannot become invite links or GoTrue redirect targets.
 
 ## Staying in sync with upstream
 

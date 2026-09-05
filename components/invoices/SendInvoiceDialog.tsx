@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
+import { useAccounts, useCompanySettings, useFiscalPeriods } from '@/lib/reference-data/hooks'
 import { useLocale, useTranslations } from 'next-intl'
 import {
   Dialog,
@@ -12,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { HelpPopover } from '@/components/ui/help-popover'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/components/ui/use-toast'
@@ -28,7 +30,8 @@ import { creditNoteNeedsJournalEntry } from '@/lib/invoices/issue-credit-note'
 import { itemHasAccrual } from '@/lib/bookkeeping/accruals/account-suggestions'
 import { Loader2, Mail, Plus, Send, Trash2 } from 'lucide-react'
 import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
-import type { Invoice, InvoiceItem, Customer, EntityType, BASAccount } from '@/types'
+import type { EntityType } from '@/types'
+import type { InvoiceWithRelations } from '@/components/invoices/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
 import {
@@ -38,11 +41,6 @@ import {
   parseInvoiceRecipientText,
   resolveInvoiceEmailRecipients,
 } from '@/lib/invoices/email-recipients'
-
-interface InvoiceWithRelations extends Invoice {
-  customer: Customer
-  items: InvoiceItem[]
-}
 
 interface SendInvoiceDialogProps {
   open: boolean
@@ -71,12 +69,39 @@ export default function SendInvoiceDialog({
   const isCreditRepair = isCreditNote && invoice.status === 'sent'
 
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [entityType, setEntityType] = useState<EntityType>('enskild_firma')
-  const [periodName, setPeriodName] = useState('')
+  // Session-cached reference data (lib/reference-data), seeded by the
+  // dashboard layout: settings, the period containing the invoice date and
+  // the chart are known on the first paint, so opening the dialog costs no
+  // reference requests. Only the credit-note original lookup and the BAS
+  // catalogue (module-cached) are still loaded in init().
+  const {
+    settings: companySettings,
+    isLoading: settingsLoading,
+    error: settingsError,
+  } = useCompanySettings()
+  const {
+    periods: fiscalPeriods,
+    isLoading: periodsLoading,
+    error: periodsError,
+  } = useFiscalPeriods()
+  const { accounts } = useAccounts()
+  // /api/settings used to fall back to the company row's entity type when
+  // company_settings.entity_type is null; the cached row does not, so the
+  // fallback is explicit here (same rule as deriveSupplierInvoiceDefaults).
+  const entityType: EntityType =
+    (companySettings?.entity_type as EntityType | null | undefined) ??
+    company?.entity_type ??
+    'enskild_firma'
+  const periodName = useMemo(
+    () =>
+      fiscalPeriods.find(
+        (p) => p.period_start <= invoice.invoice_date && invoice.invoice_date <= p.period_end,
+      )?.name ?? '',
+    [fiscalPeriods, invoice.invoice_date],
+  )
+  const deferBooking = !!companySettings?.defer_invoice_booking
   const [isInitialized, setIsInitialized] = useState(false)
   const [shouldBookOnIssue, setShouldBookOnIssue] = useState(true)
-  const [deferBooking, setDeferBooking] = useState(false)
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
   const [catalog, setCatalog] = useState<CatalogAccount[]>([])
   const [editLines, setEditLines] = useState<FormLine[]>([])
   const [hasEdited, setHasEdited] = useState(false)
@@ -109,25 +134,19 @@ export default function SendInvoiceDialog({
       return
     }
 
+    // Reference data still loading (no seed, first mount of the session):
+    // the effect re-runs once it lands.
+    if (settingsLoading || periodsLoading) return
+
     let cancelled = false
 
     async function init() {
       try {
         if (!company?.id) throw new Error(t('no_active_company'))
+        if (settingsError) throw new Error(t('company_settings_failed'))
+        if (periodsError) throw new Error(t('fiscal_period_failed'))
 
-        const [settingsResult, periodResult, originalResult, authResult] = await Promise.all([
-          supabase
-            .from('company_settings')
-            .select('accounting_method, entity_type, defer_invoice_booking, email, invoice_email_cc_addresses, invoice_email_bcc_addresses')
-            .eq('company_id', company.id)
-            .maybeSingle(),
-          supabase
-            .from('fiscal_periods')
-            .select('name')
-            .eq('company_id', company.id)
-            .lte('period_start', invoice.invoice_date)
-            .gte('period_end', invoice.invoice_date)
-            .maybeSingle(),
+        const [originalResult, sessionResult] = await Promise.all([
           invoice.credited_invoice_id
             ? supabase
                 .from('invoices')
@@ -136,55 +155,40 @@ export default function SendInvoiceDialog({
                 .eq('company_id', company.id)
                 .maybeSingle()
             : Promise.resolve({ data: null, error: null }),
-          supabase.auth.getUser(),
+          // Local session read (no network): only the signed-in address is
+          // needed, as the legacy CC fallback.
+          supabase.auth.getSession(),
         ])
 
-        if (settingsResult.error) throw new Error(t('company_settings_failed'))
-        if (periodResult.error) throw new Error(t('fiscal_period_failed'))
         if (originalResult.error) throw new Error(t('original_invoice_failed'))
-        if (authResult.error || !authResult.data.user) throw new Error(t('load_failed_title'))
+        const sessionUser = sessionResult.data.session?.user
+        if (sessionResult.error || !sessionUser) throw new Error(t('load_failed_title'))
 
         if (cancelled) return
 
-        const method = (settingsResult.data?.accounting_method || 'accrual') as 'accrual' | 'cash'
+        const method = (companySettings?.accounting_method || 'accrual') as 'accrual' | 'cash'
         // #967: deferred companies mark-sent WITHOUT booking; ekonomi books
         // later via a separate step, so neither preview nor editor applies.
         const bookOnIssue = invoice.credited_invoice_id && originalResult.data
           ? creditNoteNeedsJournalEntry(method, originalResult.data)
-          : method === 'accrual' && !settingsResult.data?.defer_invoice_booking
+          : method === 'accrual' && !companySettings?.defer_invoice_booking
 
-        // Line editing needs the chart of accounts; only the accrual
-        // book-at-issue path renders the editor, so skip the fetch elsewhere.
-        let fetchedAccounts: BASAccount[] = []
+        // Line editing needs the BAS catalogue; only the accrual
+        // book-at-issue path renders the editor, so skip the load elsewhere.
         let fetchedCatalog: CatalogAccount[] = []
         if (!invoice.credited_invoice_id && bookOnIssue && !hasAccrualItems) {
-          const [accountsRes, catalogResult] = await Promise.all([
-            fetch('/api/bookkeeping/accounts'),
-            loadBasCatalog(),
-          ])
-          if (!accountsRes.ok) throw new Error(t('load_chart_failed'))
-          const accountsData = await accountsRes.json()
-          fetchedAccounts = accountsData.data || []
-          fetchedCatalog = catalogResult
+          fetchedCatalog = await loadBasCatalog()
         }
 
         if (cancelled) return
 
-        setAccounts(fetchedAccounts)
         setCatalog(fetchedCatalog)
-        setEntityType((settingsResult.data?.entity_type as EntityType) || 'enskild_firma')
-        const legacyCc = settingsResult.data?.email || authResult.data.user.email
+        const legacyCc = companySettings?.email || sessionUser.email
         setFixedCc(
-          settingsResult.data?.invoice_email_cc_addresses
+          companySettings?.invoice_email_cc_addresses
           ?? (legacyCc ? [legacyCc] : []),
         )
-        setFixedBcc(
-          canCustomizeRecipients
-            ? settingsResult.data?.invoice_email_bcc_addresses ?? []
-            : [],
-        )
-        setPeriodName(periodResult.data?.name || '')
-        setDeferBooking(!!settingsResult.data?.defer_invoice_booking)
+        setFixedBcc(companySettings?.invoice_email_bcc_addresses ?? [])
         setShouldBookOnIssue(bookOnIssue)
         setIsInitialized(true)
       } catch (err) {
@@ -200,7 +204,10 @@ export default function SendInvoiceDialog({
 
     init()
     return () => { cancelled = true }
-  }, [open, invoice.id, invoice.invoice_date, company?.id, canCustomizeRecipients])
+  // companySettings is read at init time on purpose: a background
+  // revalidation of the settings row must not re-run init() mid-dialog.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, invoice.id, invoice.invoice_date, company?.id, canCustomizeRecipients, settingsLoading, periodsLoading, settingsError, periodsError])
 
   const proposedLines = useMemo(() => {
     if (!isInitialized || !shouldBookOnIssue) return []
@@ -235,10 +242,19 @@ export default function SendInvoiceDialog({
   )
   const invalidAdditionalRecipient = [...additionalCc, ...additionalBcc]
     .find((address) => !EMAIL_PATTERN.test(address))
+  const fixedRecipients = resolveInvoiceEmailRecipients({
+    to: invoice.customer.email ?? '',
+    configuredCc: fixedCc,
+    configuredBcc: fixedBcc,
+    customerCc: invoice.customer.invoice_email_cc_addresses,
+    customerBcc: invoice.customer.invoice_email_bcc_addresses,
+  })
   const resolvedRecipients = resolveInvoiceEmailRecipients({
     to: invoice.customer.email ?? '',
     configuredCc: fixedCc,
     configuredBcc: fixedBcc,
+    customerCc: invoice.customer.invoice_email_cc_addresses,
+    customerBcc: invoice.customer.invoice_email_bcc_addresses,
     additionalCc,
     additionalBcc,
   })
@@ -450,9 +466,13 @@ export default function SendInvoiceDialog({
                     ? 'title_email'
                     : 'title_manual',
             )}
-            {invoice.invoice_number ? t('title_suffix', { number: invoice.invoice_number }) : ''}
+            {/* data-ph-mask: the invoice number is user data */}
+            {invoice.invoice_number ? (
+              <span data-ph-mask="">{t('title_suffix', { number: invoice.invoice_number })}</span>
+            ) : ''}
           </DialogTitle>
-          <DialogDescription>
+          {/* data-ph-mask: amount and customer email are user data */}
+          <DialogDescription data-ph-mask="">
             {formatCurrency(invoice.total, invoice.currency)}
             {invoice.currency !== 'SEK' && invoice.total_sek && (
               <>{t('description_sek_suffix', { amount: formatCurrency(invoice.total_sek) })}</>
@@ -488,18 +508,29 @@ export default function SendInvoiceDialog({
             {mode === 'email' && (
               <div className="space-y-3 rounded-lg border border-border p-3">
                 <div className="space-y-1 text-sm">
-                  <p>
-                    <span className="font-medium">{t('recipient_to_label')}:</span>{' '}
-                    {invoice.customer.email}
-                  </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p>
+                      <span className="font-medium">{t('recipient_to_label')}:</span>{' '}
+                      {invoice.customer.email}
+                    </p>
+                    {/* Convention 7: the why of fixed CC/BCC and the extra
+                        address rules live behind the "?": only the actual
+                        addresses stay inline. */}
+                    <HelpPopover>
+                      <p>{t('recipient_help_fixed')}</p>
+                      {canCustomizeRecipients && (
+                        <p className="mt-2">{t('recipient_help_additional')}</p>
+                      )}
+                    </HelpPopover>
+                  </div>
                   <p className="text-muted-foreground">
                     <span className="font-medium text-foreground">{t('recipient_fixed_cc_label')}:</span>{' '}
-                    {fixedCc.length > 0 ? fixedCc.join(', ') : t('recipient_none')}
+                    {fixedRecipients.cc.length > 0 ? fixedRecipients.cc.join(', ') : t('recipient_none')}
                   </p>
                   {canCustomizeRecipients && (
                     <p className="text-muted-foreground">
                       <span className="font-medium text-foreground">{t('recipient_fixed_bcc_label')}:</span>{' '}
-                      {fixedBcc.length > 0 ? fixedBcc.join(', ') : t('recipient_none')}
+                      {fixedRecipients.bcc.length > 0 ? fixedRecipients.bcc.join(', ') : t('recipient_none')}
                     </p>
                   )}
                 </div>
@@ -527,7 +558,6 @@ export default function SendInvoiceDialog({
                         />
                       </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">{t('recipient_additional_hint')}</p>
                     {recipientError && (
                       <p className="text-sm text-destructive" role="alert">{recipientError}</p>
                     )}

@@ -3,8 +3,10 @@ import { NextResponse } from 'next/server'
 import {
   ACCOUNT_RUTA,
   resolvePeriodDates,
+  VAT_ACCOUNTS,
+  VAT_SETTLEMENT_NET_ACCOUNTS,
 } from '@/lib/reports/vat-declaration'
-import { fetchDynamicRuta05Accounts } from '@/lib/reports/vat-revenue-accounts'
+import { fetchDynamicVatAccounts } from '@/lib/reports/vat-revenue-accounts'
 import type { ReportSourceLine } from '@/lib/reports/source-lines'
 import type { VatDeclarationRutor, VatPeriodType } from '@/types'
 
@@ -40,17 +42,18 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     rutaParam.startsWith('ruta') ? rutaParam : `ruta${rutaParam}`
   ) as keyof VatDeclarationRutor
 
-  // Invert ACCOUNT_RUTA: which BAS accounts feed this ruta?
+  const dynamicVatAccounts = await fetchDynamicVatAccounts(supabase, companyId)
+
+  // Invert the effective mapping. Explicit account treatments replace the
+  // fixed BAS mapping and can move a standard account to another ruta.
   const accountsForRuta = Object.entries(ACCOUNT_RUTA)
-    .filter(([, m]) => m.box === rutaKey)
+    .filter(([account, m]) =>
+      m.box === rutaKey && !dynamicVatAccounts.explicitAccounts.has(account)
+    )
     .map(([acc]) => acc)
 
-  // Ruta 05 also collects the company's own momspliktiga intäktskonton, which
-  // ACCOUNT_RUTA cannot know about (#1261). Without them the drill-down would
-  // list a smaller sum than the figure it drills into.
-  if (rutaKey === 'ruta05') {
-    const { accounts } = await fetchDynamicRuta05Accounts(supabase, companyId)
-    accountsForRuta.push(...accounts)
+  for (const [account, mapping] of dynamicVatAccounts.mappingByAccount) {
+    if (mapping.box === rutaKey) accountsForRuta.push(account)
   }
 
   if (accountsForRuta.length === 0) {
@@ -150,6 +153,13 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     p_start: start,
     p_end: end,
     p_accounts: accountsForRuta,
+    // Settlement-shape detectors, passed exactly as fetchVatAccountTotals
+    // passes them to get_vat_declaration_totals. The drill-down must drop the
+    // same entries the figure drops (posted closing entries, vat_settlement,
+    // the kontantmetod year-end reversals, and anything shaped like a
+    // momsredovisning), or it lists verifikat that are not in the number.
+    p_ruta_accounts: VAT_ACCOUNTS,
+    p_net_accounts: VAT_SETTLEMENT_NET_ACCOUNTS,
     p_cursor_date: cursorDate,
     p_cursor_voucher_number: cursorVoucherNum,
     p_cursor_entry_id: cursorEntryId,

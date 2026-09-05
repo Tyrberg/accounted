@@ -30,7 +30,14 @@ import {
   AGIPayloadTooLargeError,
 } from './xml-generator'
 import type { AGIEmployeeData, AGICompanyData, AGITotals } from './xml-generator'
+import { agiReportingPeriod, formatAgiPeriodDashed } from './reporting-period'
 import { eventBus } from '@/lib/events'
+import { truncateToWholeKronor } from '@/lib/money'
+import {
+  computeDeclaredAvgifterWithOverrides,
+  isFSkattStatus,
+  resolveDeclaredAvgifterParams,
+} from '../declared-avgifter'
 import type { Logger } from '@/lib/logger'
 
 // Strict runtime validation of the joined salary_run_employees row. Without
@@ -128,6 +135,16 @@ function sumLineItemAmounts(
     .reduce((sum, li) => sum + ((li.amount as number) || 0), 0)
 }
 
+// Invariant: F-skatt compensation never contributes to the avgifter
+// aggregates (per-IU basis, FK061-series categories, FK487, HU totals),
+// overrides included. The calculation engine already stores
+// avgifter_basis/avgifter_amount = 0 for these rows; a manual advanced-mode
+// override must not resurrect them, or the filing would claim social charges
+// on pay whose IU simultaneously asserts FK131 (not subject to them).
+function isFSkattRow(sre: SalaryRunEmployeeRow): boolean {
+  return isFSkattStatus(sre.employee?.f_skatt_status)
+}
+
 export async function generateAgiDeclaration(
   args: GenerateAgiDeclarationArgs,
 ): Promise<GenerateAgiDeclarationResult> {
@@ -152,6 +169,10 @@ export async function generateAgiDeclaration(
       details: { current_status: run.status, eligible_statuses: ELIGIBLE_STATUSES },
     }
   }
+
+  // The redovisningsperiod is the PAYOUT month (kontantprincipen), which for
+  // lön i efterskott is the month after run.period_*; see reporting-period.ts.
+  const agiPeriod = agiReportingPeriod(run)
 
   // 2. Company + settings + profile (for contact info).
   const { data: company } = await supabase
@@ -198,8 +219,8 @@ export async function generateAgiDeclaration(
   const companyData: AGICompanyData = {
     orgNumber: (settings?.org_number || company.org_number || '').trim(),
     companyName,
-    periodYear: run.period_year,
-    periodMonth: run.period_month,
+    periodYear: agiPeriod.periodYear,
+    periodMonth: agiPeriod.periodMonth,
     contactName: (profile?.full_name || companyName || '').trim(),
     contactPhone: (settings?.phone || '').trim(),
     contactEmail: (settings?.email || profile?.email || userEmail || '').trim(),
@@ -330,21 +351,25 @@ export async function generateAgiDeclaration(
         )
       }
 
-      const isFSkatt = emp?.f_skatt_status === 'f_skatt'
+      const isFSkatt = isFSkattRow(sre)
       // Honor advanced-mode per-employee overrides set during review.
+      // F-skatt rows ignore avgifter overrides (see isFSkattRow invariant).
       const effectiveTax = sre.tax_withheld_override ?? sre.tax_withheld
-      const effectiveAvgifterBasis = sre.avgifter_basis_override ?? sre.avgifter_basis
+      const effectiveAvgifterBasis = isFSkatt
+        ? 0
+        : sre.avgifter_basis_override ?? sre.avgifter_basis
       return {
         personnummer: emp?.personnummer ?? '',
         specificationNumber: emp?.specification_number ?? 0,
         removed: Boolean(sre.removed_from_agi),
-        grossSalary: sre.gross_salary,
+        grossSalary: isFSkatt ? 0 : sre.gross_salary,
         taxWithheld: effectiveTax,
         avgifterBasis: effectiveAvgifterBasis,
         fSkattPayment: isFSkatt ? sre.gross_salary : undefined,
-        // F-skatt payees: cash goes to FK131 and benefits to the ej-UlagSA
-        // variants (FK132/FK133/FK134/FK137/FK138/FK139). Regular employees
-        // get FK011 + FK012/FK013/FK015/FK018/FK041/FK043.
+        // F-skatt payees: cash goes to FK131 ONLY (grossSalary is zeroed so
+        // FK011 is never emitted for the same payment) and benefits to the
+        // ej-UlagSA variants (FK132/FK133/FK134/FK137/FK138/FK139). Regular
+        // employees get FK011 + FK012/FK013/FK015/FK018/FK041/FK043.
         benefitsExcludedFromSAUnderlag: isFSkatt ? true : undefined,
         benefitCar: benefitCar > 0 ? benefitCar : undefined,
         benefitFuel: benefitFuel > 0 ? benefitFuel : undefined,
@@ -383,36 +408,51 @@ export async function generateAgiDeclaration(
         (e.absenceEvents?.length ?? 0) > 0,
     )
 
-  // 5. Build totals: avgifter by category (with rate-heuristic fallback for legacy runs).
+  // 5. Build totals: whole-krona declared avgifter (öretal bortfaller, SFF
+  // 2011:1261 22 kap. 1 §). Skatteverket does not use the filed FK487 for
+  // the beslut: it recomputes the avgift from the declared per-IU underlag,
+  // per sats on the whole-krona sums (IK587, kontroll B_006), and draws that
+  // amount from the skattekonto. computeDeclaredAvgifter mirrors the
+  // computation, and the category map folds from the same cells so the
+  // breakdown always cross-foots exactly against the total.
   // Removed-from-AGI rows (FK205 borttag) are tombstones: they must not
   // contribute to FK497/FK487/FK499 because the prior submission's amounts
   // remain on file at Skatteverket; the borttag just removes the IU itself.
   const activeEmployees = parsedRows.filter((sre) => !sre.removed_from_agi)
-  const avgifterByCategory: AGITotals['avgifterByCategory'] = {}
-  for (const sre of activeEmployees) {
-    const dbCategory = sre.avgifter_category ?? null
-    const category = dbCategory
-      ? dbCategory === 'reduced_65plus'
-        ? 'reduced65plus'
-        : dbCategory === 'vaxa_stod'
-          ? 'standard'
-          : dbCategory
-      : sre.avgifter_rate <= 0.1022
-        ? 'reduced65plus'
-        : sre.avgifter_rate <= 0.2082
-          ? 'youth'
-          : 'standard'
-    const cat = (avgifterByCategory as Record<string, { basis: number; amount: number }>)[
-      category
-    ] || { basis: 0, amount: 0 }
-    cat.basis += sre.avgifter_basis_override ?? sre.avgifter_basis
-    cat.amount += sre.avgifter_amount_override ?? sre.avgifter_amount
-    ;(avgifterByCategory as Record<string, { basis: number; amount: number }>)[category] = cat
-  }
-  const totalAvgifterAmount = Object.values(avgifterByCategory).reduce(
-    (sum, cat) => sum + (cat?.amount ?? 0),
-    0,
+  // F-skatt rows contribute 0 regardless of overrides (see isFSkattRow).
+  const effectiveBasis = (sre: SalaryRunEmployeeRow): number =>
+    isFSkattRow(sre) ? 0 : (sre.avgifter_basis_override ?? sre.avgifter_basis) || 0
+
+  // One computation for every roster shape (computeDeclaredAvgifterWithOverrides):
+  // rows WITHOUT an avgifter_amount_override run Skatteverket's underlag
+  // computation on the FILED basis (never basis overrides: those don't reach
+  // the IU fields, so Skatteverket computes from the filed underlag
+  // regardless, and letting them steer FK487 or the payment would file an
+  // FK487 contradicting the declaration's own IUs and underpay the
+  // skattekonto). Rows WITH an amount override (FoU-avdrag and other manual
+  // adjustments) contribute their manual amounts per category instead: a
+  // manual adjustment on one employee must not cost the colleagues their
+  // SKV-exact declared amounts. The salary booking's split runs the same
+  // function, so booked 2731 == filed FK487 == stored == paid.
+  const declared = computeDeclaredAvgifterWithOverrides(
+    activeEmployees.map((sre) => {
+      const overridden = !isFSkattRow(sre) && sre.avgifter_amount_override != null
+      return {
+        // Overridden rows report their effective (override-coalesced) basis;
+        // computing rows use the FILED basis.
+        basis: overridden ? effectiveBasis(sre) : isFSkattRow(sre) ? 0 : sre.avgifter_basis || 0,
+        rate: sre.avgifter_rate,
+        category: sre.avgifter_category ?? null,
+        overrideAmount: overridden ? sre.avgifter_amount_override : null,
+      }
+    }),
+    resolveDeclaredAvgifterParams(
+      (run.calculation_params as Record<string, unknown> | null) ?? null,
+    ),
   )
+  const avgifterByCategory = declared.byCategory as AGITotals['avgifterByCategory']
+  const totalAvgifterAmount = declared.totalAmount
+  const totalAvgifterBasis = declared.totalUnderlag
 
   // FK499 sjuklönekostnad: sum of paid sjuklön (days 2-14) across all
   // employees. Day 1 is karens (unpaid); day 15+ is Försäkringskassan.
@@ -439,19 +479,22 @@ export async function generateAgiDeclaration(
   // run.total_tax, which includes removed rows). Same for FK487.
   // Coalesce override → computed so manual jämkning/FoU adjustments flow
   // into the filed declaration.
+  //
+  // AGI amounts are whole kronor (öretal bortfaller, SFF 2011:1261
+  // 22 kap. 1 §). Each IU serialises FK001 truncated, so the HU total must
+  // be the sum of the per-IU truncated values: truncating the öre-exact sum
+  // instead could land 1 kr above what the IUs actually declare.
   const totalTax = activeEmployees.reduce(
-    (sum, sre) => sum + ((sre.tax_withheld_override ?? sre.tax_withheld) || 0),
+    (sum, sre) =>
+      sum + truncateToWholeKronor((sre.tax_withheld_override ?? sre.tax_withheld) || 0),
     0,
   )
 
   const totals: AGITotals = {
-    totalTax: Math.round(totalTax * 100) / 100,
-    totalAvgifterBasis: activeEmployees.reduce(
-      (s, e) => s + ((e.avgifter_basis_override ?? e.avgifter_basis) || 0),
-      0,
-    ),
-    totalAvgifterAmount: Math.round(totalAvgifterAmount * 100) / 100,
-    totalSjuklonekostnad: Math.round(totalSjuklonekostnad * 100) / 100,
+    totalTax,
+    totalAvgifterBasis,
+    totalAvgifterAmount,
+    totalSjuklonekostnad: truncateToWholeKronor(totalSjuklonekostnad),
     avgifterByCategory,
   }
 
@@ -466,18 +509,18 @@ export async function generateAgiDeclaration(
   {
     const now = new Date()
     const currentYM = now.getUTCFullYear() * 100 + (now.getUTCMonth() + 1)
-    const periodYM = run.period_year * 100 + run.period_month
+    const periodYM = agiPeriod.periodYear * 100 + agiPeriod.periodMonth
     if (periodYM > currentYM) {
       opLog.warn('AGI generated for future period', {
         companyId,
-        periodYear: run.period_year,
-        periodMonth: run.period_month,
+        periodYear: agiPeriod.periodYear,
+        periodMonth: agiPeriod.periodMonth,
       })
     } else if (currentYM - periodYM > 13) {
       opLog.warn('AGI generated for period > 13 months past', {
         companyId,
-        periodYear: run.period_year,
-        periodMonth: run.period_month,
+        periodYear: agiPeriod.periodYear,
+        periodMonth: agiPeriod.periodMonth,
       })
     }
   }
@@ -488,11 +531,42 @@ export async function generateAgiDeclaration(
   // PGRST116 row-not-found error and abort what should be a clean insert.
   const { data: existingAgi } = await supabase
     .from('agi_declarations')
-    .select('id')
+    .select('id, salary_run_id')
     .eq('company_id', companyId)
-    .eq('period_year', run.period_year)
-    .eq('period_month', run.period_month)
+    .eq('period_year', agiPeriod.periodYear)
+    .eq('period_month', agiPeriod.periodMonth)
     .maybeSingle()
+
+  // Two runs may share a redovisningsperiod only when one corrects the
+  // other (a correction replaces the month's declaration wholesale). Any
+  // other run paid out in the same calendar month would have to be MERGED
+  // into one declaration, which this generator cannot do: overwriting the
+  // existing XML would file the wrong amounts, so refuse instead. Reachable
+  // now that the period follows payment_date (#2191): an August run paid
+  // 25 Sept and a September run paid 30 Sept both land in 202609.
+  if (
+    existingAgi?.salary_run_id &&
+    existingAgi.salary_run_id !== run.id &&
+    existingAgi.salary_run_id !== run.corrects_run_id
+  ) {
+    const { data: otherRun } = await supabase
+      .from('salary_runs')
+      .select('id, status, period_year, period_month')
+      .eq('id', existingAgi.salary_run_id)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (otherRun && otherRun.status !== 'corrected') {
+      return {
+        ok: false,
+        code: 'AGI_PERIOD_CONFLICT',
+        details: {
+          period: formatAgiPeriodDashed(agiPeriod),
+          other_salary_run_id: otherRun.id,
+          other_run_period: `${otherRun.period_year}-${String(otherRun.period_month).padStart(2, '0')}`,
+        },
+      }
+    }
+  }
 
   const isCorrection = !!existingAgi
 
@@ -533,13 +607,14 @@ export async function generateAgiDeclaration(
         xml_content: xml,
         individuppgifter,
         total_gross: run.total_gross,
-        total_tax: run.total_tax,
+        // Declared whole-krona totals, exactly as serialised into the XML
+        // (FK497/FK487): the amounts Skatteverket computes from the declared
+        // underlag and draws from the skattekonto (modulo the two documented
+        // krona-scale approximations in declared-avgifter.ts). This is what
+        // agi-tax-settlement matches the draw against. run.total_tax would
+        // drift: it keeps öre and includes removed rows.
+        total_tax: totals.totalTax,
         total_avgifter_basis: totals.totalAvgifterBasis,
-        // Use the per-category sum that drives the XML rather than the
-        // run-level denormalised total. Both should agree, but a
-        // round-then-sum vs sum-then-round can produce öre drift; the
-        // agi_declarations row should align with what was actually
-        // serialised into the XML (which Skatteverket sees).
         total_avgifter: totals.totalAvgifterAmount,
         employee_count: employeeData.length,
         is_correction: true,
@@ -557,18 +632,14 @@ export async function generateAgiDeclaration(
         company_id: companyId,
         user_id: userId,
         salary_run_id: run.id,
-        period_year: run.period_year,
-        period_month: run.period_month,
+        period_year: agiPeriod.periodYear,
+        period_month: agiPeriod.periodMonth,
         xml_content: xml,
         individuppgifter,
         total_gross: run.total_gross,
-        total_tax: run.total_tax,
+        // Declared whole-krona totals: see the update branch above.
+        total_tax: totals.totalTax,
         total_avgifter_basis: totals.totalAvgifterBasis,
-        // Use the per-category sum that drives the XML rather than the
-        // run-level denormalised total. Both should agree, but a
-        // round-then-sum vs sum-then-round can produce öre drift; the
-        // agi_declarations row should align with what was actually
-        // serialised into the XML (which Skatteverket sees).
         total_avgifter: totals.totalAvgifterAmount,
         employee_count: employeeData.length,
       })
@@ -588,8 +659,8 @@ export async function generateAgiDeclaration(
           .from('agi_declarations')
           .select('id')
           .eq('company_id', companyId)
-          .eq('period_year', run.period_year)
-          .eq('period_month', run.period_month)
+          .eq('period_year', agiPeriod.periodYear)
+          .eq('period_month', agiPeriod.periodMonth)
           .maybeSingle()
         if (refetchErr || !nowExisting) {
           return { ok: false, code: 'DATABASE_ERROR', details: refetchErr || insErr }
@@ -600,14 +671,10 @@ export async function generateAgiDeclaration(
             xml_content: xml,
             individuppgifter,
             total_gross: run.total_gross,
-            total_tax: run.total_tax,
+            // Declared whole-krona totals: see the update branch above.
+            total_tax: totals.totalTax,
             total_avgifter_basis: totals.totalAvgifterBasis,
-            // Use the per-category sum that drives the XML rather than the
-        // run-level denormalised total. Both should agree, but a
-        // round-then-sum vs sum-then-round can produce öre drift; the
-        // agi_declarations row should align with what was actually
-        // serialised into the XML (which Skatteverket sees).
-        total_avgifter: totals.totalAvgifterAmount,
+            total_avgifter: totals.totalAvgifterAmount,
             employee_count: employeeData.length,
             is_correction: true,
             salary_run_id: run.id,
@@ -619,8 +686,8 @@ export async function generateAgiDeclaration(
         agiDeclarationId = nowExisting.id as string
         opLog.warn('agi_declarations insert raced; recovered via update', {
           companyId,
-          periodYear: run.period_year,
-          periodMonth: run.period_month,
+          periodYear: agiPeriod.periodYear,
+          periodMonth: agiPeriod.periodMonth,
         })
         // Note: the caller-facing `isCorrection` flag (set above based on
         // the pre-INSERT existingAgi lookup) reports `false` even though
@@ -650,8 +717,8 @@ export async function generateAgiDeclaration(
       type: 'agi.generated',
       payload: {
         agiId: agiDeclarationId,
-        periodYear: run.period_year,
-        periodMonth: run.period_month,
+        periodYear: agiPeriod.periodYear,
+        periodMonth: agiPeriod.periodMonth,
         userId,
         companyId,
       },
@@ -680,8 +747,8 @@ export async function generateAgiDeclaration(
     ok: true,
     xml,
     agiDeclarationId,
-    periodYear: run.period_year,
-    periodMonth: run.period_month,
+    periodYear: agiPeriod.periodYear,
+    periodMonth: agiPeriod.periodMonth,
     employeeCount: employeeData.length,
     isCorrection,
     totals,

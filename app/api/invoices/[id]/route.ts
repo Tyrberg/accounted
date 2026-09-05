@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server'
-import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { UpdateInvoiceSchema } from '@/lib/api/schemas'
 import { buildInvoiceWriteData } from '@/lib/invoices/build-invoice-write'
+import { resolveInvoicePayeeChoice, type InvoicePayeeFields } from '@/lib/invoices/invoice-payee'
 import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
+import { deleteDraftInvoice } from '@/lib/invoices/delete-draft-invoice'
 import { replaceInvoiceItems } from '@/lib/invoices/replace-invoice-items'
 import type { InvoiceDocumentType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
@@ -27,6 +28,11 @@ ensureInitialized() // Module-level: wires the audit-log handler for invoice.dra
  *
  * Only drafts may be removed either way. Sent / paid invoices are immutable per
  * BFL and must be reversed via a credit note instead.
+ *
+ * The fetch / guard / delete-or-cancel logic lives in
+ * lib/invoices/delete-draft-invoice.ts, shared with the v1 API-key route and
+ * the MCP delete_draft_invoice executor. This handler only maps the result to
+ * the cookie-session response envelope.
  */
 export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
   'invoice.delete',
@@ -34,84 +40,23 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
     const { id } = await params
     const opLog = log.child({ invoiceId: id })
 
-  const { data: invoice, error: fetchError } = await supabase
-    .from('invoices')
-    .select('id, status, invoice_number, user_id, credited_invoice_id, journal_entry_id')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (fetchError || !invoice) {
-    return errorResponseFromCode('INVOICE_NOT_FOUND', opLog, { requestId })
-  }
-
-  if (invoice.status !== 'draft') {
-    return errorResponseFromCode('INVOICE_DELETE_NOT_DRAFT', opLog, { requestId })
-  }
-
-  // Unnumbered drafts (saved via "Spara som utkast", never finalized) are not
-  // yet issued invoices (no F-series number was consumed) so they can be hard
-  // deleted with no gap in the sequence (ML 17 kap 24§). invoice_items cascade
-  // via the FK (ON DELETE CASCADE); an un-finalized draft has no journal entry
-  // or linked document. The status='draft' + invoice_number IS NULL guard makes
-  // the delete a no-op if the row was finalized (numbered) concurrently.
-  if (!invoice.invoice_number) {
-    const { data: removed, error: removeError } = await supabase
-      .from('invoices')
-      .delete()
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .eq('status', 'draft')
-      .is('invoice_number', null)
-      .select('id')
-
-    if (removeError) {
-      opLog.error('invoice draft delete failed', removeError)
-      return errorResponseFromCode('INVOICE_DELETE_FAILED', opLog, { requestId })
-    }
-
-    if (!removed || removed.length === 0) {
-      // Finalized between fetch and delete: refuse rather than fall through to
-      // makulering of a now-issued invoice.
-      return errorResponseFromCode('INVOICE_CANCEL_RACE', opLog, { requestId })
-    }
-
-    // The row is gone, so there's no journal trace of the removal. Emit an
-    // audit event carrying the identifiers so the event log records who deleted
-    // which draft and when: the makulering path leaves a journal/status trail,
-    // a hard delete otherwise leaves none.
-    await eventBus.emit({
-      type: 'invoice.draft_deleted',
-      payload: { invoiceId: id, companyId, userId: user.id },
+    const result = await deleteDraftInvoice({
+      supabase,
+      companyId,
+      userId: user.id,
+      invoiceId: id,
+      log: opLog,
     })
 
+    if (!result.ok) {
+      return errorResponseFromCode(result.code, opLog, { requestId })
+    }
+
+    if (result.outcome === 'deleted') {
       return NextResponse.json({ data: { deleted: true } })
-  }
+    }
 
-  // Numbered draft: retain the row and its number, flip to 'cancelled'
-  // (makulering) so the F-series stays gap-free.
-  // .select() returns the affected rows so we can detect a TOCTOU race where
-  // the status flipped between the fetch above and this update. With only the
-  // .eq('status','draft') guard, a 0-row update returns success and the user
-  // would see "Makulerad" while the invoice is still in its previous state.
-  const { data: updated, error: cancelError } = await supabase
-    .from('invoices')
-    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .eq('status', 'draft')
-    .select('id')
-
-  if (cancelError) {
-    opLog.error('invoice cancellation failed', cancelError)
-    return errorResponseFromCode('INVOICE_DELETE_FAILED', opLog, { requestId })
-  }
-
-  if (!updated || updated.length === 0) {
-    return errorResponseFromCode('INVOICE_CANCEL_RACE', opLog, { requestId })
-  }
-
-    return NextResponse.json({ data: { cancelled: true, invoice_number: invoice.invoice_number } })
+    return NextResponse.json({ data: { cancelled: true, invoice_number: result.invoiceNumber } })
   },
   { requireWrite: true },
 )
@@ -143,13 +88,12 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     })
     if (!validation.success) return validation.response
     const input = validation.data
-    const documentType: InvoiceDocumentType = input.document_type || 'invoice'
 
     // Fetch the target. Only drafts (not sent, no committed verifikat, not a
     // received self-billing document) may be edited.
     const { data: existing, error: fetchError } = await supabase
       .from('invoices')
-      .select('id, status, invoice_number, journal_entry_id, is_self_billed, credited_invoice_id, deduction_personnummer_encrypted, deduction_personnummer_last4')
+      .select('id, status, invoice_number, journal_entry_id, is_self_billed, credited_invoice_id, document_type, quote_status, deduction_personnummer_encrypted, deduction_personnummer_last4')
       .eq('id', id)
       .eq('company_id', companyId!)
       .single()
@@ -164,6 +108,23 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     // truth the detail and edit pages also gate on, so the rule can't drift.
     if (!isEditableInvoiceDraft(existing)) {
       return errorResponseFromCode('INVOICE_UPDATE_NOT_DRAFT', ctxLog, { requestId })
+    }
+
+    // An omitted document_type means "unchanged", never "invoice": a client
+    // that only edits lines on a delivery-note or quote draft must not trip
+    // the series lock below.
+    const existingType: InvoiceDocumentType = existing.document_type ?? 'invoice'
+    const documentType: InvoiceDocumentType = input.document_type ?? existingType
+
+    // Quotes and delivery notes are numbered at insert from their own series,
+    // so their type is fixed: turning OF-007 into a faktura would carry a
+    // quote number into the F-series (and vice versa).
+    const seriesLocked = (t: InvoiceDocumentType) => t === 'quote' || t === 'delivery_note'
+    if (existingType !== documentType && (seriesLocked(existingType) || seriesLocked(documentType))) {
+      return errorResponseFromCode('INVOICE_UPDATE_DOCUMENT_TYPE_LOCKED', ctxLog, {
+        requestId,
+        details: { from: existingType, to: documentType },
+      })
     }
 
     // Resolve the (possibly changed) customer.
@@ -205,6 +166,22 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       return errorResponseFromCode(build.code, ctxLog, { requestId, details: build.details })
     }
 
+    // Payee choice: omitted = unchanged (a partial update must not clear a
+    // draft's chosen account); null = back to the per-currency default.
+    let payeeFields: Partial<InvoicePayeeFields> = {}
+    if (input.payment_cash_account_id !== undefined) {
+      const payeeChoice = await resolveInvoicePayeeChoice(
+        supabase,
+        companyId!,
+        input.currency,
+        input.payment_cash_account_id,
+      )
+      if (!payeeChoice.ok) {
+        return errorResponseFromCode(payeeChoice.code, ctxLog, { requestId, details: payeeChoice.details })
+      }
+      payeeFields = payeeChoice.fields
+    }
+
     // Update the draft row. invoice_number + status are intentionally NOT in
     // build.invoiceFields, so they are preserved. The .eq('status','draft')
     // guard turns a concurrent send/finalize into a 0-row update (race), rather
@@ -221,7 +198,12 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
         : build.invoiceFields
     const { data: updated, error: updateError } = await supabase
       .from('invoices')
-      .update({ ...updateFields, updated_at: new Date().toISOString() })
+      .update({
+        ...updateFields,
+        payment_cash_account_id: payeeFields.payment_cash_account_id,
+        payment_details: payeeFields.payment_details,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', id)
       .eq('company_id', companyId!)
       .eq('status', 'draft')
@@ -245,6 +227,9 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     // nothing else.
     const replaced = await replaceInvoiceItems(supabase, id, build.items)
     if (!replaced.ok) {
+      if (replaced.stage === 'guard') {
+        return errorResponseFromCode(replaced.code, ctxLog, { requestId })
+      }
       ctxLog.error(`invoice items ${replaced.stage} failed on update`, replaced.error, { invoiceId: id })
       return errorResponseFromCode('INVOICE_CREATE_ITEMS_FAILED', ctxLog, {
         requestId,

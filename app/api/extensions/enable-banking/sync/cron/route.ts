@@ -1,15 +1,18 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { type SupabaseClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { syncAccountTransactions } from '@/extensions/general/enable-banking/lib/sync'
 import {
-  runReconciliation,
-  DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
-} from '@/lib/reconciliation/bank-reconciliation'
+  runUnattendedReconciliationSweep,
+  toSweepSummary,
+} from '@/lib/reconciliation/unattended-sweep'
 import {
   isConsentExpiringSoon,
   getDaysUntilExpiry,
   probeSessionHealth,
   SessionExpiredError,
+  AspspUnavailableError,
+  ConnectorSyncError,
   REAUTH_REQUIRED_MESSAGE,
   SYNC_FAILED_MESSAGE,
 } from '@/extensions/general/enable-banking/lib/api-client'
@@ -20,22 +23,42 @@ import {
   generateConsentExpiryEmailSubject,
 } from '@/lib/email/consent-notification-templates'
 import { ensureInitialized } from '@/lib/init'
-import { hasCapability } from '@/lib/entitlements/has-capability'
+import { getCompanyIdsWithCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { withCronContext } from '@/lib/api/with-cron-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getBranding } from '@/lib/branding/service'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { updateBalancesFromSync } from '@/lib/cash-accounts/service'
 import type { StoredAccount } from '@/extensions/general/enable-banking/types'
+import {
+  INCREMENTAL_LOOKBACK_DAYS,
+  MAX_LOOKBACK_DAYS,
+  incrementalLookbackDays,
+} from '@/extensions/general/enable-banking/lib/cron-lookback'
 
 ensureInitialized()
+
+// Without this export the route runs under the platform default (60s), which
+// is why the sync loop used to self-limit to 50s and starve the queue: ~17
+// connections per day against 100+ entitled active connections, so any given
+// connection only got an automatic sync every 4-7 days.
+export const maxDuration = 300
+
+const MAX_CONNECTIONS_PER_RUN = 300
+// Connections synced concurrently within one wave. Enable Banking calls are
+// I/O-bound, so a small fan-out multiplies throughput without hammering the
+// ASPSPs; per-connection error isolation is preserved inside each wave.
+const SYNC_CONCURRENCY = 4
 
 /**
  * GET /api/extensions/enable-banking/sync/cron
  * Automatic daily bank transaction sync
  * Runs at 05:00 UTC (07:00 Swedish time)
  *
- * Processes up to 50 connections per run (Vercel Pro 300s timeout).
- * Prioritizes connections not synced for the longest time.
+ * Sized so one run covers every entitled active connection (Vercel Pro 300s
+ * timeout, 4-way concurrency). Prioritizes connections not synced for the
+ * longest time, so anything cut off by the time budget is first tomorrow.
  * Deduplication via external_id makes repeated runs safe.
  */
 export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
@@ -49,7 +72,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
     })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   // Clean up stale pending connections (older than 1 hour)
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
@@ -64,26 +87,49 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
     ctx.log.info('cleaned up stale pending connections', { count: stalePending.length })
   }
 
-  const { data: connections, error: connError } = await supabase
-    .from('bank_connections')
-    .select('*')
-    .eq('status', 'active')
-    .order('last_synced_at', { ascending: true, nullsFirst: true })
-    .limit(50)
-
-  if (connError) {
-    ctx.log.error('failed to fetch bank connections', connError, {
-      message: connError.message,
-      code: connError.code,
-    })
-    return errorResponse(connError, ctx.log, { requestId: ctx.requestId })
+  let candidateConnections
+  let entitledCompanyIds
+  try {
+    candidateConnections = await fetchAllRows(
+      ({ from, to }) => supabase
+        .from('bank_connections')
+        .select('*')
+        .eq('status', 'active')
+        .order('last_synced_at', { ascending: true, nullsFirst: true })
+        .order('id', { ascending: true })
+        .range(from, to),
+      { dedupeBy: connection => connection.id },
+    )
+    entitledCompanyIds = await getCompanyIdsWithCapability(
+      supabase,
+      candidateConnections.map(connection => connection.company_id),
+      CAPABILITY.bank_sync,
+    )
+  } catch (error) {
+    ctx.log.error('failed to build entitled bank sync work list', error as Error)
+    return errorResponse(error, ctx.log, { requestId: ctx.requestId })
   }
+
+  // Apply the batch limit only after entitlement filtering. Otherwise old
+  // free-tier rows can permanently occupy the head of the queue and prevent
+  // every paying connection behind them from syncing.
+  const connections = candidateConnections
+    .filter(connection => entitledCompanyIds.has(connection.company_id))
+    .slice(0, MAX_CONNECTIONS_PER_RUN)
+
+  ctx.log.info('bank sync work list built', {
+    candidates: candidateConnections.length,
+    entitledCompanies: entitledCompanyIds.size,
+    selected: connections.length,
+  })
 
   // No early return on an empty set: the health probe below still has work to
   // do (a company whose only connection is parked in 'pending_selection' has
   // nothing to sync but can absolutely have a dead session).
   const startTime = Date.now()
-  const TIME_BUDGET_MS = 50_000 // 50s: leave 10s margin for Vercel timeout
+  // 230s of the 300s maxDuration for the sync loop; the rest is reserved for
+  // the health probe pass and response teardown below.
+  const TIME_BUDGET_MS = 230_000
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
 
   const results: {
@@ -107,17 +153,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
   const notifyKey = (c: { user_id: string; session_id: string | null }) =>
     `${c.user_id}:${c.session_id ?? 'none'}`
 
-  for (const connection of connections ?? []) {
-    if (Date.now() - startTime > TIME_BUDGET_MS) {
-      ctx.log.info('time budget reached', { processedSoFar: results.length })
-      break
-    }
-
-    if (!(await hasCapability(supabase, connection.company_id, CAPABILITY.bank_sync))) {
-      ctx.log.info('skip: capability not entitled', { companyId: connection.company_id })
-      continue
-    }
-
+  const syncConnection = async (connection: (typeof connections)[number]) => {
     try {
       const daysLeft = getDaysUntilExpiry(connection.consent_expires)
       const isExpired = daysLeft !== null && daysLeft <= 0
@@ -146,7 +182,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
           status: 'expired',
           daysUntilExpiry: 0,
         })
-        continue
+        return
       }
 
       const expiringSoon = isConsentExpiringSoon(connection.consent_expires)
@@ -165,15 +201,26 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       }
 
       const toDate = new Date().toISOString().split('T')[0]
-      // First sync: 90-day lookback (PSD2 max). Subsequent: 7-day window.
+      // First sync: 90-day lookback (PSD2 max). Subsequent: 7-day window,
+      // widened to cover any gap since the last successful sync (a paused
+      // subscription that was paid again, a renewed consent) so the days in
+      // between are not lost. See cron-lookback.ts.
       // Gate on initial_sync_completed_at, not last_synced_at: manual "Sync now"
       // sets last_synced_at without doing the deep backfill, and we want the cron
       // to still fall back to 90 days if the inline activation backfill failed.
       const isFirstSync = !connection.initial_sync_completed_at
-      const lookbackDays = isFirstSync ? 90 : 7
+      const lookbackDays = isFirstSync
+        ? MAX_LOOKBACK_DAYS
+        : incrementalLookbackDays(connection.last_synced_at)
       if (isFirstSync) {
         ctx.log.info('first sync for connection: using 90-day lookback', {
           connectionId: connection.id,
+          lookbackDays,
+        })
+      } else if (lookbackDays > INCREMENTAL_LOOKBACK_DAYS) {
+        ctx.log.info('gap since last sync: widening lookback', {
+          connectionId: connection.id,
+          lastSyncedAt: connection.last_synced_at,
           lookbackDays,
         })
       }
@@ -202,7 +249,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
           status: 'skipped',
           daysUntilExpiry: daysLeft,
         })
-        continue
+        return
       }
 
       // Detect SIE overlap: skip auto-categorization if the sync range
@@ -217,11 +264,12 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         .maybeSingle()
 
       // First sync uses strategy=longest to pull the deepest history available
-      // from the ASPSP. Incremental syncs skip it: the implicit default is
-      // faster and we already have the older data.
+      // from the ASPSP, and so does a gap backfill of a month or more (same
+      // threshold as the manual sync route). Routine incremental syncs skip
+      // it: the implicit default is faster and we already have the older data.
       const syncOptions = {
         ...(sieOverlap ? { skipAutoCategorization: true } : {}),
-        ...(isFirstSync ? { strategy: 'longest' as const } : {}),
+        ...(isFirstSync || lookbackDays >= 30 ? { strategy: 'longest' as const } : {}),
       }
 
       const syncResults = await Promise.all(
@@ -242,22 +290,36 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       const totalDuplicates = syncResults.reduce((sum, r) => sum + r.duplicates, 0)
       const totalErrors = syncResults.reduce((sum, r) => sum + r.errors, 0)
 
-      // Batch reconciliation sweep when SIE overlap detected
+      // Batch reconciliation sweep when SIE overlap detected. One scoped run
+      // per enabled cash account (issue #1298): a pooled run matched every
+      // same-currency account's transactions against 1930's GL lines and could
+      // persist a cross-account journal_entry_id.
       if (sieOverlap && totalImported > 0) {
         try {
-          const reconResult = await runReconciliation(supabase, connection.company_id, connection.user_id, {
-            dateFrom: fromDate,
-            dateTo: toDate,
-            // Unattended run: nobody reviews a dry-run first, so never commit
-            // low-confidence (fuzzy / date-range) matches automatically.
-            confidenceThreshold: DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
-          })
+          const reconResult = await runUnattendedReconciliationSweep(
+            supabase,
+            connection.company_id,
+            connection.user_id,
+            { dateFrom: fromDate, dateTo: toDate },
+          )
+          // Stamp the outcome so the UI can render "Vi matchade X av Y" and the
+          // review surface knows there is something to granska.
+          await supabase
+            .from('bank_connections')
+            .update({
+              last_sie_sweep: toSweepSummary(reconResult, { dateFrom: fromDate, dateTo: toDate }),
+            })
+            .eq('id', connection.id)
           if (reconResult.applied > 0 || reconResult.skippedBelowThreshold > 0) {
             ctx.log.info('batch reconciliation after sync', {
               companyId: connection.company_id,
               applied: reconResult.applied,
               skippedBelowThreshold: reconResult.skippedBelowThreshold,
-              total: reconResult.matches.length,
+              accounts: reconResult.accounts.map((a) => ({
+                accountNumber: a.accountNumber,
+                applied: a.applied,
+                skippedBelowThreshold: a.skippedBelowThreshold,
+              })),
             })
           }
         } catch {
@@ -282,6 +344,19 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
           initial_sync_lookback_days: lookbackDays,
         }
       }
+      // Mirror refreshed balances into cash_accounts (what the Bank-page
+      // picker and reconciliation read); logs failures instead of throwing.
+      await updateBalancesFromSync(
+        supabase,
+        connection.company_id,
+        connection.id,
+        allAccounts.map(a => ({
+          external_uid: a.uid,
+          balance: a.balance,
+          available_balance: a.available_balance,
+          balance_updated_at: a.balance_updated_at,
+        })),
+      )
       await supabase
         .from('bank_connections')
         .update({
@@ -303,14 +378,6 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         daysUntilExpiry: daysLeft,
       })
     } catch (error) {
-      ctx.log.error('sync failed for connection', error as Error, {
-        connectionId: connection.id,
-        userId: connection.user_id,
-        bankName: connection.bank_name,
-        consentExpires: connection.consent_expires,
-        lastSyncedAt: connection.last_synced_at,
-      })
-
       // A dead PSD2 session (closed/expired/invalid consent) is a re-auth
       // condition, not a transient failure: flip it to 'expired' (same state
       // the consent-elapsed branch uses) so the UI offers a reconnect instead
@@ -318,15 +385,51 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       //
       // error_message is rendered verbatim on the settings panel, so it gets
       // the short Swedish user message in both cases: the raw Enable Banking
-      // error body (an English JSON envelope) stays in the server log above.
+      // error body (an English JSON envelope) stays in the server log below.
       const isSessionDead = error instanceof SessionExpiredError
+      // A bank refusing right now, or the connector hop failing (timeout,
+      // error envelope, contract mismatch), says nothing about the PSD2
+      // session: retryable, and the row is left alone. Parking it in 'error'
+      // with SYNC_FAILED_MESSAGE told users to renew a consent that was fine
+      // (four canary companies on 2026-09-04). The probe below still checks
+      // the session, so a dead one is caught anyway.
+      const isTransient = error instanceof AspspUnavailableError || error instanceof ConnectorSyncError
       const failureStatus = isSessionDead ? 'expired' : 'error'
       const failureMessage = isSessionDead ? REAUTH_REQUIRED_MESSAGE : SYNC_FAILED_MESSAGE
 
-      await supabase
-        .from('bank_connections')
-        .update({ status: failureStatus, error_message: failureMessage })
-        .eq('id', connection.id)
+      // An expired PSD2 consent is the normal end of a bank grant and the row
+      // is flipped to 'expired' for the user to reconnect: a warning, not an
+      // error. Only genuine sync failures belong in the error panel.
+      const failureContext = {
+        connectionId: connection.id,
+        userId: connection.user_id,
+        bankName: connection.bank_name,
+        consentExpires: connection.consent_expires,
+        lastSyncedAt: connection.last_synced_at,
+      }
+      if (isSessionDead) {
+        ctx.log.warn('bank session expired for connection', {
+          ...failureContext,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      } else if (isTransient) {
+        ctx.log.warn('transient bank sync failure, connection left untouched', {
+          ...failureContext,
+          reason: error instanceof Error ? error.message : String(error),
+          ...(error instanceof ConnectorSyncError
+            ? { connectorCode: error.code, connectorStatus: error.status, issues: error.issues }
+            : { aspspReason: error instanceof AspspUnavailableError ? error.reason : undefined }),
+        })
+      } else {
+        ctx.log.error('sync failed for connection', error as Error, failureContext)
+      }
+
+      if (!isTransient) {
+        await supabase
+          .from('bank_connections')
+          .update({ status: failureStatus, error_message: failureMessage })
+          .eq('id', connection.id)
+      }
 
       results.push({
         connectionId: connection.id,
@@ -340,6 +443,42 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
     }
   }
 
+  // Concurrency is per COMPANY, not per connection: the unattended sweep after
+  // an SIE-overlap sync is company-scoped (it reconciles every cash account of
+  // the company), so two connections of one company syncing concurrently would
+  // run two identical whole-company sweeps whose read-time "unlinked GL lines"
+  // snapshots race, and both can claim the same journal entry for different
+  // bank transactions. Grouping keeps one company's connections sequential
+  // while unrelated companies still fan out.
+  const companyGroups = new Map<string, typeof connections>()
+  for (const connection of connections) {
+    const group = companyGroups.get(connection.company_id)
+    if (group) group.push(connection)
+    else companyGroups.set(connection.company_id, [connection])
+  }
+  const groups = [...companyGroups.values()]
+
+  const syncCompanyGroup = async (group: typeof connections) => {
+    for (const connection of group) {
+      // Re-check inside the group too: a company with many connections would
+      // otherwise run to completion past the budget and eat the health-probe
+      // and teardown margin before the between-waves check fires.
+      if (Date.now() - startTime > TIME_BUDGET_MS) return
+      await syncConnection(connection)
+    }
+  }
+
+  // Waves of SYNC_CONCURRENCY company groups: the budget check sits between
+  // waves, and each connection keeps its own try/catch above, so one slow or
+  // failing bank affects at most its own wave slot.
+  for (let offset = 0; offset < groups.length; offset += SYNC_CONCURRENCY) {
+    if (Date.now() - startTime > TIME_BUDGET_MS) {
+      ctx.log.info('time budget reached', { processedSoFar: results.length })
+      break
+    }
+    await Promise.all(groups.slice(offset, offset + SYNC_CONCURRENCY).map(syncCompanyGroup))
+  }
+
   // Health probe for connections this run did NOT prove alive by syncing them.
   //
   // A sync failure is the only thing that used to move a connection off
@@ -351,7 +490,10 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
   // user read old balances as current. Probing costs one cheap session call
   // per connection and only ever acts on a definite 'dead'.
   const probeResults: { connectionId: string; bankName: string }[] = []
-  const PROBE_BUDGET_MS = 100_000
+  // Total-elapsed ceiling (measured from startTime, like TIME_BUDGET_MS): the
+  // probe pass gets whatever the sync loop left of it, with 20s of maxDuration
+  // spare for teardown.
+  const PROBE_BUDGET_MS = 280_000
   const provenAlive = new Set(
     results.filter(r => r.status === 'synced' || r.status === 'expiring_soon').map(r => r.connectionId)
   )

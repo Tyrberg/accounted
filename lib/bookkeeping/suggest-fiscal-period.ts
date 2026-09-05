@@ -10,6 +10,7 @@
  */
 
 import type { FiscalPeriod } from '@/types'
+import { addDaysIso as addDays } from '@/lib/dates/iso'
 
 /** Minimal shape needed for the date math: `FiscalPeriod` satisfies it. */
 type PeriodRange = Pick<FiscalPeriod, 'period_start' | 'period_end'>
@@ -23,23 +24,22 @@ export interface SuggestedPeriod {
   period_end: string
 }
 
-/** Add `days` to a YYYY-MM-DD date string, returning a YYYY-MM-DD string. */
-function addDays(date: string, days: number): string {
-  const d = new Date(date + 'T00:00:00Z')
-  d.setUTCDate(d.getUTCDate() + days)
-  return d.toISOString().split('T')[0]
-}
-
 /**
  * A fiscal-year name: `Räkenskapsår 2025`, or `Räkenskapsår 2024/2025` when it
  * straddles two calendar years. Swedish by default to match the app's existing
  * fiscal-year naming (Swedish-first); the field stays editable in the dialog.
+ * Exported so the create dialog can keep the name in step with the dates the
+ * user actually types: a suggested "Räkenskapsår 2027" must not survive the
+ * user re-dating the year to 2022-07-01..2023-12-31. Callers pass full
+ * YYYY-MM-DD strings.
  */
-function periodName(start: string, end: string): string {
-  const startYear = Number(start.slice(0, 4))
-  const endYear = Number(end.slice(0, 4))
+export function fiscalYearName(start: string, end: string): string {
+  const startYear = start.slice(0, 4)
+  const endYear = end.slice(0, 4)
   return startYear === endYear ? `Räkenskapsår ${startYear}` : `Räkenskapsår ${startYear}/${endYear}`
 }
+
+const periodName = fiscalYearName
 
 /**
  * Suggest a fiscal period for the create dialog, given the date the user is

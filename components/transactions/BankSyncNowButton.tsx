@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { createClient } from '@/lib/supabase/client'
 import { notifyBankSyncUpdated } from '@/lib/transactions/bank-sync-signal'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import {
   claimConnectionsLoad,
   clearBusyConnection,
@@ -29,6 +30,7 @@ import {
 } from '@/lib/transactions/bank-sync-store'
 import { useCompany, useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
+import { isSelfHosted } from '@/lib/env/public-flags'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 export type { BankConn }
@@ -141,13 +143,30 @@ export function useBankSync() {
       }
       toast({
         title: t('bank_sync_button_now'),
-        description: data.imported === 1
-          ? t('bank_sync_new_since_last_visit_one')
-          : t('bank_sync_new_since_last_visit_many', { count: data.imported ?? 0 }),
+        // Surface skipped duplicates too: a renewal that dedupes correctly
+        // imports 0 rows, which without this line reads as a broken sync.
+        // Joined with '. ' so the two sentences do not run together (the
+        // imported-count strings are shared with the BankSyncSinceLastVisit
+        // chip and deliberately carry no trailing period).
+        description: [
+          data.imported === 1
+            ? t('bank_sync_new_since_last_visit_one')
+            : t('bank_sync_new_since_last_visit_many', { count: data.imported ?? 0 }),
+          typeof data.duplicates === 'number' && data.duplicates > 0
+            ? data.duplicates === 1
+              ? t('bank_sync_duplicates_skipped_one')
+              : t('bank_sync_duplicates_skipped_many', { count: data.duplicates })
+            : null,
+        ]
+          .filter(Boolean)
+          .join('. '),
       })
       // Tell the neighbouring status chip to refetch so it doesn't keep showing
       // the pre-sync "synced Nd ago" until a hard reload.
       notifyBankSyncUpdated()
+      // The account chooser reads cash accounts from the session cache
+      // (lib/reference-data); a sync can change balances, so refetch them.
+      void invalidateReferenceData('ref:cash-accounts')
       router.refresh()
     } catch (error) {
       toast({
@@ -227,14 +246,25 @@ export default function BankSyncNowButton() {
   // Bank sync (and reconnect) is a paid external PSD2 call. Without the
   // capability we keep the button VISIBLE as the conversion surface but inert,
   // and surface an Uppgradera link. CSV/SIE import stays free (separate UI).
-  const gateTitle = !hasBankSync ? 'Bankkoppling kräver ett abonnemang' : undefined
+  // Self-host: the remedy is a connector key (or own EB credentials), never
+  // the hosted Stripe billing page; same branch as UpgradeNote.
+  const selfHosted = isSelfHosted()
+  const gateTitle = !hasBankSync
+    ? selfHosted
+      ? t('bank_sync_requires_connector_key')
+      : t('bank_sync_requires_subscription')
+    : undefined
   const upsellNote = !hasBankSync ? (
-    <span className="text-xs text-muted-foreground">
-      Kräver abonnemang.{' '}
-      <a href="/settings/billing" className="underline underline-offset-2">
-        Uppgradera
-      </a>
-    </span>
+    selfHosted ? (
+      <span className="text-xs text-muted-foreground">{t('bank_sync_upsell_connector_key')}</span>
+    ) : (
+      <span className="text-xs text-muted-foreground">
+        {t('bank_sync_upsell_subscription')}{' '}
+        <a href="/settings/billing" className="underline underline-offset-2">
+          {t('bank_sync_upsell_upgrade')}
+        </a>
+      </span>
+    )
   ) : null
 
   if (connections.length === 1) {

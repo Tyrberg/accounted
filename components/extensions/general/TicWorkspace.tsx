@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
+import { useCompanySettings } from '@/lib/reference-data/hooks'
 import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -16,7 +17,6 @@ import {
 import { useExtensionData } from '@/lib/extensions/use-extension-data'
 import { useToast } from '@/components/ui/use-toast'
 import {
-  Building2,
   CheckCircle,
   XCircle,
   MapPin,
@@ -28,6 +28,7 @@ import {
   ShieldCheck,
   Users,
   Receipt,
+  Briefcase,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import Link from 'next/link'
@@ -188,6 +189,9 @@ function ProfileSkeleton() {
 export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
   const { getByKey, save, isLoading: isDataLoading } = useExtensionData('general', 'tic')
   const { toast } = useToast()
+  // org_number from the session-cached settings row (lib/reference-data):
+  // the profile fetch no longer pays a /api/settings round trip first.
+  const { settings: companySettings, error: settingsError } = useCompanySettings()
   const t = useTranslations('tic_workspace')
   const [profile, setProfile] = useState<TICCompanyProfile | null>(null)
   const [isFetching, setIsFetching] = useState(false)
@@ -216,14 +220,13 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     setFetchFailed(false)
 
     try {
-      // Get org_number from company settings
-      const settingsRes = await fetch('/api/settings')
-      if (!settingsRes.ok) {
+      // Get org_number from company settings (settled without a row = the
+      // same failure the old fetch reported).
+      if (settingsError) {
         toast({ title: t('toast_settings_failed'), variant: 'destructive' })
         return
       }
-      const { data: settings } = await settingsRes.json()
-      const orgNumber = settings?.org_number
+      const orgNumber = companySettings?.org_number
 
       if (!orgNumber) {
         setNoOrgNumber(true)
@@ -255,7 +258,7 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     } finally {
       setIsFetching(false)
     }
-  }, [save, toast, t])
+  }, [save, toast, t, companySettings, settingsError])
 
   // Auto-fetch on first visit when no cached data
   useEffect(() => {
@@ -272,7 +275,7 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <Settings className="h-12 w-12 text-muted-foreground/40 mb-4" />
-        <h3 className="text-lg font-medium text-foreground">
+        <h3 className="text-lg text-foreground">
           {t('no_org_number_title')}
         </h3>
         <p className="text-sm text-muted-foreground mt-1 max-w-md">
@@ -293,7 +296,7 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <XCircle className="h-12 w-12 text-muted-foreground/40 mb-4" />
-        <h3 className="text-lg font-medium text-foreground">
+        <h3 className="text-lg text-foreground">
           {t('fetch_failed_title')}
         </h3>
         <p className="text-sm text-muted-foreground mt-1 max-w-md">
@@ -327,11 +330,14 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <Building2 className="h-4 w-4" />
-              {profile.companyName}
+              <Briefcase className="h-4 w-4" />
+              {/* data-ph-mask: the looked-up company name is user data */}
+              <span data-ph-mask="">{profile.companyName}</span>
             </CardTitle>
             <CardDescription>
-              {profile.orgNumber} &middot; {profile.legalEntityType}
+              {/* data-ph-mask: TIC serves the orgnr in unnormalized format, so
+                  the separator-based pattern scrub cannot be relied on */}
+              <span data-ph-mask="">{profile.orgNumber}</span> &middot; {profile.legalEntityType}
               {!isActive && (
                 <span className="ml-2 text-destructive">&middot; {t('deregistered')}</span>
               )}
@@ -477,7 +483,8 @@ export default function TicWorkspace({ userId }: WorkspaceComponentProps) {
               {profile.statuses.slice(0, 6).map((status, i) => (
                 <li key={i} className="flex items-center justify-between gap-3 text-sm">
                   <div className="flex items-center gap-2">
-                    <Badge variant={statusColorToVariant(status.color)}>
+                    {/* data-ph-mask: the Bolagsverket status text is user data */}
+                    <Badge variant={statusColorToVariant(status.color)} data-ph-mask="">
                       {status.description ?? status.code ?? '-'}
                     </Badge>
                     {status.isCeased && (

@@ -25,9 +25,22 @@ import {
   customerNameMatches,
 } from './invoice-matching'
 import { autoReconcileTransactionForLinkedVoucher } from '@/lib/reconciliation/bank-reconciliation'
+import { clearSettledInvoiceSuggestions } from './clear-settled-invoice-suggestions'
 import { documentCurrency, ledgerLineSideAmountIn } from '@/lib/bookkeeping/ledger-line-amount'
 import type { SupplierInvoice, Supplier } from '@/types'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
+import {
+  AMOUNT_TOLERANCE,
+  DATE_PROXIMITY_BUMP,
+  DEFAULT_DATE_WINDOW_DAYS,
+  EXCLUDED_SOURCE_TYPES,
+  isDateWithinDays,
+  round2,
+  type FiscalPeriodRow,
+  type VoucherMatchLineRow as JournalEntryLine,
+  type VoucherRow,
+} from './voucher-matching-shared'
+import { formatAmount as formatNumber } from '@/lib/utils'
 
 const log = createLogger('supplier-voucher-matching')
 
@@ -38,15 +51,6 @@ const log = createLogger('supplier-voucher-matching')
  *  suppliers will legitimately debit both 2440 and 2441: summing across
  *  the 244x range catches that. PR #602 Swedish-compliance fix. */
 const AP_ACCOUNT_PREFIX = '244'
-
-/** ±90 days from the invoice's due_date as the default search window. */
-const DEFAULT_DATE_WINDOW_DAYS = 90
-
-/** Tolerance for floating-point comparisons on monetary amounts (0.5 öre). */
-const AMOUNT_TOLERANCE = 0.005
-
-/** Date-proximity bump applied when entry_date is within ±7 days of due_date. */
-const DATE_PROXIMITY_BUMP = 0.05
 
 export interface SupplierVoucherCandidate {
   journal_entry_id: string
@@ -72,45 +76,10 @@ export interface SupplierVoucherCandidate {
   match_reason: string
 }
 
-interface JournalEntryLine {
-  id: string
-  journal_entry_id: string
-  account_number: string
-  debit_amount: number | null
-  credit_amount: number | null
-  /** Labels the DOCUMENT, NOT the unit of debit_amount/credit_amount. */
-  currency: string | null
-  /** The line's amount in `currency`: the only non-SEK figure on the row. */
-  amount_in_currency: number | string | null
-}
-
-interface VoucherRow {
-  id: string
-  voucher_series: string | null
-  voucher_number: number | null
-  entry_date: string
-  description: string
-  status: string
-  source_type: string | null
-  fiscal_period_id: string
-}
-
-/** fiscal_periods carries no `status` column: lock state is the (is_closed,
- *  locked_at) pair, which is exactly what enforce_period_lock() reads in
- *  migration 20240101000017 and what resolvePeriodStatusForDate() uses in
- *  lib/core/bookkeeping/period-service.ts. */
-interface FiscalPeriodRow {
-  id: string
-  is_closed: boolean | null
-  locked_at: string | null
-}
-
 interface CandidateContext {
   invoice: SupplierInvoice & { supplier?: Supplier }
   remainingAmount: number
 }
-
-const EXCLUDED_SOURCE_TYPES = ['opening_balance', 'storno']
 
 /**
  * Find posted journal entries whose lines debit 2440 and could plausibly be
@@ -459,9 +428,17 @@ export async function validateVoucherForSupplierInvoiceLink(
   let apDebitTotal = 0
   let lineCurrency: string | null = null
   // A 244x debit line that carries no amount in the invoice's currency. Fail
-  // CLOSED on it: summing only the convertible lines would silently understate
-  // a voucher that settles more than we can read.
+  // CLOSED on it, UNLESS the whole matched side is genuinely SEK-booked: then
+  // the fallback below mirrors the RPC's FX residual settlement gate
+  // (migration 20260830140000).
   let unconvertibleLineCurrency: string | null | undefined
+  // Fallback classification, counted per LINE exactly as the RPC does: a line
+  // labelled with the invoice's currency whose amount_in_currency is 0 is
+  // still a readable LINE and must keep the fallback disabled, because its
+  // real SEK ledger movement is excluded from sekSideTotal.
+  let readableCount = 0
+  let sekSideTotal = 0
+  let foreignLabelCount = 0
   for (const raw of lines) {
     const line = raw as {
       account_number: string
@@ -471,9 +448,19 @@ export async function validateVoucherForSupplierInvoiceLink(
       amount_in_currency: number | string | null
     }
     if (!line.account_number?.startsWith(AP_ACCOUNT_PREFIX)) continue
+    const rawDebit = Number(line.debit_amount) || 0
+    if (invoiceCurrency !== 'SEK' && rawDebit > 0) {
+      if (line.currency === invoiceCurrency && line.amount_in_currency != null) {
+        readableCount += 1
+      } else if ((line.currency ?? 'SEK') === 'SEK') {
+        sekSideTotal += rawDebit
+      } else {
+        foreignLabelCount += 1
+      }
+    }
     const debit = ledgerLineSideAmountIn(line, invoiceCurrency, 'debit')
     if (debit === null) {
-      if ((Number(line.debit_amount) || 0) > 0 && unconvertibleLineCurrency === undefined) {
+      if (rawDebit > 0 && unconvertibleLineCurrency === undefined) {
         unconvertibleLineCurrency = line.currency
       }
       continue
@@ -485,14 +472,49 @@ export async function validateVoucherForSupplierInvoiceLink(
   apDebitTotal = round2(apDebitTotal)
 
   if (unconvertibleLineCurrency !== undefined) {
-    return {
-      ok: false,
-      code: 'LINK_SI_VOUCHER_CURRENCY_MISMATCH',
-      details: {
-        invoice_currency: invoice.currency,
-        line_currency: unconvertibleLineCurrency,
-      },
+    // SEK-booked settlement fallback, mirroring the RPC gate byte-for-byte
+    // (the supplier side has no kontantmetoden branch): zero readable lines,
+    // every unreadable line SEK-booked, a sane exchange_rate, and the
+    // voucher's SEK total within 10% of remaining * rate. The RPC settles the
+    // FULL remaining and books the FX residual to 3960/7960 as its own
+    // verifikat; the validation outcome only has to agree.
+    const exchangeRate = Number(invoice.exchange_rate)
+    const fallbackEligible =
+      readableCount === 0 &&
+      foreignLabelCount === 0 &&
+      sekSideTotal > 0 &&
+      Number.isFinite(exchangeRate) &&
+      exchangeRate > 0 &&
+      exchangeRate < 100000
+    if (!fallbackEligible) {
+      return {
+        ok: false,
+        code: 'LINK_SI_VOUCHER_CURRENCY_MISMATCH',
+        details: {
+          invoice_currency: invoice.currency,
+          line_currency: unconvertibleLineCurrency,
+        },
+      }
     }
+    const sekTotal = round2(sekSideTotal)
+    const bookedSek = round2(remainingAmount * exchangeRate)
+    if (Math.abs(sekTotal - bookedSek) > bookedSek * 0.1) {
+      return {
+        ok: false,
+        code: 'LINK_SI_VOUCHER_CURRENCY_MISMATCH',
+        details: {
+          invoice_currency: invoice.currency,
+          line_currency: unconvertibleLineCurrency,
+          reason: 'fx_deviation_too_large',
+          expected_sek: bookedSek,
+          voucher_sek: sekTotal,
+        },
+      }
+    }
+    // Full-remaining settlement, exactly as the RPC computes it. lineCurrency
+    // is null here (no readable line), so the label guard below passes and the
+    // exceeds-remaining guard sees an equal amount.
+    apDebitTotal = round2(remainingAmount)
   }
 
   if (apDebitTotal <= 0) {
@@ -701,6 +723,19 @@ export async function linkSupplierInvoiceToVoucher(
     })
   }
 
+  // The invoice is settled, so every transaction still carrying a suggestion
+  // pointer at it is dead: retire them (issue #1259). No exceptTransactionId:
+  // the reconciled row (if any) has already had its own hint cleared by the
+  // auto-reconcile tag update, so nothing here needs preserving.
+  if (result.invoice_status === 'paid') {
+    await clearSettledInvoiceSuggestions(
+      supabase,
+      companyId,
+      'supplier_invoice',
+      params.supplierInvoiceId,
+    )
+  }
+
   return {
     ok: true,
     result: {
@@ -730,28 +765,10 @@ function computeRemaining(invoice: SupplierInvoice): number {
   return Math.max(0, round2(invoice.total - paid))
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100
-}
-
-function isDateWithinDays(a: string, b: string, days: number): boolean {
-  const ad = new Date(a).getTime()
-  const bd = new Date(b).getTime()
-  if (Number.isNaN(ad) || Number.isNaN(bd)) return false
-  return Math.abs(ad - bd) <= days * 24 * 3600 * 1000
-}
-
 function descriptionMentionsToken(description: string | null, token: string): boolean {
   if (!description || !token) return false
   const normalizedDesc = description.replace(/\s+/g, '').toLowerCase()
   const normalizedTok = token.replace(/\s+/g, '').toLowerCase()
   if (normalizedTok.length < 2) return false
   return normalizedDesc.includes(normalizedTok)
-}
-
-function formatNumber(n: number): string {
-  return new Intl.NumberFormat('sv-SE', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(n)
 }

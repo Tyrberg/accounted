@@ -47,6 +47,12 @@ import { InvoicePDF } from '@/lib/invoices/pdf-template'
 
 const mockSendEmail = vi.fn()
 const mockIsConfigured = vi.fn()
+// The sender resolver reads company_sending_domains; keep it out of the
+// queued-mock sequence (its own tests live in lib/email/__tests__).
+vi.mock('@/lib/email/invoice-sender', () => ({
+  resolveInvoiceSender: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('@/lib/email/service', () => ({
   getEmailService: () => ({
     sendEmail: (...args: unknown[]) => mockSendEmail(...args),
@@ -383,6 +389,20 @@ describe('POST /api/invoices/[id]/send', () => {
     expect(mockSendEmail).not.toHaveBeenCalled()
     },
   )
+
+  it('does not allocate a number or send when the registered company has no VAT number', async () => {
+    enqueue({ data: makeInvoice({ ...invoice, invoice_number: null }), error: null })
+    enqueue({ data: { ...company, vat_registered: true, vat_number: null }, error: null })
+
+    const request = createMockRequest('/api/invoices/inv-1/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('INVOICE_SEND_VAT_NUMBER_MISSING')
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
 
   it('rejects custom recipients from a non-admin company member before allocation', async () => {
     enqueue({ data: invoice, error: null })

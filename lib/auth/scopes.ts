@@ -10,7 +10,15 @@
  * Endpoints not listed here are public (no auth): only the discovery routes
  * (`/llms.txt`, `/.well-known/skills`, `/api/v1/health`, `/api/v1/openapi.json`)
  * fall into that bucket. Everything else under `/api/v1/` MUST be in this map
- * or the wrapper will refuse the request with INSUFFICIENT_SCOPE.
+ * or the wrapper answers NOT_FOUND before it even looks at the bearer token
+ * (`resolveRequiredScope` returns null for an unknown path).
+ *
+ * This map and the endpoint registry (`lib/api/v1/registry.ts`, populated by
+ * `load-routes.ts`) are kept in lock-step by
+ * `lib/api/v1/__tests__/scope-registry-parity.test.ts`: every registered
+ * endpoint needs an entry with the same scope, and every entry needs a
+ * registered endpoint. The inbox-items stamp route shipped without an entry
+ * and answered 404 to valid keys until that test existed.
  */
 
 import type { ApiKeyScope } from './api-keys'
@@ -22,7 +30,6 @@ import type { ApiKeyScope } from './api-keys'
 export const V1_PUBLIC_ENDPOINTS: ReadonlyArray<string> = [
   'GET /api/v1/health',
   'GET /api/v1/openapi.json',
-  'GET /api/v1/openapi.yaml',
 ]
 
 /**
@@ -38,13 +45,14 @@ export const V1_PUBLIC_ENDPOINTS: ReadonlyArray<string> = [
 export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   // Companies
   'GET /api/v1/companies': 'companies:read',
-  'GET /api/v1/companies/:companyId': 'companies:read',
+  // Issue #1814: programmatic company creation (partner provisioning, agents).
+  'POST /api/v1/companies': 'companies:write',
+  // Issue #1348: company-settings write (same field set as the MCP tool
+  // gnubok_update_company_settings; direct write, no staging).
+  'PATCH /api/v1/companies/:companyId/settings': 'companies:write',
 
   // Operations (async long-running tasks)
   'GET /api/v1/operations/:id': 'operations:read',
-
-  // Events (webhook fallback / event log polling)
-  'GET /api/v1/companies/:companyId/events': 'events:read',
 
   // Customers (Phase 2 PR-A: reads; Phase 2 PR-B-1: writes)
   'GET /api/v1/companies/:companyId/customers': 'customers:read',
@@ -58,12 +66,16 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'GET /api/v1/companies/:companyId/invoices/:id': 'invoices:read',
   'POST /api/v1/companies/:companyId/invoices': 'invoices:write',
   'PATCH /api/v1/companies/:companyId/invoices/:id': 'invoices:write',
+  // Draft deletion: hard delete unnumbered drafts, makulering for numbered
+  // ones. Non-drafts are refused (credit note is the only reversal path).
+  'DELETE /api/v1/companies/:companyId/invoices/:id': 'invoices:write',
   // Phase 2 PR-B-2b: action verbs. URL uses /verb subpath (not Google-AIP-style :verb)
   // because Next.js routes don't support `:` in folder names.
   'POST /api/v1/companies/:companyId/invoices/:id/mark-sent': 'invoices:write',
   'POST /api/v1/companies/:companyId/invoices/:id/mark-paid': 'invoices:write',
   'POST /api/v1/companies/:companyId/invoices/:id/credit': 'invoices:write',
   'POST /api/v1/companies/:companyId/invoices/:id/send': 'invoices:write',
+  'POST /api/v1/companies/:companyId/invoices/:id/quote-status': 'invoices:write',
   'POST /api/v1/companies/:companyId/invoices/bulk-create': 'invoices:write',
   // Phase 2 PR-B-3: invoice PDF + customer bulk-create.
   'GET /api/v1/companies/:companyId/invoices/:id/pdf': 'invoices:read',
@@ -105,10 +117,16 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'POST /api/v1/companies/:companyId/fiscal-periods/:id/currency-revaluation': 'bookkeeping:write',
   // Compliance check (Accounted's defensible edge).
   'GET /api/v1/companies/:companyId/compliance/check': 'compliance:read',
+  // #1663: filed momsdeklaration read (SKV inlamnat/beslutat). Rides
+  // compliance:read, mirroring the MCP gnubok_vat_declaration_status mapping.
+  'GET /api/v1/companies/:companyId/skatteverket/vat-declarations': 'compliance:read',
   // Phase 4 PR-3: Documents (multipart).
   'POST /api/v1/companies/:companyId/documents': 'documents:write',
   'GET /api/v1/companies/:companyId/documents/:id/download': 'documents:read',
   'POST /api/v1/companies/:companyId/documents/:id/link': 'documents:write',
+  // Inbox item stamp: closes an invoice_inbox_items row against the JE it
+  // was booked to. Rides documents:write like the link verb it complements.
+  'POST /api/v1/companies/:companyId/inbox-items/:id/stamp': 'documents:write',
 
   // Phase 3: transactions + reconciliation vertical.
   // Reads
@@ -121,12 +139,39 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'POST /api/v1/companies/:companyId/transactions/:id/uncategorize': 'transactions:write',
   'POST /api/v1/companies/:companyId/transactions/:id/match-invoice': 'transactions:write',
   'POST /api/v1/companies/:companyId/transactions/:id/match-supplier-invoice': 'transactions:write',
+  // Ignore / restore: no verifikat, so it is the locked-period escape hatch
+  // for rows that are not business events (issue #1661).
+  'POST /api/v1/companies/:companyId/transactions/:id/ignore': 'transactions:write',
+  'DELETE /api/v1/companies/:companyId/transactions/:id/ignore': 'transactions:write',
   // Writes: bulk
   'POST /api/v1/companies/:companyId/transactions/ingest': 'transactions:write',
   'POST /api/v1/companies/:companyId/transactions/batch-categorize': 'transactions:write',
-  // Reconciliation
+  // Cash accounts: the bank/kassa register incl. the bank-reported balance
+  // (booked + available + balance_updated_at) from the PSD2 sync.
+  'GET /api/v1/companies/:companyId/cash-accounts': 'transactions:read',
+  // Bank connections: PSD2 connection health (status, last_synced_at,
+  // consent_expires). companies:read, mirroring the MCP gnubok_connect_bank
+  // mapping: connection metadata, no transaction data.
+  'GET /api/v1/companies/:companyId/bank-connections': 'companies:read',
+  // Triggering a sync writes transactions: transactions:write, like the
+  // MCP gnubok_sync_bank twin.
+  'POST /api/v1/companies/:companyId/bank-connections/:connectionId/sync': 'transactions:write',
+  // Reconciliation (legacy bank-only routes; kept as aliases of the
+  // account-keyed routes below, with their original scopes)
   'POST /api/v1/companies/:companyId/reconciliation/bank/run': 'transactions:write',
   'GET /api/v1/companies/:companyId/reconciliation/bank/status': 'transactions:read',
+  // Reconciliation, account-keyed (bank:<cash_account_id> | skattekonto):
+  // the account list, the bridge, the item buckets, links and ignore flags.
+  'GET /api/v1/companies/:companyId/reconciliation/accounts': 'reconciliation:read',
+  'GET /api/v1/companies/:companyId/reconciliation/accounts/:accountKey': 'reconciliation:read',
+  'GET /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/items': 'reconciliation:read',
+  'POST /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/links': 'reconciliation:write',
+  'DELETE /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/links/:linkId': 'reconciliation:write',
+  'POST /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/items/:itemId/ignore': 'reconciliation:write',
+  'GET /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/signoff': 'reconciliation:read',
+  'POST /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/signoff': 'reconciliation:signoff',
+  'POST /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/signoff/:signoffId/reopen': 'reconciliation:signoff',
+  'POST /api/v1/companies/:companyId/reconciliation/accounts/:accountKey/residual': 'transactions:write',
 
   // Phase 5 PR-3: Reports + import async. Reports are read-only over
   // existing lib/reports/* generators; imports are async over the Phase 4
@@ -140,6 +185,10 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'GET /api/v1/companies/:companyId/reports/trial-balance': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/balance-sheet': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/income-statement': 'reports:read',
+  // Binary reports: PDF exports of the two financial statements, sharing the
+  // dashboard's renderer (custom date ranges supported via query params).
+  'GET /api/v1/companies/:companyId/reports/balance-sheet/pdf': 'reports:read',
+  'GET /api/v1/companies/:companyId/reports/income-statement/pdf': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/general-ledger': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/journal-register': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/vat-declaration': 'reports:read',
@@ -185,6 +234,9 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   // detail endpoint is the identity drill-in.
   'GET /api/v1/companies/:companyId/salary-runs/:id/employees': 'payroll:read',
   'GET /api/v1/companies/:companyId/salary-runs/:id/employees/:employeeId': 'payroll:read',
+  // Per-run base salary edit (variable owner pay): draft-only write of
+  // salary_run_employees.monthly_salary; the employee master is untouched.
+  'PATCH /api/v1/companies/:companyId/salary-runs/:id/employees/:employeeId': 'payroll:write',
   'GET /api/v1/companies/:companyId/salary-runs/:id/payslips/:employeeId/pdf': 'payroll:read',
   // Payroll gap-closure 1.2: payslip line writes (draft runs only).
   'POST /api/v1/companies/:companyId/salary-runs/:id/employees/:employeeId/lines': 'payroll:write',

@@ -1,24 +1,28 @@
 'use client'
 
 import { useState, useEffect, useMemo, useCallback, Suspense } from 'react'
+import { useCompanySettings, useCustomers } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import dynamic from 'next/dynamic'
 import { useLocale, useTranslations } from 'next-intl'
 import { useSearchParams, useRouter, usePathname } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Input } from '@/components/ui/input'
+import { ToolbarSearch } from '@/components/ui/toolbar-search'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TH_CLASS, TD_CLASS } from '@/components/ui/dry-table'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
-import { Plus, Search, Users, Lock, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
+import { Plus, Users, Lock, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { EmptyCustomers, EmptyState } from '@/components/ui/empty-state'
 import { ReportExportMenu } from '@/components/reports/ReportExportMenu'
 import { cn } from '@/lib/utils'
 import Link from 'next/link'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { SuggestionsAttn } from '@/components/parties/SuggestionsAttn'
 import type { Customer, CustomerType, CreateCustomerInput } from '@/types'
+import { customerListIdentifier } from '@/lib/customers/mask-personal-number'
 
 const CustomerForm = dynamic(
   () => import('@/components/customers/CustomerForm'),
@@ -53,8 +57,11 @@ const SORTABLE_COLUMNS: ReadonlyArray<SortColumn> = [
 ]
 const INITIAL_VISIBLE_ROWS = 100
 
+// Business rows show org_number; individual rows show the masked
+// personnummer the API returns, and a legacy individual row that still
+// carries its personnummer in org_number shows that masked too, never raw.
 function getIdentifier(customer: Customer): string {
-  return customer.org_number || customer.personal_number || ''
+  return customerListIdentifier(customer)
 }
 
 function compareStrings(a: string, b: string): number {
@@ -63,12 +70,26 @@ function compareStrings(a: string, b: string): number {
 
 function CustomersPageInner() {
   const { canWrite } = useCanWrite()
-  const [customers, setCustomers] = useState<Customer[]>([])
-  const [isLoading, setIsLoading] = useState(true)
+  // The roster from the session cache (lib/reference-data): /api/customers
+  // masks the personnummer column server-side (see the note that used to sit
+  // on fetchCustomers), the list is shared with every customer picker, and
+  // a revisit renders from cache. Skeleton only on the very first load.
+  const { customers, isLoading: customersLoading, error: customersError } = useCustomers()
+  const isLoading = customersLoading && customers.length === 0
   const [searchTerm, setSearchTerm] = useState('')
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_ROWS)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [isCreating, setIsCreating] = useState(false)
+  // Company default payment terms (Inställningar → Fakturering). Prefilled
+  // into the new-customer form so it opens on the company's own default
+  // instead of a hardcoded 30.
+  // Default payment terms from the session-cached settings row; the dialog
+  // falls back to 30 until (or unless) the company set one.
+  const { settings: companySettings } = useCompanySettings()
+  const companyDefaultTerms =
+    typeof companySettings?.invoice_default_days === 'number' && companySettings.invoice_default_days > 0
+      ? companySettings.invoice_default_days
+      : null
   const { toast } = useToast()
   const t = useTranslations('customers')
   const tCommon = useTranslations('common')
@@ -100,44 +121,14 @@ function CustomersPageInner() {
     [searchParams, sortColumn, sortDir, router, pathname]
   )
 
-  /**
-   * Read the roster through the API, not straight from Supabase.
-   *
-   * personal_number holds AES-256-GCM ciphertext (migration 20260726110000).
-   * A browser-side select('*') handed this page 76 to 82 hex characters and
-   * getIdentifier() rendered them into the nowrap identifier cell, which is
-   * what shredded the table layout for companies with private customers.
-   * GET /api/customers maps every row through maskCustomerRow, so the
-   * ciphertext now never leaves the server and the column shows the same
-   * '********-1234' the detail view does.
-   *
-   * No `company` guard: the route resolves the active company server-side, so
-   * the fetch no longer has to wait for CompanyContext to hydrate. The old
-   * guard could leave the list empty on a slow context load, because the
-   * effect below runs once and never retries.
-   */
-  async function fetchCustomers() {
-    setIsLoading(true)
-    try {
-      const response = await fetch('/api/customers')
-      if (!response.ok) throw new Error('Failed to load customers')
-      const { data } = await response.json()
-      setCustomers(data || [])
-    } catch {
-      toast({
-        title: t('load_failed_title'),
-        description: t('load_failed_description'),
-        variant: 'destructive',
-      })
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
   useEffect(() => {
-    fetchCustomers()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    if (!customersError) return
+    toast({
+      title: t('load_failed_title'),
+      description: t('load_failed_description'),
+      variant: 'destructive',
+    })
+  }, [customersError, toast, t])
 
   async function handleCreateCustomer(data: CreateCustomerInput) {
     setIsCreating(true)
@@ -161,7 +152,9 @@ function CustomersPageInner() {
         title: t('created_title'),
         description: t('created_description', { name: data.name }),
       })
-      setCustomers([...customers, result.data])
+      // Every picker shares the cached list: refresh it instead of patching
+      // this page's copy.
+      await invalidateReferenceData('ref:customers')
       setIsDialogOpen(false)
     }
 
@@ -285,26 +278,28 @@ function CustomersPageInner() {
               <CustomerForm
                 onSubmit={handleCreateCustomer}
                 isLoading={isCreating}
+                initialData={
+                  companyDefaultTerms !== null
+                    ? { default_payment_terms: companyDefaultTerms }
+                    : undefined
+                }
               />
             </DialogContent>
           </Dialog>
         </div>
       </div>
+      <SuggestionsAttn side="customer" />
 
       {/* Toolbar: search (concept) */}
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative min-w-[220px] max-w-xs flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            placeholder={t('search_placeholder')}
-            value={searchTerm}
-            onChange={(e) => {
-              setSearchTerm(e.target.value)
-              setVisibleCount(INITIAL_VISIBLE_ROWS)
-            }}
-            className="h-9 pl-10"
-          />
-        </div>
+        <ToolbarSearch
+          placeholder={t('search_placeholder')}
+          value={searchTerm}
+          onChange={(e) => {
+            setSearchTerm(e.target.value)
+            setVisibleCount(INITIAL_VISIBLE_ROWS)
+          }}
+        />
       </div>
 
       {isLoading ? (
@@ -318,7 +313,7 @@ function CustomersPageInner() {
           <EmptyState
             icon={Users}
             title={t('no_search_results_title')}
-            description={t('no_search_results_description', { term: searchTerm })}
+            description={<span data-ph-mask="">{t('no_search_results_description', { term: searchTerm })}</span>}
           />
         ) : (
           <EmptyCustomers onAction={() => setIsDialogOpen(true)} />

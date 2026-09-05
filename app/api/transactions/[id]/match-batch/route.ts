@@ -2,8 +2,9 @@ import { NextResponse } from 'next/server'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { MatchBatchSchema } from '@/lib/api/schemas'
-import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { eventBus } from '@/lib/events/bus'
+import { clearSettledBatchAllocationSuggestions } from '@/lib/invoices/clear-settled-batch-allocations'
 import { ensureInitialized } from '@/lib/init'
 import type { Invoice, SupplierInvoice, Transaction } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
@@ -72,6 +73,35 @@ export const POST = withRouteContext(
 
     // PR #607 round 3: p_user_id removed: RPC resolves caller from
     // auth.uid() directly. Keeps the attack surface off the API boundary.
+    // Only fakturor carry a receivable. The RPC gates on status alone, so a
+    // sent proforma or quote in the allocation list is refused here, as the
+    // single-invoice match route does.
+    const customerInvoiceIds = Array.from(
+      new Set(
+        validation.data.allocations.flatMap((a) =>
+          a.kind === 'customer_invoice' && a.invoice_id ? [a.invoice_id] : [],
+        ),
+      ),
+    )
+    if (customerInvoiceIds.length > 0) {
+      const { data: docRows, error: docError } = await supabase
+        .from('invoices')
+        .select('id, document_type')
+        .in('id', customerInvoiceIds)
+        .eq('company_id', companyId)
+      if (docError) {
+        txLog.error('match-batch: document lookup failed', docError)
+        return errorResponse(docError, txLog, { requestId })
+      }
+      const offender = (docRows ?? []).find((r) => r.document_type && r.document_type !== 'invoice')
+      if (offender) {
+        return errorResponseFromCode('MATCH_INVOICE_NOT_INVOICE_TYPE', txLog, {
+          requestId,
+          details: { invoiceId: offender.id, documentType: offender.document_type },
+        })
+      }
+    }
+
     const { data, error } = await supabase.rpc('match_batch_allocate', {
       p_tx_id: transactionId,
       p_allocations: validation.data.allocations,
@@ -148,6 +178,17 @@ export const POST = withRouteContext(
         txLog.warn('match_batch event emission failed', err as Error)
       }
     }
+
+    // Every allocation the RPC settled in full retires its suggestion pointer
+    // from the company's OTHER transactions (issue #1259). This request's own
+    // row is linked by the RPC, so it is excluded there. Shared with the MCP
+    // executor for the same RPC (commitMatchBatchAllocate).
+    await clearSettledBatchAllocationSuggestions(
+      supabase,
+      companyId!,
+      result.allocations,
+      transactionId,
+    )
 
     return NextResponse.json({
       data: {

@@ -34,6 +34,7 @@ interface SeededTables {
   supplier_invoices?: Row[]
   invoice_payments?: Row[]
   supplier_invoice_payments?: Row[]
+  company_settings?: Row[]
 }
 
 /**
@@ -178,6 +179,7 @@ function fxInvoice(overrides: Row = {}): Row {
   return {
     id: `inv-${Math.random().toString(36).slice(2, 10)}`,
     company_id: 'company-1',
+    document_type: 'invoice',
     status: 'sent',
     currency: 'EUR',
     exchange_rate: 11.2,
@@ -225,6 +227,9 @@ vi.mock('@/lib/bookkeeping/currency-revaluation', () => ({
 vi.mock('../period-service', () => ({
   lockPeriod: vi.fn(),
   closePeriod: vi.fn(),
+  // Default: clean books. Individual tests override to simulate unbooked
+  // transactions or a failed check (fail-closed).
+  countUnbookedInPeriod: vi.fn().mockResolvedValue({ untriaged: 0, businessUnbooked: 0 }),
   createNextPeriod: vi.fn(),
   findNextPeriod: vi.fn().mockResolvedValue(null),
 }))
@@ -232,7 +237,12 @@ vi.mock('../period-service', () => ({
 import { validateYearEndReadiness, previewYearEndClosing } from '../year-end-service'
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
 import { generateIncomeStatement } from '@/lib/reports/income-statement'
-import { findNextPeriod } from '../period-service'
+import { countUnbookedInPeriod, findNextPeriod } from '../period-service'
+import {
+  buildCutoffLines,
+  KONTANTMETOD_CUTOFF_DESCRIPTIONS,
+  reverseLines,
+} from '../kontantmetod-cutoff'
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -279,6 +289,44 @@ describe('validateYearEndReadiness', () => {
     const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
     expect(result.ready).toBe(false)
     expect(result.errors.some((e: string) => e.includes('utkast'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'DRAFT_ENTRIES')).toBe(true)
+    // errors is the message mirror of blockers: same order, same strings.
+    expect(result.errors).toEqual(result.blockers.map((b) => b.message))
+  })
+
+  it('returns a coded PERIOD_NOT_FOUND blocker when the period is missing', async () => {
+    results = [{ data: null, error: { message: 'not found' } }]
+
+    const supabase = makeClient()
+    const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-x')
+    expect(result.ready).toBe(false)
+    expect(result.blockers).toEqual([
+      { code: 'PERIOD_NOT_FOUND', message: 'Räkenskapsperioden hittades inte' },
+    ])
+    expect(result.errors).toEqual(['Räkenskapsperioden hittades inte'])
+  })
+
+  it('codes closed-period, existing closing entry, and continuity blockers', async () => {
+    const period = {
+      ...makeFiscalPeriod({ id: 'fp-1', is_closed: true, closing_entry_id: 'ce-1' }),
+      continuity_verified: false,
+    }
+    results = noGapResults(period)
+
+    vi.mocked(generateTrialBalance).mockResolvedValue({
+      rows: [],
+      isBalanced: true,
+      totalDebit: 0,
+      totalCredit: 0,
+    } as never)
+
+    const supabase = makeClient()
+    const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
+    expect(result.ready).toBe(false)
+    const codes = result.blockers.map((b) => b.code)
+    expect(codes).toContain('PERIOD_ALREADY_CLOSED')
+    expect(codes).toContain('CLOSING_ENTRY_EXISTS')
+    expect(codes).toContain('CONTINUITY_MISMATCH')
   })
 
   it('returns errors when trial balance is unbalanced', async () => {
@@ -297,6 +345,7 @@ describe('validateYearEndReadiness', () => {
     expect(result.ready).toBe(false)
     expect(result.trialBalanceBalanced).toBe(false)
     expect(result.errors.some((e: string) => e.includes('Råbalansen balanserar inte'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'TRIAL_BALANCE_UNBALANCED')).toBe(true)
   })
 
   it('returns error when period has not yet ended', async () => {
@@ -319,6 +368,57 @@ describe('validateYearEndReadiness', () => {
     const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
     expect(result.ready).toBe(false)
     expect(result.errors.some((e: string) => e.includes('slutdatumet har inte passerat'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'PERIOD_NOT_ENDED')).toBe(true)
+  })
+
+  it('blocks when the period contains unbooked bank transactions', async () => {
+    // Previously only lockPeriod caught this, at step 7 of the execute flow,
+    // AFTER the closing entry had posted: readiness said ready: true and the
+    // run aborted mid-flow. The count must block up front.
+    const period = makeFiscalPeriod({ id: 'fp-1', is_closed: false, closing_entry_id: null })
+    results = noGapResults(period)
+
+    vi.mocked(generateTrialBalance).mockResolvedValue({
+      rows: [],
+      isBalanced: true,
+      totalDebit: 0,
+      totalCredit: 0,
+    } as never)
+    vi.mocked(countUnbookedInPeriod).mockResolvedValueOnce({ untriaged: 2, businessUnbooked: 1 })
+
+    const supabase = makeClient()
+    const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
+    expect(result.ready).toBe(false)
+    expect(result.unbookedTransactionCount).toBe(3)
+    expect(result.errors.some((e: string) => e.includes('3 transaktioner i perioden saknar bokföring'))).toBe(true)
+    // The code is what the wizard and the MCP tool route on: losing it would
+    // silently drop the remediation link and the 'unbooked_transactions' kind.
+    expect(result.blockers.some((b) => b.code === 'UNBOOKED_TRANSACTIONS')).toBe(true)
+    expect(result.errors).toEqual(result.blockers.map((b) => b.message))
+  })
+
+  it('fails closed when the unbooked-transaction check cannot run', async () => {
+    const period = makeFiscalPeriod({ id: 'fp-1', is_closed: false, closing_entry_id: null })
+    results = noGapResults(period)
+
+    vi.mocked(generateTrialBalance).mockResolvedValue({
+      rows: [],
+      isBalanced: true,
+      totalDebit: 0,
+      totalCredit: 0,
+    } as never)
+    vi.mocked(countUnbookedInPeriod).mockRejectedValueOnce(new Error('query failed'))
+
+    const supabase = makeClient()
+    const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
+    expect(result.ready).toBe(false)
+    expect(
+      result.errors.some((e: string) =>
+        e.includes('Kontrollen av obokförda transaktioner kunde inte genomföras'),
+      ),
+    ).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'UNBOOKED_CHECK_FAILED')).toBe(true)
+    expect(result.errors).toEqual(result.blockers.map((b) => b.message))
   })
 
   it('warns on explained voucher gaps', async () => {
@@ -400,6 +500,7 @@ describe('validateYearEndReadiness', () => {
     const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
     expect(result.ready).toBe(false)
     expect(result.errors.some((e: string) => e.includes('Oförklarat verifikationsnummerglapp'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'UNEXPLAINED_VOUCHER_GAP')).toBe(true)
     expect(result.unexplainedGaps).toHaveLength(1)
     expect(result.unexplainedGaps[0]).toEqual({ gap_start: 5, gap_end: 7, series: 'A' })
   })
@@ -481,6 +582,7 @@ describe('validateYearEndReadiness', () => {
     const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
     expect(result.ready).toBe(false)
     expect(result.errors.some((e: string) => e.includes('Nummerserien i serie'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'SEQUENCE_COUNTER_BEHIND')).toBe(true)
     expect(result.sequenceMismatches).toHaveLength(1)
     expect(result.sequenceMismatches[0]).toEqual({ series: 'A', sequenceCounter: 5, actualMax: 10 })
   })
@@ -563,6 +665,92 @@ describe('validateYearEndReadiness', () => {
     const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
     expect(result.ready).toBe(false)
     expect(result.errors.some((e: string) => e.includes('redan ingående balanser bokförda'))).toBe(true)
+    expect(result.blockers.some((b) => b.code === 'NEXT_PERIOD_HAS_IB')).toBe(true)
+  })
+})
+
+describe('validateYearEndReadiness: kontantmetoden cut-off gate', () => {
+  const nextPeriod = {
+    id: 'fp-2', period_start: '2025-01-01', period_end: '2025-12-31',
+    is_closed: false, locked_at: null, opening_balance_entry_id: null,
+  }
+  const openInvoice = {
+    id: 'inv-1', company_id: 'company-1', invoice_number: 'F-1',
+    invoice_date: '2024-12-15', status: 'sent', total: 1250, total_sek: 1250,
+    vat_amount: 250, vat_amount_sek: 250, vat_treatment: 'standard_25',
+    credited_invoice_id: null, document_type: 'invoice',
+  }
+
+  beforeEach(() => {
+    vi.mocked(generateTrialBalance).mockResolvedValue({
+      rows: [], isBalanced: true, totalDebit: 10000, totalCredit: 10000,
+    } as never)
+    vi.mocked(findNextPeriod).mockResolvedValue(nextPeriod as never)
+  })
+
+  function cashTables(journalEntries: Row[] = []): SeededTables {
+    return {
+      ...fxBaseTables({ journal_entries: journalEntries }),
+      company_settings: [{
+        company_id: 'company-1', accounting_method: 'cash', entity_type: 'aktiebolag',
+      }],
+      invoices: [openInvoice],
+    }
+  }
+
+  it('blocks year-end when an outstanding invoice has no matching cut-off pair', async () => {
+    const result = await validateYearEndReadiness(
+      makeFilteringClient(cashTables()) as never,
+      'company-1', 'user-1', 'fp-1',
+    )
+
+    expect(result.ready).toBe(false)
+    expect(result.blockers).toContainEqual(expect.objectContaining({
+      code: 'KONTANTMETOD_CUTOFF_REQUIRED',
+    }))
+  })
+
+  it('clears only after the exact cut-off and next-period reversal are posted', async () => {
+    const expected = buildCutoffLines([{
+      id: 'inv-1', reference: 'F-1', vatTreatment: 'standard_25',
+      outstanding: 1250, vat: 250,
+    }], [])
+    const markers = [
+      {
+        id: 'cutoff', company_id: 'company-1', fiscal_period_id: 'fp-1',
+        voucher_series: 'A', voucher_number: 10, status: 'posted', source_type: 'year_end',
+        source_id: 'fp-1', entry_date: '2024-12-31',
+        description: KONTANTMETOD_CUTOFF_DESCRIPTIONS.receivable,
+        lines: expected.receivableLines,
+      },
+      {
+        id: 'reversal', company_id: 'company-1', fiscal_period_id: 'fp-2',
+        voucher_series: 'A', voucher_number: 1, status: 'posted', source_type: 'year_end',
+        source_id: 'fp-1', entry_date: '2025-01-01',
+        description: KONTANTMETOD_CUTOFF_DESCRIPTIONS.receivableReversal,
+        lines: reverseLines(expected.receivableLines),
+      },
+    ]
+
+    const result = await validateYearEndReadiness(
+      makeFilteringClient(cashTables(markers)) as never,
+      'company-1', 'user-1', 'fp-1',
+    )
+    expect(result.blockers.some((blocker) =>
+      blocker.code === 'KONTANTMETOD_CUTOFF_REQUIRED' ||
+      blocker.code === 'KONTANTMETOD_CUTOFF_CHECK_FAILED',
+    )).toBe(false)
+    expect(result.ready).toBe(true)
+  })
+
+  it('fails closed when the cut-off query cannot run', async () => {
+    const result = await validateYearEndReadiness(
+      makeFilteringClient(cashTables(), 'company_settings') as never,
+      'company-1', 'user-1', 'fp-1',
+    )
+    expect(result.blockers).toContainEqual(expect.objectContaining({
+      code: 'KONTANTMETOD_CUTOFF_CHECK_FAILED',
+    }))
   })
 })
 
@@ -719,6 +907,21 @@ describe('validateYearEndReadiness: open FX items at balansdagen (ÅRL 4 kap. 13
     const supabase = makeFilteringClient(
       fxBaseTables({
         invoices: [fxInvoice({ id: 'inv-next-year', invoice_date: '2025-02-01' })],
+      })
+    )
+
+    const result = await validateYearEndReadiness(supabase as never, 'company-1', 'user-1', 'fp-1')
+
+    expect(result.warnings.filter((w: string) => w.includes('valuta'))).toHaveLength(0)
+  })
+
+  it('ignores sent EUR quotes and proformas: they are not receivables and sit on no 1510 balance', async () => {
+    const supabase = makeFilteringClient(
+      fxBaseTables({
+        invoices: [
+          fxInvoice({ id: 'quote-1', document_type: 'quote' }),
+          fxInvoice({ id: 'proforma-1', document_type: 'proforma', exchange_rate: null }),
+        ],
       })
     )
 

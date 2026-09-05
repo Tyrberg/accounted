@@ -255,6 +255,38 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     },
   )
 
+  it('rejects issuance when the registered company has no VAT number', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: {
+          data: {
+            accounting_method: 'accrual',
+            entity_type: 'enskild_firma',
+            bankgiro: '123-4567',
+            vat_registered: true,
+            vat_number: null,
+          },
+          error: null,
+        },
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_VAT_NUMBER_MISSING')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
   it('rejects delivery notes with VALIDATION_ERROR (regardless of status)', async () => {
     // Critical: the delivery-note guard must run BEFORE the status check
     // so a sent delivery note still returns 400 (per the documented
@@ -497,5 +529,70 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(res.status).toBe(400)
     const body = await res.json()
     expect(body.error.code).toBe('VALIDATION_ERROR')
+  })
+})
+
+describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent honours defer_invoice_booking (#967)', () => {
+  it('marks sent WITHOUT a journal entry when the company defers booking', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: DRAFT_INVOICE, error: null },
+          { data: SENT_INVOICE, error: null },
+        ],
+        company_settings: {
+          data: {
+            accounting_method: 'accrual',
+            defer_invoice_booking: true,
+            entity_type: 'enskild_firma',
+            bankgiro: '123-4567',
+          },
+          error: null,
+        },
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.journal_entry_id ?? null).toBeNull()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('dry-run preview reports would_create_journal_entry=false when booking is deferred', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: {
+          data: {
+            accounting_method: 'accrual',
+            defer_invoice_booking: true,
+            entity_type: 'enskild_firma',
+            bankgiro: '123-4567',
+          },
+          error: null,
+        },
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent?dry_run=true`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.preview.would_create_journal_entry).toBe(false)
+    expect(body.data.preview.accounting_method).toBe('accrual')
   })
 })

@@ -4,8 +4,8 @@
  * GET   : return the full webhook row (no secret).
  * PATCH : update name, description, webhook_url, active. Cannot change
  *          event_type (immutable: would require re-pinning api_version).
- *          Cannot rotate the secret here (separate flow, deferred to
- *          Phase 6 follow-up).
+ *          Cannot rotate the secret here: that is POST .../rotate-secret
+ *          (see ./rotate-secret/route.ts).
  * DELETE: hard delete the webhook. The webhook_deliveries.webhook_id FK
  *          is ON DELETE SET NULL (declared in migration 20260515170000),
  *          so the delivery audit trail SURVIVES webhook deletion
@@ -21,7 +21,8 @@ import { ok, noContent } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope, NoBodyResponse } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 import { validateWebhookUrl } from '@/lib/webhooks/url-guard'
 
 const WEBHOOK_DETAIL_COLUMNS =
@@ -124,7 +125,8 @@ registerEndpoint({
   description:
     'Update the URL, name, description, or active flag. event_type is immutable: delete and recreate to change it. Setting active=false manually pauses delivery without deleting; setting active=true clears any disabled_at/disabled_reason set by the auto-disable on HTTP 410.',
   useWhen: 'You need to point an existing webhook at a new URL or temporarily pause delivery.',
-  doNotUseFor: 'Rotating the signing secret (delete and recreate). Changing event_type.',
+  doNotUseFor:
+    'Rotating the signing secret: use POST /webhooks/{id}/rotate-secret, which issues a fresh secret in place and keeps the webhook id and delivery history. Changing event_type: delete and recreate.',
   pitfalls: [
     'Re-enabling a webhook (active: true) does NOT replay deliveries that went to dead status while it was disabled: those need POST /webhook-deliveries/{id}/retry.',
   ],
@@ -161,27 +163,11 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
   async (request, ctx, params) => {
     const { id } = await params.params
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
     const parsed = PatchWebhookSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const body = parsed.data
 
     // SSRF guard on webhook_url change: same DNS/IP-class validation as

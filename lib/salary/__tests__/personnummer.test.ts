@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
 import {
+  PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED,
   validatePersonnummer,
   extractLast4,
   extractBirthDate,
@@ -9,6 +10,7 @@ import {
   calculateAgeAtYearStart,
   maskPersonnummer,
   formatPersonnummer,
+  expandPersonnummerTo12,
   encryptPersonnummer,
   decryptPersonnummer,
 } from '../personnummer'
@@ -306,6 +308,47 @@ describe('encryption roundtrip', () => {
   })
 })
 
+describe('encryption key configuration guard (#1996)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('throws a coded error in production when PERSONNUMMER_ENCRYPTION_KEY is unset', () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('PERSONNUMMER_ENCRYPTION_KEY', '')
+
+    let thrown: unknown
+    try {
+      encryptPersonnummer('199001019802')
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    // The code is what withRouteContext -> errorResponse() dispatches on, so
+    // the route answers 503 with the registry message instead of a generic 500.
+    expect((thrown as { code?: unknown }).code).toBe(PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED)
+    expect(PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED).toBe('PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED')
+  })
+
+  it('decrypt is guarded the same way (genuine ciphertext, no key, production)', () => {
+    const ciphertext = encryptPersonnummer('199001019802')
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('PERSONNUMMER_ENCRYPTION_KEY', '')
+
+    expect(() => decryptPersonnummer(ciphertext)).toThrow(
+      expect.objectContaining({ code: PERSONNUMMER_ENCRYPTION_NOT_CONFIGURED }),
+    )
+  })
+
+  it('falls back to the deterministic dev key outside production', () => {
+    vi.stubEnv('NODE_ENV', 'test')
+    vi.stubEnv('PERSONNUMMER_ENCRYPTION_KEY', '')
+
+    const encrypted = encryptPersonnummer('199001019802')
+    expect(decryptPersonnummer(encrypted)).toBe('199001019802')
+  })
+})
+
 describe('decryptPersonnummer tolerance for unencrypted rows', () => {
   it('passes a raw 12-digit personnummer through unchanged (no crash)', () => {
     // A row stored unencrypted (pre-fix v1 create, or a seed) would otherwise
@@ -317,5 +360,49 @@ describe('decryptPersonnummer tolerance for unencrypted rows', () => {
   it('still decrypts genuine ciphertext', () => {
     const enc = encryptPersonnummer('199001019802')
     expect(decryptPersonnummer(enc)).toBe('199001019802')
+  })
+})
+
+describe('expandPersonnummerTo12', () => {
+  // Fixed clock (2026-08-17) so century inference is deterministic.
+  const now = new Date(2026, 7, 17)
+
+  it('passes a 12-digit value through with the separator stripped', () => {
+    expect(expandPersonnummerTo12('19900101-9802', now)).toBe('199001019802')
+    expect(expandPersonnummerTo12('199001019802', now)).toBe('199001019802')
+  })
+
+  it('expands a 10-digit value to the most recent past century', () => {
+    expect(expandPersonnummerTo12('900101-9802', now)).toBe('199001019802')
+    expect(expandPersonnummerTo12('9001019802', now)).toBe('199001019802')
+  })
+
+  it('keeps a birth date earlier this century in the 2000s', () => {
+    expect(expandPersonnummerTo12('250101-0025', now)).toBe('202501010025')
+  })
+
+  it('treats a birth date equal to today as this century', () => {
+    expect(expandPersonnummerTo12('260817-0000', now)).toBe('202608170000')
+  })
+
+  it('rolls a not-yet-reached date this century back to the 1900s', () => {
+    expect(expandPersonnummerTo12('261231-0000', now)).toBe('192612310000')
+  })
+
+  it('subtracts a further century for the over-100 plus separator', () => {
+    expect(expandPersonnummerTo12('900101+9802', now)).toBe('189001019802')
+  })
+
+  it('strips the samordningsnummer day offset for the comparison only', () => {
+    // Day 77 = real day 17 (today): this century. Day 78 = real day 18
+    // (tomorrow): last century. The returned digits keep the printed day.
+    expect(expandPersonnummerTo12('260877-0000', now)).toBe('202608770000')
+    expect(expandPersonnummerTo12('260878-0000', now)).toBe('192608780000')
+  })
+
+  it('returns null for shapes that are neither 10 nor 12 digits', () => {
+    expect(expandPersonnummerTo12('', now)).toBeNull()
+    expect(expandPersonnummerTo12('123', now)).toBeNull()
+    expect(expandPersonnummerTo12('********-9802', now)).toBeNull()
   })
 })

@@ -1,15 +1,21 @@
+import { Suspense } from 'react'
 import { redirect } from 'next/navigation'
+import { cookies } from 'next/headers'
 import DashboardContent from '@/components/dashboard/DashboardContent'
-import { getWorklistCounts, listSuggestedMatches } from '@/lib/worklist'
-import { listResumeItems } from '@/lib/worklist/resume'
-import { shouldShowOtherAccountHint } from '@/lib/company/other-account-hint'
-import type { OnboardingProgress } from '@/types'
+import { ChecklistSkeleton, PanesSkeleton } from '@/components/dashboard/HemSkeletons'
+import { COMPANY_PICKED_COOKIE } from '@/lib/company/context'
+import { isCockpitLandingRole } from '@/lib/company/home-domain'
+import { OAUTH_MCP_KEY_NAME } from '@/lib/auth/api-keys'
+import { claudeStepDone } from '@/lib/onboarding/checklist'
+import { createServiceClient } from '@/lib/supabase/server'
 import {
   getDashboardAuthContext,
   getDashboardCompanyId,
   getDashboardSettings,
+  getDashboardTeamMemberships,
   getResolvedDashboardAgentProfile,
 } from './request-context'
+import { HemChecklistSection, HemNoticesSection, HemPanesSection } from './hem-sections'
 
 export const dynamic = 'force-dynamic'
 
@@ -18,6 +24,14 @@ export const dynamic = 'force-dynamic'
 // dev_docs/last_session_resume.md §8), which also pruned their fetches:
 // the journal-line YTD aggregation, unpaid-invoice totals and deadline
 // queries are gone and the page got faster.
+//
+// Streaming: the page itself awaits only what the greeting shell and the
+// redirects need (settings, profile, agent profile, the Skatteverket flag).
+// The notice line, the setup checklist and the Att göra + Fortsätt panes are
+// async server components behind their own <Suspense> (hem-sections.tsx),
+// so ~30 queries fill three blocks in as they land instead of holding the
+// whole page behind the slowest one. RSC streaming applies to client
+// navigations too, not only hard loads.
 
 export default async function DashboardPage() {
   const [{ supabase, user }, companyId] = await Promise.all([
@@ -33,48 +47,70 @@ export default async function DashboardPage() {
     redirect('/onboarding')
   }
 
+  // Byrå landing: byrå owners/admins home to the cockpit, not to an
+  // auto-resolved client company. Role-gated 2026-08-27 (superseding the
+  // 2026-08-05 all-members widening): plain members land like regular users
+  // and open the cockpit from the nav when they want it; the middleware's
+  // zero-company steer stays ungated since a member with no client companies
+  // has nowhere else to land. companyId above can be the middleware's
+  // fallback (which it also writes back to user_preferences, so the DB can't
+  // tell picked from auto-picked); the session cookie stamped by
+  // setActiveCompany is the explicit-choice signal. Once they enter a client
+  // this session, "/" is that company's Hem again. Memberships are
+  // request-cached and shared with the layout.
+  const [cookieStore, teamMemberships] = await Promise.all([
+    cookies(),
+    getDashboardTeamMemberships(),
+  ])
+  if (!cookieStore.has(COMPANY_PICKED_COOKIE)) {
+    if (
+      teamMemberships.some(
+        (m) => m.teams?.kind === 'byra' && isCockpitLandingRole(m.role),
+      )
+    ) {
+      redirect('/byra')
+    }
+  }
+
   const now = new Date()
 
-  // Fetch all data in parallel
+  // Service role for the OAuth-key count below: api_keys' SELECT policy is
+  // company_id IN user_company_ids() (20260330130000), so through the user
+  // client a key minted companyless (company_id NULL, the connect-before-
+  // signup flow) or bound to a company the user has since archived or left is
+  // invisible, and the step would stay open for exactly the user who just
+  // connected. The query filters on user_id explicitly, so no other user's
+  // rows are reachable.
+  const serviceClient = await createServiceClient()
+
   const [
     settingsRes,
-    { count: customerCount },
-    { count: invoiceCount },
-    { count: transactionCount },
-    { data: bankConnections },
-    { count: sieImportCount },
-    { count: skatteverketTokenCount },
     { data: profile },
     agentProfile,
-    worklist,
-    suggestedMatches,
-    resumeItems,
-    otherAccountHint,
-  ] = await Promise.all([
-    getDashboardSettings(),
-    supabase.from('customers').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
-    supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
-    supabase.from('transactions').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
-    supabase.from('bank_connections').select('id, status, consent_expires, bank_name').eq('company_id', companyId).eq('status', 'active'),
-    supabase.from('sie_imports').select('*', { count: 'exact', head: true }).eq('company_id', companyId).eq('status', 'completed'),
-    // Skatteverket tokens are user-scoped (one BankID identity per user) but
-    // carry the active company_id; either filter would work: we use user_id
-    // because that's what the token-store reads/writes against.
-    supabase.from('skatteverket_tokens').select('*', { count: 'exact', head: true }).eq('user_id', user.id),
-    // First name for the greeting.
-    supabase.from('profiles').select('full_name').eq('id', user.id).maybeSingle(),
-    getResolvedDashboardAgentProfile(),
-    // Pending-work counts + suggested matches come from lib/worklist: the
-    // same source as the sidebar badges, so the numbers can never diverge.
-    getWorklistCounts(supabase, companyId),
-    listSuggestedMatches(supabase, companyId, 5),
-    // In-progress work for the Fortsätt pane: pure draft-state derivation.
-    listResumeItems(supabase, companyId, now),
-    // Wrong-account hint (#1231): true only when this account has zero
-    // journal entries while a same-orgnr company with real bookkeeping
-    // exists in another account. Common case costs one existence probe.
-    shouldShowOtherAccountHint(supabase),
-  ])
+    { count: skatteverketTokenCount },
+    { count: oauthKeyCount, error: oauthKeyError },
+  ] =
+    await Promise.all([
+      getDashboardSettings(),
+      // First name for the greeting.
+      supabase.from('profiles').select('full_name').eq('id', user.id).maybeSingle(),
+      getResolvedDashboardAgentProfile(),
+      // The Skatteverket promo below the panes needs this flag in the shell;
+      // the checklist section reads it again for its own step (cheap head count).
+      supabase.from('skatteverket_tokens').select('*', { count: 'exact', head: true }).eq('user_id', user.id).eq('company_id', companyId),
+      // The checklist's "Anslut till Claude" step is done when the MCP OAuth
+      // token route has minted a key for this user (claudeStepDone). Keyed on
+      // the user, not the company: the Claude connection follows the person,
+      // and the key's company_id is whatever was active at sign-in (or null
+      // for a companyless signup), so a company filter would miss real
+      // connections. Revoked rows do not count.
+      serviceClient
+        .from('api_keys')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id)
+        .eq('name', OAUTH_MCP_KEY_NAME)
+        .is('revoked_at', null),
+    ])
 
   // A FAILED settings read must not masquerade as "onboarding not done":
   // that sent fully onboarded users back to the wizard on a transient query
@@ -84,57 +120,71 @@ export default async function DashboardPage() {
   if (settingsError) {
     throw new Error(`company_settings fetch failed: ${settingsError.message}`)
   }
+  // Same rule for the OAuth-key count: a failed query answers count null,
+  // which claudeStepDone would read as "never connected" and re-open the
+  // Claude step for a connected user. Surface it instead of guessing.
+  if (oauthKeyError) {
+    throw new Error(`api_keys count failed: ${oauthKeyError.message}`)
+  }
 
-  // If onboarding is not complete, redirect to onboarding
+  // If onboarding is not complete, redirect to onboarding. Exception: a byrå
+  // member who did NOT explicitly pick this company this session goes to the
+  // cockpit instead. The auto-resolved company can be onboarding-incomplete
+  // through no action of theirs (a client mid migration-reset repoints every
+  // member's active_company_id), and the first-run wizard is a dead end for
+  // role 'member': WL-15 refuses client creation and the shell has no nav.
+  // Before the owner/admin landing gate the /byra bounce above shielded every
+  // byrå member from this path; this keeps that shield without the gate.
   if (!settings?.onboarding_complete) {
+    if (
+      !cookieStore.has(COMPANY_PICKED_COOKIE) &&
+      teamMemberships.some((m) => m.teams?.kind === 'byra')
+    ) {
+      redirect('/byra')
+    }
     redirect('/onboarding')
   }
 
   const agentBuilt = Boolean(agentProfile?.verified_at)
-
-  const onboardingProgress: OnboardingProgress = {
-    hasCustomers: (customerCount || 0) > 0,
-    hasInvoices: (invoiceCount || 0) > 0,
-    hasBankConnected: (bankConnections?.length || 0) > 0 || (transactionCount || 0) > 0,
-    hasSIEImport: (sieImportCount || 0) > 0,
-    hasSkatteverketConnected: (skatteverketTokenCount || 0) > 0,
-  }
-
-  const nowMs = now.getTime()
-  const expiringBankConnections = (bankConnections || [])
-    .filter(conn => {
-      if (!conn.consent_expires) return false
-      const daysLeft = Math.ceil(
-        (new Date(conn.consent_expires).getTime() - nowMs) / (1000 * 60 * 60 * 24)
-      )
-      return daysLeft > 0 && daysLeft <= 14
-    })
-    .map(conn => ({
-      id: conn.id as string,
-      bank_name: conn.bank_name as string,
-      days_left: Math.ceil(
-        (new Date(conn.consent_expires!).getTime() - nowMs) / (1000 * 60 * 60 * 24)
-      ),
-    }))
-
+  const hasMcpKey = claudeStepDone({ oauthKeyCount })
   const userFirstName = profile?.full_name?.trim().split(/\s+/)[0] ?? null
+  const initialSetup = {
+    path: settings.initial_setup_path ?? null,
+    completedAt: settings.initial_setup_completed_at ?? null,
+    dismissedAt: settings.initial_setup_dismissed_at ?? null,
+  }
+  const setupOpen = !settings.initial_setup_completed_at && !settings.initial_setup_dismissed_at
 
   return (
     <DashboardContent
       companyId={companyId}
       agentBuilt={agentBuilt}
       userFirstName={userFirstName}
-      expiringBankConnections={expiringBankConnections}
-      worklist={worklist}
-      suggestedMatches={suggestedMatches}
-      resumeItems={resumeItems}
-      otherAccountHint={otherAccountHint}
-      onboardingProgress={onboardingProgress}
-      initialSetup={{
-        path: settings.initial_setup_path ?? null,
-        completedAt: settings.initial_setup_completed_at ?? null,
-        dismissedAt: settings.initial_setup_dismissed_at ?? null,
-      }}
+      initialSetup={initialSetup}
+      hasSkatteverketConnected={(skatteverketTokenCount || 0) > 0}
+      notices={
+        <Suspense fallback={null}>
+          <HemNoticesSection companyId={companyId} userId={user.id} now={now} />
+        </Suspense>
+      }
+      checklist={
+        <Suspense fallback={<ChecklistSkeleton />}>
+          <HemChecklistSection
+            companyId={companyId}
+            userId={user.id}
+            now={now}
+            initialSetup={initialSetup}
+            hasMcpKey={hasMcpKey}
+            vatRegistered={settings.vat_registered}
+            momsPeriod={settings.moms_period ?? null}
+          />
+        </Suspense>
+      }
+      panes={
+        <Suspense fallback={<PanesSkeleton />}>
+          <HemPanesSection companyId={companyId} now={now} setupOpen={setupOpen} />
+        </Suspense>
+      }
     />
   )
 }

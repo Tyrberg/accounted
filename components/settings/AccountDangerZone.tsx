@@ -181,7 +181,12 @@ export function AccountDangerZone() {
           // lives behind the "?": the visible row stays one quiet line.
           help={<RetentionNotice variant="account" className="border-0 bg-transparent p-0" />}
         >
-          <SettingsRowNote>{tRetention('account_title')}</SettingsRowNote>
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <SettingsRowNote>{tRetention('account_title')}</SettingsRowNote>
+            {/* Says up front that a typed confirmation follows (issue #2214,
+                same as CompanyDangerZone). */}
+            <SettingsRowNote>{t('confirm_hint')}</SettingsRowNote>
+          </div>
           {/* Live region always mounted so the failure is announced when it
               appears, not merely inserted. */}
           <div id={errorId} role="status" aria-live="polite" className="min-w-0">
@@ -255,7 +260,8 @@ export function AccountDangerZone() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="delete-confirm">
+            {/* data-ph-mask: the label interpolates the user's email */}
+            <Label data-ph-mask="" htmlFor="delete-confirm">
               {t.rich('confirm_label', {
                 email: email ?? '',
                 strong: (chunks) => <strong>{chunks}</strong>,
@@ -268,6 +274,9 @@ export function AccountDangerZone() {
               onChange={(e) => setConfirmText(e.target.value)}
               placeholder={email ?? ''}
               autoComplete="off"
+              // ph-no-capture: the placeholder is the user's email, and
+              // replay masking covers values, not attributes.
+              className="ph-no-capture"
             />
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>

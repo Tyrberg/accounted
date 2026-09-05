@@ -69,6 +69,15 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
 vi.mock('@/lib/invoices/match-log', () => ({
   logMatchEvent: vi.fn(),
 }))
+// Issue #1259: the settle paths retire sibling suggestion pointers. Mocked so
+// the assertion is on the orchestration; the helper's own query shape is pinned
+// by lib/invoices/__tests__/clear-settled-invoice-suggestions.test.ts.
+const { clearSuggestionsMock } = vi.hoisted(() => ({
+  clearSuggestionsMock: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock('@/lib/invoices/clear-settled-invoice-suggestions', () => ({
+  clearSettledInvoiceSuggestions: clearSuggestionsMock,
+}))
 vi.mock('@/lib/bookkeeping/mapping-engine', async () => {
   // Keep the real applySettlementAccount: it's a pure rewrite (1930 -> the
   // resolved bank leg) and the v1 categorize route's settlement-account fix
@@ -111,6 +120,10 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
+  // Every chained builder call, in order. The proxy otherwise swallows its
+  // arguments, which makes update payloads invisible to assertions. Recording
+  // is passive: it changes nothing about what a chain resolves to.
+  const calls: { table: string; method: string; args: unknown[] }[] = []
   const buildChain = (table: string): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
@@ -121,12 +134,25 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
             resolve(next)
           }
         }
-        return (..._args: unknown[]) => buildChain(table)
+        return (...args: unknown[]) => {
+          calls.push({ table, method: String(prop), args })
+          return buildChain(table)
+        }
       },
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)) }
+  return { from: vi.fn((table: string) => buildChain(table)), calls }
+}
+
+/** Payloads of every `.update()` call made against `table`. */
+function updatePayloads(
+  supa: { calls: { table: string; method: string; args: unknown[] }[] },
+  table: string,
+): Record<string, unknown>[] {
+  return supa.calls
+    .filter((c) => c.table === table && c.method === 'update')
+    .map((c) => c.args[0] as Record<string, unknown>)
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -531,7 +557,10 @@ describe('POST :id/match-invoice', () => {
           { data: [{ id: INV_ID }], error: null }, // status update select
         ],
         company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
-        invoice_payments: { data: null, error: null },
+        invoice_payments: [
+            { data: [], error: null },
+            { data: { id: 'ip-1' }, error: null },
+          ],
       }),
     )
     const res = await matchInvoicePOST(
@@ -558,6 +587,16 @@ describe('POST :id/match-invoice', () => {
       expect.objectContaining({ account_number: '1930', debit_amount: 12500, credit_amount: 0 }),
       expect.objectContaining({ account_number: '1510', debit_amount: 0, credit_amount: 12500 }),
     ])
+    // Issue #1259: settling the invoice retires its suggestion pointer on every
+    // OTHER transaction of the company.
+    expect(clearSuggestionsMock).toHaveBeenCalledTimes(1)
+    expect(clearSuggestionsMock).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY_ID,
+      'invoice',
+      INV_ID,
+      { exceptTransactionId: TX_ID },
+    )
   })
 
   it('rejects negative transaction with MATCH_INVOICE_NOT_INCOME', async () => {
@@ -680,7 +719,10 @@ describe('POST :id/match-invoice', () => {
           ],
           company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
           cash_accounts: { data: { ledger_account: '1940' }, error: null },
-          invoice_payments: { data: null, error: null },
+          invoice_payments: [
+            { data: [], error: null },
+            { data: { id: 'ip-1' }, error: null },
+          ],
         }),
       )
       const res = await matchInvoicePOST(
@@ -814,41 +856,40 @@ describe('POST :id/match-invoice', () => {
 
 describe('POST :id/match-supplier-invoice', () => {
   it('matches a negative transaction to an open supplier invoice', async () => {
-    mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        transactions: {
+    const supa = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          amount: -5000,
+          date: '2026-05-12',
+          currency: 'SEK',
+          supplier_invoice_id: null,
+          journal_entry_id: null,
+        },
+        error: null,
+      },
+      supplier_invoices: [
+        {
           data: {
-            id: TX_ID,
-            amount: -5000,
-            date: '2026-05-12',
+            id: SI_ID,
+            status: 'approved',
+            total: 5000,
+            paid_amount: 0,
+            remaining_amount: 5000,
             currency: 'SEK',
-            supplier_invoice_id: null,
-            journal_entry_id: null,
+            exchange_rate: null,
+            supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+            items: [],
           },
           error: null,
         },
-        supplier_invoices: [
-          {
-            data: {
-              id: SI_ID,
-              status: 'approved',
-              total: 5000,
-              paid_amount: 0,
-              remaining_amount: 5000,
-              currency: 'SEK',
-              exchange_rate: null,
-              supplier: { name: 'Acme', supplier_type: 'swedish_business' },
-              items: [],
-            },
-            error: null,
-          },
-          { data: [{ id: SI_ID }], error: null },
-        ],
-        company_settings: { data: { accounting_method: 'accrual' }, error: null },
-        supplier_invoice_payments: { data: null, error: null },
-      }),
-    )
+        { data: [{ id: SI_ID }], error: null },
+      ],
+      company_settings: { data: { accounting_method: 'accrual' }, error: null },
+      supplier_invoice_payments: { data: null, error: null },
+    })
+    mockServiceClient.mockReturnValue(supa)
     const res = await matchSIPOST(
       makeRequest(
         `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
@@ -859,6 +900,25 @@ describe('POST :id/match-supplier-invoice', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.data.invoice_status).toBe('paid')
+    // Issue #1259: the confirmed link supersedes the suggestion, so this row's
+    // own hint must not survive it. Parity with the dashboard twin, which this
+    // route was missing.
+    expect(updatePayloads(supa, 'transactions')).toContainEqual(
+      expect.objectContaining({
+        supplier_invoice_id: SI_ID,
+        potential_supplier_invoice_id: null,
+        is_business: true,
+      }),
+    )
+    // And every OTHER transaction of the company gets its pointer retired.
+    expect(clearSuggestionsMock).toHaveBeenCalledTimes(1)
+    expect(clearSuggestionsMock).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY_ID,
+      'supplier_invoice',
+      SI_ID,
+      { exceptTransactionId: TX_ID },
+    )
   })
 
   it('rejects positive transaction with MATCH_SI_NOT_EXPENSE', async () => {

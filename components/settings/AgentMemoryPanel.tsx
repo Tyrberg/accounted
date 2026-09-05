@@ -24,8 +24,7 @@ import { useCanWrite } from '@/lib/hooks/use-can-write'
 import { cn, formatDateLong } from '@/lib/utils'
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 
-type Kind = 'fact' | 'preference' | 'pattern' | 'correction'
-type Source = 'composer' | 'user_taught' | 'agent_learned' | 'derived'
+import type { FactKind as Kind, FactSource as Source } from '@/lib/agent-context/agent-competence'
 
 interface AgentMemoryRow {
   id: string
@@ -389,7 +388,7 @@ export function AgentMemoryPanel() {
                       onClick={() => patch(row.id, { is_pinned: !row.is_pinned })}
                       disabled={isBusy}
                       className={cn(
-                        'mt-0.5 shrink-0 rounded-md p-1.5 transition-colors duration-150',
+                        'mt-0.5 shrink-0 rounded-sm p-1.5 transition-colors duration-150',
                         row.is_pinned
                           ? 'bg-secondary text-foreground'
                           : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',

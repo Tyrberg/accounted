@@ -6,22 +6,22 @@ import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
-  ReceiptText,
   Users,
-  ArrowLeftRight,
-  Camera,
-  Building2,
-  FileText,
-  Calendar,
   Plus,
+  TrendingUp,
   type LucideIcon,
 } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
 
 interface EmptyStateProps {
   icon?: LucideIcon
-  title: string
-  description: string
+  /**
+   * Usually static i18n strings. The empty state is data-ph-unmask chrome in
+   * session replays, so a title or description carrying user data (e.g. an
+   * interpolated search term) must wrap that part in a data-ph-mask element.
+   */
+  title: React.ReactNode
+  description: React.ReactNode
   actionLabel?: string
   actionHref?: string
   onAction?: () => void
@@ -50,7 +50,8 @@ export function EmptyState({
 }: EmptyStateProps) {
   const t = useTranslations('empty')
   return (
-    <div className={cn('flex flex-col items-center justify-center py-12 px-4 text-center', className)}>
+    // data-ph-unmask: empty states are static i18n chrome in session replays.
+    <div data-ph-unmask="" className={cn('flex flex-col items-center justify-center py-12 px-4 text-center', className)}>
       {Icon && (
         <div className="mb-6">
           <div className="p-4 rounded-full bg-muted">
@@ -58,7 +59,7 @@ export function EmptyState({
           </div>
         </div>
       )}
-      <h3 className="text-lg font-medium mb-2">{title}</h3>
+      <h3 className="text-lg mb-2">{title}</h3>
       <p className="text-sm text-muted-foreground max-w-sm mb-6 text-balance">{description}</p>
 
       {supportHint && (
@@ -99,20 +100,6 @@ export function EmptyState({
 
 // Preset empty states for common pages
 
-export function EmptyInvoices({ onAction }: { onAction?: () => void } = {}) {
-  const t = useTranslations('empty')
-  return (
-    <EmptyState
-      icon={ReceiptText}
-      title={t('preset_invoices_title')}
-      description={t('preset_invoices_description')}
-      actionLabel={t('preset_invoices_action')}
-      actionHref={onAction ? undefined : '/invoices?new=1'}
-      onAction={onAction}
-    />
-  )
-}
-
 export function EmptyCustomers({ onAction }: { onAction?: () => void } = {}) {
   const t = useTranslations('empty')
   return (
@@ -127,69 +114,24 @@ export function EmptyCustomers({ onAction }: { onAction?: () => void } = {}) {
   )
 }
 
-export function EmptyTransactions() {
-  const t = useTranslations('empty')
+/**
+ * Byrå cockpit: no client companies yet. A preset, not a bare <EmptyState
+ * icon={TrendingUp} />, because the only caller is a Server Component: a
+ * lucide icon is a forwardRef object that cannot cross the RSC boundary as a
+ * prop, while a reference to this client component can. The copy lives in the
+ * byra namespace, where the byrå surfaces already keep it.
+ */
+export function EmptyByraClients() {
+  // Named tByra, not t: this is the only preset here that reads from a
+  // namespace other than `empty`, and i18n/__tests__/message-keys.test.ts maps
+  // one variable name to one namespace per file. Reusing `t` would silently
+  // re-point every other preset's key in this file at `byra`.
+  const tByra = useTranslations('byra')
   return (
     <EmptyState
-      icon={ArrowLeftRight}
-      title={t('preset_transactions_title')}
-      description={t('preset_transactions_description')}
-      actionLabel={t('preset_transactions_action')}
-      actionHref="/import"
-      supportHint
-    />
-  )
-}
-
-export function EmptyReceipts() {
-  const t = useTranslations('empty')
-  return (
-    <EmptyState
-      icon={Camera}
-      title={t('preset_receipts_title')}
-      description={t('preset_receipts_description')}
-      actionLabel={t('preset_receipts_action')}
-      actionHref="/receipts/scan"
-    />
-  )
-}
-
-export function EmptyDeadlines() {
-  const t = useTranslations('empty')
-  return (
-    <EmptyState
-      icon={Calendar}
-      title={t('preset_deadlines_title')}
-      description={t('preset_deadlines_description')}
-    />
-  )
-}
-
-export function NoBankConnected() {
-  const t = useTranslations('empty')
-  return (
-    <EmptyState
-      icon={Building2}
-      title={t('preset_no_bank_title')}
-      description={t('preset_no_bank_description')}
-      actionLabel={t('preset_no_bank_action')}
-      actionHref="/import"
-      supportHint
-    />
-  )
-}
-
-export function EmptyReports() {
-  const t = useTranslations('empty')
-  return (
-    <EmptyState
-      icon={FileText}
-      title={t('preset_reports_title')}
-      description={t('preset_reports_description')}
-      actionLabel={t('preset_reports_action')}
-      actionHref="/invoices?new=1"
-      secondaryActionLabel={t('preset_reports_secondary')}
-      secondaryActionHref="/import"
+      icon={TrendingUp}
+      title={tByra('kpi_empty_title')}
+      description={tByra('kpi_empty_description')}
     />
   )
 }

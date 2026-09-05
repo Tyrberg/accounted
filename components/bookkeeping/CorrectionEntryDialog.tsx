@@ -14,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
+import RattelseExplainer from '@/components/bookkeeping/RattelseExplainer'
 import { AddAccountDialog } from '@/components/bookkeeping/AddAccountDialog'
 import CorrectionPreview from '@/components/bookkeeping/CorrectionPreview'
 import {
@@ -22,6 +23,8 @@ import {
 } from '@/components/bookkeeping/correction-entry-description'
 import { nextLineDescriptionForAccountChange } from '@/components/bookkeeping/correction-line-description'
 import { useToast } from '@/components/ui/use-toast'
+import { useAccounts } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { formatDate } from '@/lib/utils'
@@ -32,7 +35,7 @@ import {
 } from '@/lib/bookkeeping/correction-line-account'
 import { splitCreateAccountPrefill } from '@/lib/bookkeeping/create-account-prefill'
 import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
-import type { JournalEntry, JournalEntryLine, BASAccount } from '@/types'
+import type { JournalEntry, JournalEntryLine } from '@/types'
 
 interface CorrectionLine {
   account_number: string
@@ -52,12 +55,24 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
   const { toast } = useToast()
   const router = useRouter()
   const t = useTranslations('journal_detail')
-  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  // The full chart (deactivated rows included) comes from the session cache
+  // (lib/reference-data); only the static BAS catalogue is loaded per open,
+  // and it is module-cached after the first time.
+  const { accounts, isLoading: accountsLoading, error: accountsError, refresh: refreshAccounts } = useAccounts(false)
   const [catalog, setCatalog] = useState<CatalogAccount[]>([])
-  const [accountsStatus, setAccountsStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [catalogStatus, setCatalogStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const accountsStatus: 'loading' | 'ready' | 'error' =
+    accountsLoading || catalogStatus === 'loading'
+      ? 'loading'
+      : accountsError || catalogStatus === 'error'
+        ? 'error'
+        : 'ready'
   const [lines, setLines] = useState<CorrectionLine[]>([])
   const [description, setDescription] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // Non-null when the server refused with CORRECTION_CHAIN_TOO_DEEP: holds the
+  // reported chain depth and opens the bypass confirm ("Rätta ändå").
+  const [deepChainDepth, setDeepChainDepth] = useState<number | null>(null)
   // Index of the line whose combobox opened the create dialog, and the search
   // string it was showing. Null index = the dialog is closed.
   const [creatingAccountForLine, setCreatingAccountForLine] = useState<number | null>(null)
@@ -94,26 +109,18 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
       // Pre-fill the verifikationstext with the same auto text the server
       // would generate; only a user edit is sent along (see handleSubmit).
       setDescription(autoCorrectionDescription(entry.description))
-      void fetchAccounts()
+      void loadCatalog()
     }
   }, [open, entry.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function fetchAccounts() {
-    setAccountsStatus('loading')
+  async function loadCatalog() {
+    setCatalogStatus('loading')
     try {
-      const [res, basCatalog] = await Promise.all([
-        fetch('/api/bookkeeping/accounts?active=false'),
-        loadBasCatalog(),
-      ])
-      if (!res.ok) throw new Error(`accounts ${res.status}`)
-      const { data } = await res.json()
-      setAccounts(data || [])
-      setCatalog(basCatalog)
-      setAccountsStatus('ready')
+      setCatalog(await loadBasCatalog())
+      setCatalogStatus('ready')
     } catch {
-      setAccounts([])
       setCatalog([])
-      setAccountsStatus('error')
+      setCatalogStatus('error')
     }
   }
 
@@ -165,9 +172,9 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
   // a dead end here: the rättelse can only post to accounts that exist in the
   // chart. Creating it inline keeps the half-finished rättelse intact.
   const handleAccountCreated = async (account: { account_number: string; account_name?: string }) => {
-    await fetchAccounts()
+    await invalidateReferenceData('ref:accounts')
     if (creatingAccountForLine != null) {
-      // fetchAccounts' state update is not visible in this closure, so the
+      // The refreshed cache is not visible in this closure, so the
       // fresh account's own name is passed alongside the stale sources. The
       // reactivate path reports no name, but that account is already in
       // `accounts` (the fetch includes deactivated rows).
@@ -191,7 +198,7 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
 
   const hasValidLines = lines.length >= 2 && lines.every((l) => l.account_number.length === 4)
 
-  async function handleSubmit() {
+  async function handleSubmit(allowDeepChain = false) {
     if (!isBalanced || !hasValidLines) return
 
     setIsSubmitting(true)
@@ -211,17 +218,26 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
           // Only sent when the user changed the auto prefill: the server
           // fallback ("Rättelse: <original>") stays the source of truth.
           description: correctionDescriptionForSubmit(description, entry.description),
+          ...(allowDeepChain ? { allow_deep_chain: true } : {}),
         }),
       })
 
       const result = await res.json()
 
       if (!res.ok) {
+        // Chain-depth guard: open the bypass confirm instead of a dead-end
+        // toast. "Rätta ändå" resubmits with allow_deep_chain=true.
+        const structured = (result as { error?: { code?: string; details?: { depth?: number } } })?.error
+        if (structured?.code === 'CORRECTION_CHAIN_TOO_DEEP') {
+          setDeepChainDepth(structured.details?.depth ?? 3)
+          return
+        }
         const error = new Error('Failed to create correction') as Error & { body?: unknown; status?: number }
         error.body = result
         error.status = res.status
         throw error
       }
+      setDeepChainDepth(null)
 
       const correctedId = result.data?.corrected?.id
 
@@ -252,21 +268,30 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-3xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Skapa ändringsverifikation</DialogTitle>
+          {/* Convention 7: the how-it-works copy lives behind the "?", not in
+              the dialog flow. */}
+          <div className="flex items-center gap-2">
+            <DialogTitle>Skapa ändringsverifikation</DialogTitle>
+            <RattelseExplainer>
+              <p>
+                Här skapas automatiskt en stornoverifikation som nollställer
+                originalet och en ny verifikation med dina rättade uppgifter.
+                Rättelsen bokförs i samma räkenskapsperiod som originalet: du
+                hittar den under originalets räkenskapsår.
+              </p>
+              <p>
+                Spårbarheten ligger i stornokedjan: originalet,
+                stornoverifikationen och ändringsverifikationen förblir synliga
+                i bokföringen och länkade till varandra.
+              </p>
+              <p>
+                Tar du bort ett konto ur de rättade raderna nollställs det
+                (stornon återför det). Vill du bara återföra hela verifikatet
+                utan att ersätta det, använd Återför (storno) istället.
+              </p>
+            </RattelseExplainer>
+          </div>
         </DialogHeader>
-
-        {/* Storno explanation */}
-        <div className="rounded-lg bg-muted/50 border p-3 text-sm text-muted-foreground">
-          <p className="font-medium text-foreground mb-1">Hur fungerar en ändringsverifikation?</p>
-          <p>En bokförd verifikation kan inte ändras direkt. Istället skapas automatiskt:</p>
-          <ol className="list-decimal list-inside mt-1 space-y-0.5">
-            <li>En <strong>stornoverifikation</strong> som nollställer den ursprungliga</li>
-            <li>En ny verifikation med dina rättade uppgifter</li>
-          </ol>
-          <p className="mt-2">
-            Rättelsen bokförs i samma räkenskapsperiod som originalet: du hittar den under originalets räkenskapsår.
-          </p>
-        </div>
 
         {/* Original entry metadata: lines live inside CorrectionPreview below */}
         <div className="space-y-1">
@@ -291,6 +316,9 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             placeholder={autoCorrectionDescription(entry.description)}
+            // ph-no-capture: the placeholder echoes the posted entry's
+            // description, and replay masking covers values, not attributes.
+            className="ph-no-capture"
           />
           <p className="text-xs text-muted-foreground">
             Texten på den nya verifikationen. Ändra den om originalets beskrivning inte längre
@@ -303,9 +331,7 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
           <div className="space-y-1">
             <p className="text-sm font-medium">Rättade rader</p>
             <p className="text-xs text-muted-foreground">
-              Det här är hela den nya verifikationen: alla konton som ska finnas kvar måste stå
-              kvar. Tar du bort ett konto nollställs det (stornon återför det). Vill du bara återföra
-              hela verifikatet utan att ersätta det, använd Återför (storno) istället.
+              Det här är hela den nya verifikationen: alla konton som ska finnas kvar måste stå kvar.
             </p>
           </div>
 
@@ -316,7 +342,7 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
                 {accountsStatus === 'loading' ? t('accounts_loading') : t('accounts_load_failed')}
               </span>
               {accountsStatus === 'error' && (
-                <Button variant="outline" size="sm" onClick={() => void fetchAccounts()}>
+                <Button variant="outline" size="sm" onClick={() => void refreshAccounts()}>
                   {t('accounts_retry')}
                 </Button>
               )}
@@ -325,19 +351,25 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
 
           <div className="space-y-2">
             {lines.map((line, index) => (
-              <div key={index} className="space-y-2 sm:space-y-0 sm:grid sm:grid-cols-[1fr_1fr_120px_120px_auto] sm:gap-2 sm:items-start border-b sm:border-0 pb-3 sm:pb-0 last:border-0">
-                <div className="grid grid-cols-[1fr_auto] sm:contents gap-2">
-                  <AccountCombobox
-                    value={line.account_number}
-                    accounts={activeAccounts}
-                    catalog={selectableCatalog}
-                    onChange={(v) => updateLineAccount(index, v)}
-                    onCreateAccount={(prefill) => {
-                      setCreatingAccountForLine(index)
-                      setCreateAccountPrefill(prefill)
-                    }}
-                    disabled={accountsStatus !== 'ready'}
-                  />
+              <div key={index} className="space-y-2 sm:space-y-0 sm:grid sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px_120px_auto] sm:gap-2 sm:items-start border-b sm:border-0 pb-3 sm:pb-0 last:border-0">
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] sm:contents gap-2">
+                  {/* min-w-0: at sm: the sm:contents wrapper promotes this cell
+                      to a direct grid item; without it the combobox refuses to
+                      shrink below its content and overflows the dialog (same
+                      pattern as SendInvoiceDialog's desktop rows). */}
+                  <div className="min-w-0">
+                    <AccountCombobox
+                      value={line.account_number}
+                      accounts={activeAccounts}
+                      catalog={selectableCatalog}
+                      onChange={(v) => updateLineAccount(index, v)}
+                      onCreateAccount={(prefill) => {
+                        setCreatingAccountForLine(index)
+                        setCreateAccountPrefill(prefill)
+                      }}
+                      disabled={accountsStatus !== 'ready'}
+                    />
+                  </div>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -411,12 +443,37 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
             Avbryt
           </Button>
           <Button
-            onClick={handleSubmit}
+            onClick={() => handleSubmit()}
             disabled={!isBalanced || !hasValidLines || isSubmitting}
           >
             {isSubmitting ? 'Skapar...' : 'Skapa ändringsverifikation'}
           </Button>
         </DialogFooter>
+
+        {/* Chain-depth guard confirm: the server refused because this entry
+            already sits deep in a rättelse chain. Advisory, never a dead end:
+            "Rätta ändå" resubmits with allow_deep_chain=true. */}
+        <Dialog open={deepChainDepth != null} onOpenChange={(next) => { if (!next) setDeepChainDepth(null) }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t('deep_chain_title')}</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">
+              {t('deep_chain_body', { depth: deepChainDepth ?? 3 })}
+            </p>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeepChainDepth(null)} disabled={isSubmitting}>
+                {t('deep_chain_cancel')}
+              </Button>
+              <Button
+                onClick={() => { setDeepChainDepth(null); void handleSubmit(true) }}
+                disabled={isSubmitting}
+              >
+                {t('deep_chain_correct_anyway')}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </DialogContent>
 
       {/* Nested on purpose: closing this one (Esc, click-outside, Avbryt) must

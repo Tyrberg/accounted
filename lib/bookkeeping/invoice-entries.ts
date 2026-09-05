@@ -25,45 +25,13 @@ import type {
 
 const log = createLogger('invoice-entries')
 
-/**
- * Stable code for the "foreign-currency customer invoice without a rate"
- * refusal. Registered in lib/errors/structured-errors.ts so REST routes, the
- * MCP server and getErrorMessage() all translate it the same way.
- *
- * Sales-side twin of SI_FX_RATE_MISSING (supplier-invoice-entries.ts).
- */
-export const INVOICE_FX_RATE_MISSING = 'INVOICE_FX_RATE_MISSING' as const
-
-/**
- * Raised when an invoice booking path is asked to translate a foreign-currency
- * amount that has no usable exchange rate.
- *
- * The generators below derive every FX leg from the per-item amounts, and items
- * carry no `*_sek` column: `exchange_rate` is the only SEK source they have. The
- * old per-file fallback returned the RAW foreign amount, and because the 1510
- * debit is derived from the sum of the credits on the FX branch, every leg was
- * scaled by the same wrong factor: the verifikation still balanced, no DB
- * trigger fired and nothing errored. A 1 000 EUR sale posted 1 000 kr to 3001
- * and 250 kr to 2611 instead of 11 500 kr and 2 875 kr at 11,50 SEK/EUR,
- * understating ruta 05 and ruta 10 of the momsdeklaration by the same amount:
- * an oriktig uppgift exposed to skattetillägg under SFL 49 kap 4 §.
- *
- * Refusing instead of guessing follows the `match_batch_allocate` RPC
- * (BATCH_FX_RATE_MISSING) and `toSekOrThrow()` in supplier-invoice-entries.ts.
- *
- * The same refusal covers the header-level fallbacks (no-items bookings and
- * the payment entry) via `headerToSekOrThrow` below: those paths DO honour a
- * populated `*_sek` column, so only rows with no SEK source at all refuse.
- */
-export class InvoiceFxRateMissingError extends Error {
-  readonly code = INVOICE_FX_RATE_MISSING
-  constructor(public readonly currency: string) {
-    super(
-      `Invoice is in ${currency} but has no exchange rate on file; refusing to post it as if 1 ${currency} = 1 SEK.`
-    )
-    this.name = 'InvoiceFxRateMissingError'
-  }
-}
+// INVOICE_FX_RATE_MISSING, InvoiceFxRateMissingError, getRevenueAccount and
+// getOutputVatAccount live in ./invoice-accounts (pure, no engine import):
+// the client-side proposal helpers (propose-send-lines, propose-payment-lines)
+// need only those, and importing them from here dragged the engine, the
+// account backfill and with it the full BAS chart into the browser bundle.
+export { getOutputVatAccount, getRevenueAccount } from './invoice-accounts'
+import { InvoiceFxRateMissingError, getOutputVatAccount, getRevenueAccount } from './invoice-accounts'
 
 /**
  * Convert an invoice-currency item amount to SEK for a journal entry line.
@@ -358,6 +326,10 @@ function generateRotRutLines(
     const amount = computeDeduction({
       unit_price: side === 'credit' ? Math.abs(item.unit_price) : item.unit_price,
       quantity: side === 'credit' ? Math.abs(item.quantity) : item.quantity,
+      // The deduction base is the NET line total (rabatt reduces what the
+      // customer pays); omitting this books 1513 on the gross while the
+      // stored deduction_total and the Skatteverket claim carry the net.
+      discount_percent: item.discount_percent ?? 0,
       deduction_type: item.deduction_type,
       vat_rate: item.vat_rate,
     })
@@ -549,6 +521,33 @@ export async function createInvoiceJournalEntry(
 }
 
 /**
+ * What the customer still owes on an invoice, in invoice currency:
+ * remaining_amount when the row carries it, else total minus paid_amount.
+ * remaining_amount is written as total minus the ROT/RUT deduction at
+ * creation (build-invoice-write.ts) and decremented per payment, so it is the
+ * one figure that already knows about both partial payments and the 1513
+ * share. Never falls back to the bare total when paid_amount is present.
+ */
+function invoiceOutstandingAmount(invoice: Invoice): number {
+  const inv = invoice as Invoice & {
+    remaining_amount?: number | null
+    paid_amount?: number | null
+    deduction_total?: number | null
+  }
+  // A payment is being booked, so a stored 0 cannot mean "settled": rows
+  // written by paths that bypass buildInvoiceWriteData (imports, sandbox seed,
+  // legacy migrations) leave the NOT NULL DEFAULT 0 in place. Treat 0 as
+  // unmaintained and derive: total minus prior payments minus the ROT/RUT
+  // share that was never the customer's to pay.
+  if (typeof inv.remaining_amount === 'number' && Number.isFinite(inv.remaining_amount) && inv.remaining_amount > 0) {
+    return roundOre(inv.remaining_amount)
+  }
+  const paid = typeof inv.paid_amount === 'number' ? inv.paid_amount : 0
+  const deduction = typeof inv.deduction_total === 'number' ? inv.deduction_total : 0
+  return roundOre(invoice.total - paid - deduction)
+}
+
+/**
  * Create journal entry when an invoice is marked as paid
  *
  *   Debit  1930 Företagskonto       [total]
@@ -589,14 +588,24 @@ export async function createInvoicePaymentJournalEntry(
   const defaultDimensions = coerceDimensionsBag(invoice.default_dimensions)
 
   // When paymentAmount is provided, use it for the 1930/1510 line amounts.
-  // Otherwise use the full invoice total (backward compatible). Strict
-  // conversion on both: a rate-less foreign payment would otherwise clear
-  // 1510 with the raw foreign number relabelled as kronor (balanced against
-  // an equally wrong 1930 debit, so nothing downstream could catch it).
-  // Rows carrying total_sek or a usable rate convert exactly as before.
+  // Otherwise the payment settles what is still outstanding on the invoice:
+  // remaining_amount (total minus prior partial payments minus any ROT/RUT
+  // deduction, which sits on 1513 and is never the customer's to pay). Booking
+  // invoice.total here, as this path did before, credited 1510 for money that
+  // never arrived: 1510 went negative by the avdrag on every ROT/RUT invoice
+  // settled through mark-paid without lines, and 1930 was overstated by the
+  // same amount. Strict conversion on all three: a rate-less foreign payment
+  // would otherwise clear 1510 with the raw foreign number relabelled as
+  // kronor (balanced against an equally wrong 1930 debit, so nothing
+  // downstream could catch it). A fully outstanding invoice still converts via
+  // total_sek exactly as before, so legacy rows without a rate keep working.
+  const outstanding = invoiceOutstandingAmount(invoice)
+  const settlesFullTotal = Math.abs(outstanding - invoice.total) < 0.005
   const bookedSekAmount = isPartial
     ? headerToSekOrThrow(paymentAmount, null, invoice.currency, invoice.exchange_rate)
-    : headerToSekOrThrow(invoice.total, invoice.total_sek, invoice.currency, invoice.exchange_rate)
+    : settlesFullTotal
+      ? headerToSekOrThrow(invoice.total, invoice.total_sek, invoice.currency, invoice.exchange_rate)
+      : headerToSekOrThrow(outstanding, null, invoice.currency, invoice.exchange_rate)
 
   const lines: CreateJournalEntryLineInput[] = []
 
@@ -907,43 +916,3 @@ export async function createInvoiceCashEntry(
   return createJournalEntry(supabase, companyId, userId, input)
 }
 
-/**
- * Get the appropriate revenue account based on VAT treatment
- *
- * For 'exempt': AB uses 3004 (Försäljning inom Sverige, momsfri),
- * EF uses 3100 (Momsfria intäkter, mapped to R2 in NE engine).
- */
-export function getRevenueAccount(vatTreatment: VatTreatment, entityType: EntityType = 'enskild_firma'): string {
-  switch (vatTreatment) {
-    case 'standard_25':
-      return '3001' // Försäljning 25%
-    case 'reduced_12':
-      return '3002' // Försäljning 12%
-    case 'reduced_6':
-      return '3003' // Försäljning 6%
-    case 'reverse_charge':
-      return '3308' // Försäljning tjänst EU
-    case 'export':
-      return '3305' // Försäljning tjänst Export
-    case 'exempt':
-      return entityType === 'aktiebolag' ? '3004' : '3100'
-    default:
-      return '3001'
-  }
-}
-
-/**
- * Get the output VAT account based on VAT treatment
- */
-export function getOutputVatAccount(vatTreatment: VatTreatment): string {
-  switch (vatTreatment) {
-    case 'standard_25':
-      return '2611'
-    case 'reduced_12':
-      return '2621'
-    case 'reduced_6':
-      return '2631'
-    default:
-      return '2611'
-  }
-}

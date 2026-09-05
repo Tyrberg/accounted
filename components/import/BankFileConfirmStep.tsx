@@ -1,6 +1,8 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { useAccounts } from '@/lib/reference-data/hooks'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -17,9 +19,7 @@ import {
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
 import { summarizeByCurrency } from '@/lib/import/bank-file/currency-summary'
-import { createClient } from '@/lib/supabase/client'
-import { useCompany } from '@/contexts/CompanyContext'
-import type { BankFileParseResult } from '@/lib/import/bank-file/types'
+import type { BankFileParseResult, BankFileDuplicateInfo } from '@/lib/import/bank-file/types'
 
 interface BankAccount {
   account_number: string
@@ -28,6 +28,7 @@ interface BankAccount {
 
 interface BankFileConfirmStepProps {
   parseResult: BankFileParseResult
+  duplicateInfo?: BankFileDuplicateInfo | null
   onExecute: (options: { skip_duplicates: boolean; auto_categorize: boolean; settlement_account?: string }) => void
   onBack: () => void
   isLoading: boolean
@@ -35,43 +36,43 @@ interface BankFileConfirmStepProps {
 
 export default function BankFileConfirmStep({
   parseResult,
+  duplicateInfo,
   onExecute,
   onBack,
   isLoading,
 }: BankFileConfirmStepProps) {
+  const t = useTranslations('transactions')
   const { transactions, stats, date_from, date_to, issues } = parseResult
-  const refsCount = transactions.filter((t) => t.reference).length
+  const refsCount = transactions.filter((tx) => tx.reference).length
   const warnings = issues.filter((i) => i.severity === 'warning')
   // Same per-currency grouping as the preview step: parser-level totals sum
   // across currencies, which misleads on Wise/camt.053 multi-currency files.
   const currencyTotals = summarizeByCurrency(transactions)
+  // Advisory: clamp so a stale preview can never produce a negative CTA
+  // count. Execute stays authoritative; the copy says rows are skipped
+  // automatically rather than promising an exact final number.
+  const duplicateCount = Math.min(Math.max(duplicateInfo?.duplicate_count ?? 0, 0), stats.parsed_rows)
 
-  const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([])
   const [selectedAccount, setSelectedAccount] = useState('1930')
-  const { company } = useCompany()
-
+  // Active 19xx accounts from the session-cached chart (lib/reference-data):
+  // the account select is populated on the first paint.
+  const { accounts } = useAccounts()
+  const bankAccounts = useMemo<BankAccount[]>(
+    () =>
+      accounts
+        .filter((a) => a.account_number >= '1900' && a.account_number <= '1999')
+        .sort((a, b) => a.account_number.localeCompare(b.account_number))
+        .map((a) => ({ account_number: a.account_number, account_name: a.account_name })),
+    [accounts],
+  )
+  // Default to 1930 if available, otherwise the first account (once).
+  const defaultedRef = useRef(false)
   useEffect(() => {
-    if (!company?.id) return
-    async function fetchBankAccounts(companyId: string) {
-      const supabase = createClient()
-      const { data } = await supabase
-        .from('chart_of_accounts')
-        .select('account_number, account_name')
-        .eq('company_id', companyId)
-        .eq('is_active', true)
-        .gte('account_number', '1900')
-        .lte('account_number', '1999')
-        .order('account_number')
-
-      if (data && data.length > 0) {
-        setBankAccounts(data)
-        // Default to 1930 if available, otherwise first account
-        const has1930 = data.some(a => a.account_number === '1930')
-        if (!has1930) setSelectedAccount(data[0].account_number)
-      }
-    }
-    fetchBankAccounts(company.id)
-  }, [company?.id])
+    if (defaultedRef.current || bankAccounts.length === 0) return
+    defaultedRef.current = true
+    const has1930 = bankAccounts.some((a) => a.account_number === '1930')
+    if (!has1930) setSelectedAccount(bankAccounts[0].account_number)
+  }, [bankAccounts])
 
   if (isLoading) {
     return (
@@ -188,6 +189,23 @@ export default function BankFileConfirmStep({
         </CardContent>
       </Card>
 
+      {/* Duplicate rows: repeated here because the generic_csv path skips the
+          preview step where the same card is shown. Advisory: ingest skips
+          them automatically at execute. */}
+      {duplicateCount > 0 && (
+        <Card>
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm flex items-center gap-2 text-warning">
+              <AlertTriangle className="h-4 w-4" />
+              {t('import_duplicate_rows_title', { count: duplicateCount })}
+            </CardTitle>
+            <CardDescription>
+              {t('import_duplicate_rows_body')}
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+
       {/* Skipped rows: surfaced here because the manual-mapping path skips the
           preview step where these warnings would otherwise be shown. */}
       {warnings.length > 0 && (
@@ -241,7 +259,7 @@ export default function BankFileConfirmStep({
           ) : (
             <>
               <Play className="mr-2 h-4 w-4" />
-              Importera {stats.parsed_rows} transaktioner
+              Importera {stats.parsed_rows - duplicateCount} transaktioner
             </>
           )}
         </Button>

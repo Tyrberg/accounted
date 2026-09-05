@@ -6,12 +6,17 @@ import { CreateInvoiceSchema, CreateCreditNoteSchema } from '@/lib/api/schemas'
 import type { Invoice, InvoiceDocumentType, InvoiceItem } from '@/types'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { buildInvoiceWriteData } from '@/lib/invoices/build-invoice-write'
+import { resolveInvoicePayeeChoice } from '@/lib/invoices/invoice-payee'
 import { buildCreditNoteItem } from '@/lib/invoices/build-credit-note-item'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { Logger } from '@/lib/logger'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 import { maskEmbeddedCustomer } from '@/lib/customers/protect-personal-number'
+import {
+  fetchInvoiceRegisterCoverage,
+  NO_INVOICE_REGISTER_COVERAGE,
+} from '@/lib/invoices/invoice-register-coverage'
 
 ensureInitialized()
 
@@ -35,6 +40,11 @@ export const GET = withRouteContext(
     if (status) {
       query = query.eq('status', status)
     }
+    // Kundorder detail: the invoices created from one order.
+    const salesOrderId = searchParams.get('sales_order_id')
+    if (salesOrderId && /^[0-9a-f-]{36}$/i.test(salesOrderId)) {
+      query = query.eq('sales_order_id', salesOrderId)
+    }
 
     const { data, error, count } = await query
 
@@ -43,9 +53,24 @@ export const GET = withRouteContext(
       return errorResponse(error, log, { requestId })
     }
 
+    // Coverage disclosure: the register only holds invoices created in
+    // Accounted, so for a migrated/backfilled company this list is silently
+    // incomplete before its first invoice. Non-fatal: a failed lookup
+    // degrades to "no marker", never to a failed list.
+    let coverage = NO_INVOICE_REGISTER_COVERAGE
+    try {
+      coverage = await fetchInvoiceRegisterCoverage(supabase, companyId)
+    } catch {
+      // keep NO_INVOICE_REGISTER_COVERAGE
+    }
+
     // Mask the embedded customer's personnummer: the customers(*) join
     // carries the stored ciphertext, which has no business reaching a client.
-    return NextResponse.json({ data: (data ?? []).map(maskEmbeddedCustomer), count })
+    return NextResponse.json({
+      data: (data ?? []).map(maskEmbeddedCustomer),
+      count,
+      invoice_register_coverage: coverage,
+    })
   },
 )
 
@@ -112,6 +137,19 @@ export const POST = withRouteContext(
       })
     }
 
+    // Which bank account the customer pays to (null = the per-currency
+    // default). Validated against the company's payee accounts; the payee
+    // fields are frozen on the row and refreshed again at issue.
+    const payeeChoice = await resolveInvoicePayeeChoice(
+      supabase,
+      companyId!,
+      invoiceInput.currency,
+      invoiceInput.payment_cash_account_id,
+    )
+    if (!payeeChoice.ok) {
+      return errorResponseFromCode(payeeChoice.code, log, { requestId, details: payeeChoice.details })
+    }
+
     // Shared validation + computation (VAT rules, accrual guards, totals,
     // revenue-account override checks, server-side ROT/RUT, currency, item
     // rows). Identical to the PATCH (draft edit) path: see build-invoice-write.
@@ -130,14 +168,24 @@ export const POST = withRouteContext(
       return errorResponseFromCode(build.code, log, { requestId, details: build.details })
     }
 
-    // Delivery notes are always numbered at insert (ignores save_as_draft);
-    // invoices/proformas get their F-number below or at finalize.
+    // Delivery notes and quotes are always numbered at insert from their own
+    // series (ignores save_as_draft): neither is a faktura, so no F-number is
+    // at stake. Invoices/proformas get their F-number below or at finalize.
     let invoiceNumber: string | null = null
     if (documentType === 'delivery_note') {
       const { data: dnNumber } = await supabase.rpc('generate_delivery_note_number', {
         p_company_id: companyId,
       })
       invoiceNumber = dnNumber
+    } else if (documentType === 'quote') {
+      const { data: quoteNumber, error: quoteNumberError } = await supabase.rpc('generate_quote_number', {
+        p_company_id: companyId,
+      })
+      if (quoteNumberError || !quoteNumber) {
+        log.error('quote number allocation failed', quoteNumberError ?? new Error('no number'))
+        return errorResponseFromCode('INVOICE_CREATE_NUMBER_ASSIGN_FAILED', log, { requestId })
+      }
+      invoiceNumber = quoteNumber
     }
 
     const { data: invoice, error: invoiceError } = await supabase
@@ -147,6 +195,8 @@ export const POST = withRouteContext(
         company_id: companyId,
         invoice_number: invoiceNumber,
         ...build.invoiceFields,
+        payment_cash_account_id: payeeChoice.fields.payment_cash_account_id,
+        payment_details: payeeChoice.fields.payment_details,
       })
       .select()
       .single()
@@ -301,6 +351,17 @@ async function createCreditNote(
     })
   }
 
+  // Self-billed originals have invoice_number null by design (the DB
+  // constraint invoices_self_billed_numbering enforces it); their number
+  // lives in external_invoice_number. Without this fallback the credit note
+  // would be numbered the literal string 'KR-null' (issue #1820). Both null
+  // is impossible for an issued invoice, but refuse defensively rather than
+  // mint a garbage number.
+  const originalRef = originalInvoice.invoice_number ?? originalInvoice.external_invoice_number
+  if (!originalRef) {
+    return errorResponseFromCode('INVOICE_CREDIT_NO_NUMBER', log, { requestId })
+  }
+
   // Returning the existing credit note makes the action idempotent. A
   // cancelled, unissued draft is reopened so the deterministic KR number can
   // be reused without colliding with the company-wide invoice-number key.
@@ -325,7 +386,7 @@ async function createCreditNote(
           status: 'draft',
           invoice_date: today,
           due_date: today,
-          notes: input.reason || `Krediterar faktura ${originalInvoice.invoice_number}`,
+          notes: input.reason || `Krediterar faktura ${originalRef}`,
           updated_at: new Date().toISOString(),
         })
         .eq('id', existingCreditNote.id)
@@ -354,7 +415,7 @@ async function createCreditNote(
     return NextResponse.json({ data: maskEmbeddedCustomer(existingCreditNote) })
   }
 
-  const creditNoteNumber = `KR-${originalInvoice.invoice_number}`
+  const creditNoteNumber = `KR-${originalRef}`
 
   const { data: creditNote, error: creditNoteError } = await supabase
     .from('invoices')
@@ -381,12 +442,21 @@ async function createCreditNote(
       reverse_charge_text: originalInvoice.reverse_charge_text,
       your_reference: originalInvoice.your_reference,
       our_reference: originalInvoice.our_reference,
+      // Same buyer routing on the kreditfaktura as the original.
+      invoice_marking: originalInvoice.invoice_marking ?? null,
+      // Same payee as the original: the credit note refers to the account
+      // the customer paid (or was asked to pay) to.
+      payment_cash_account_id: originalInvoice.payment_cash_account_id ?? null,
+      payment_details: originalInvoice.payment_details ?? null,
+      // Positive magnitude, unlike the negated amounts above: the DB has
+      // CHECK (deduction_total >= 0), and every reader either recomputes the
+      // ROT/RUT amount from the items or skips credit notes entirely.
       deduction_total: originalInvoice.deduction_total
-        ? -Math.abs(originalInvoice.deduction_total)
+        ? Math.abs(originalInvoice.deduction_total)
         : 0,
       deduction_personnummer_encrypted: originalInvoice.deduction_personnummer_encrypted ?? null,
       deduction_personnummer_last4: originalInvoice.deduction_personnummer_last4 ?? null,
-      notes: input.reason || `Krediterar faktura ${originalInvoice.invoice_number}`,
+      notes: input.reason || `Krediterar faktura ${originalRef}`,
       credited_invoice_id: input.credited_invoice_id,
       // Copy the original's dimension bag so the credit-note verifikat nets
       // against the same dimension cells in reports (dimensions PR7).

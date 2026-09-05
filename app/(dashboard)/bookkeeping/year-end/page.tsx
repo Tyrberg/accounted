@@ -1,13 +1,16 @@
 'use client'
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { useFiscalPeriods } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Card, CardContent } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
+import { AttnLine } from '@/components/ui/attn-line'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { ContextPicker } from '@/components/common/ContextPicker'
 import { Skeleton } from '@/components/ui/skeleton'
 import { CalendarPlus, Check, Lock } from 'lucide-react'
-import AgentSparkleButton from '@/components/agent/AgentSparkleButton'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
@@ -37,6 +40,12 @@ interface PeriodOption {
   name: string
   period_start: string
   period_end: string
+  /**
+   * True when the period can actually be closed here (open, ended, no closing
+   * entry). The dropdown can also hold a known-but-ineligible period from the
+   * URL; the klarmarkera affordance must not render for that one.
+   */
+  eligible: boolean
 }
 
 export default function YearEndPage() {
@@ -65,58 +74,49 @@ export default function YearEndPage() {
   const [executing, setExecuting] = useState(false)
   const [executeError, setExecuteError] = useState<string | null>(null)
   const [result, setResult] = useState<YearEndResult | null>(null)
+  const [navigationBlocked, setNavigationBlocked] = useState(false)
 
-  // ---- Load eligible periods ----
+  // ---- Eligible periods, from the session-cached list (lib/reference-data) ----
+  // Recomputed whenever the cached list changes: the close actions below
+  // invalidate it, which is what drops a just-closed year out of the picker.
+  const { periods: allPeriods, isLoading: periodsLoading, error: periodsFetchError } = useFiscalPeriods()
   useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      try {
-        const res = await fetch('/api/bookkeeping/fiscal-periods')
-        if (!res.ok) {
-          if (!cancelled) setPeriodsError('Kunde inte hämta perioder')
-          return
-        }
-        const { data } = (await res.json()) as { data: FiscalPeriod[] }
-        const all = data ?? []
-        const today = new Date().toISOString().split('T')[0]
-        const eligible = all.filter(
-          (p) => !p.is_closed && !p.closing_entry_id && p.period_end <= today,
-        )
-        // Oldest first: accountants close in order.
-        eligible.sort((a, b) => a.period_start.localeCompare(b.period_start))
-        if (cancelled) return
-        setHasAnyPeriods(all.length > 0)
+    if (periodsLoading) return
+    if (periodsFetchError) {
+      setPeriodsError('Kunde inte hämta perioder')
+      return
+    }
+    const all: FiscalPeriod[] = allPeriods
+    const today = new Date().toISOString().split('T')[0]
+    const eligible: PeriodOption[] = all
+      .filter((p) => !p.is_closed && !p.closing_entry_id && p.period_end <= today)
+      .map((p) => ({ ...p, eligible: true }))
+    // Oldest first: accountants close in order.
+    eligible.sort((a, b) => a.period_start.localeCompare(b.period_start))
+    setHasAnyPeriods(all.length > 0)
 
-        // The URL ?period= param may point anywhere: at an ineligible period
-        // (e.g. a year that has not ended) or, after a company switch, at a
-        // period that does not exist in this company at all. An unknown id is
-        // reset to the first eligible period; a known-but-ineligible one is
-        // kept selectable in the dropdown so the user can navigate away from
-        // it instead of being stuck (the readiness step explains why it
-        // cannot be closed).
-        let options = eligible
-        if (selectedPeriodId) {
-          const known = all.find((p) => p.id === selectedPeriodId)
-          if (!known) {
-            setSelectedPeriodId(eligible.length > 0 ? eligible[0].id : null)
-          } else if (!eligible.some((p) => p.id === selectedPeriodId)) {
-            options = [...eligible, known].sort((a, b) =>
-              a.period_start.localeCompare(b.period_start),
-            )
-          }
-        } else if (eligible.length > 0) {
-          setSelectedPeriodId(eligible[0].id)
-        }
-        setPeriods(options)
-      } catch {
-        if (!cancelled) setPeriodsError('Kunde inte hämta perioder')
+    // The URL ?period= param may point anywhere: at an ineligible period
+    // (e.g. a year that has not ended) or, after a company switch, at a
+    // period that does not exist in this company at all. An unknown id is
+    // reset to the first eligible period; a known-but-ineligible one is
+    // kept selectable in the dropdown so the user can navigate away from
+    // it instead of being stuck (the readiness step explains why it
+    // cannot be closed).
+    let options = eligible
+    if (selectedPeriodId) {
+      const known = all.find((p) => p.id === selectedPeriodId)
+      if (!known) {
+        setSelectedPeriodId(eligible.length > 0 ? eligible[0].id : null)
+      } else if (!eligible.some((p) => p.id === selectedPeriodId)) {
+        options = [...eligible, { ...known, eligible: false }].sort((a, b) =>
+          a.period_start.localeCompare(b.period_start),
+        )
       }
+    } else if (eligible.length > 0) {
+      setSelectedPeriodId(eligible[0].id)
     }
-    void load()
-    return () => {
-      cancelled = true
-    }
-  }, [selectedPeriodId])
+    setPeriods(options)
+  }, [selectedPeriodId, allPeriods, periodsLoading, periodsFetchError])
 
   // ---- Sync selected period to URL so users can bookmark / share ----
   useEffect(() => {
@@ -194,6 +194,8 @@ export default function YearEndPage() {
       }
       setResult(body.data as YearEndResult)
       setStep('result')
+      // The period is now closed: every picker and form reads the cached list.
+      void invalidateReferenceData('ref:fiscal-periods')
       toast({
         title: 'Bokslut verkställt',
         description: `${report?.period.name ?? 'Perioden'} är stängd.`,
@@ -212,17 +214,54 @@ export default function YearEndPage() {
     [selectedPeriodId, periods],
   )
 
+  // ---- Klarmarkera: year already closed in a previous bookkeeping system ----
+  // Imported historical years (SIE) land here as "pending bokslut" even though
+  // the bokslut was done in the old software. The confirm dialog POSTs
+  // close-external, which closes + locks the period without a closing entry.
+  const [confirmExternalOpen, setConfirmExternalOpen] = useState(false)
+  const selectedOption = periods?.find((p) => p.id === selectedPeriodId) ?? null
+
+  const markClosedExternally = useCallback(async () => {
+    if (!selectedPeriodId) return
+    try {
+      const res = await fetch(
+        `/api/bookkeeping/fiscal-periods/${selectedPeriodId}/close-external`,
+        { method: 'POST' },
+      )
+      const body = await res.json()
+      if (!res.ok) {
+        toast({
+          title: 'Kunde inte klarmarkera perioden',
+          description: getErrorMessage(body?.error),
+          variant: 'destructive',
+        })
+        return
+      }
+      toast({
+        title: 'Perioden klarmarkerad',
+        description: `${selectedOption?.name ?? 'Perioden'} är nu markerad som avslutad i tidigare program.`,
+      })
+      // Drop back to "no selection" and refresh the cached list: the effect
+      // above picks the next eligible period (the marked one no longer
+      // qualifies).
+      setPeriods(null)
+      setSelectedPeriodId(null)
+      setStep('preflight')
+      await invalidateReferenceData('ref:fiscal-periods')
+    } catch (err) {
+      toast({
+        title: 'Kunde inte klarmarkera perioden',
+        description: getErrorMessage(err),
+        variant: 'destructive',
+      })
+    }
+  }, [selectedPeriodId, selectedOption?.name, toast])
+
   return (
     <div className="space-y-8">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <h1 className="font-display text-2xl leading-8 tracking-tight">Årsbokslut</h1>
         <div className="flex items-center gap-2">
-          <AgentSparkleButton
-            intentId="bokslut.step"
-            intentArgs={{ step_id: null }}
-            contextRef="bokslut:overview"
-            size="default"
-          />
           {showWizard && periods && periods.length > 0 && step !== 'result' && (
             <ContextPicker
               items={periods.map((p) => ({
@@ -231,6 +270,7 @@ export default function YearEndPage() {
                 annotation: `${p.period_start} till ${p.period_end}`,
               }))}
               value={selectedPeriodId}
+              disabled={navigationBlocked}
               onChange={(value) => {
                 setSelectedPeriodId(value)
                 setStep('preflight')
@@ -246,6 +286,32 @@ export default function YearEndPage() {
           )}
         </div>
       </div>
+
+      {showWizard && step === 'preflight' && selectedOption?.eligible && !navigationBlocked && (
+        <AttnLine
+          action={{ label: 'Klarmarkera perioden', onClick: () => setConfirmExternalOpen(true) }}
+        >
+          Är bokslutet för {selectedOption.name} redan gjort i ett tidigare bokföringsprogram?
+        </AttnLine>
+      )}
+
+      <ConfirmDialog
+        open={confirmExternalOpen}
+        onOpenChange={setConfirmExternalOpen}
+        title="Klarmarkera perioden?"
+        description={
+          <>
+            {selectedOption?.name ?? 'Perioden'} markeras som avslutad i ett tidigare
+            bokföringsprogram. Perioden stängs och låses: inga nya verifikat kan bokföras i den,
+            och inget bokslutsverifikat skapas här eftersom bokslutet redan finns i det gamla
+            programmet. Rapporter som bygger på periodens bokslut (t.ex. jämförelseår i nästa
+            årsredovisning och INK2 för perioden) kan sakna uppgifter och behöver i så fall
+            hämtas från det tidigare programmet. Åtgärden loggas i behandlingshistoriken.
+          </>
+        }
+        confirmLabel="Klarmarkera"
+        onConfirm={markClosedExternally}
+      />
 
       {periods === null && !periodsError && (
         <Card>
@@ -296,13 +362,13 @@ export default function YearEndPage() {
                 type="button"
                 role="tab"
                 aria-selected={s === step}
-                disabled={i >= currentStepIndex}
+                disabled={navigationBlocked || i >= currentStepIndex}
                 onClick={() => {
-                  if (i < currentStepIndex) setStep(s)
+                  if (!navigationBlocked && i < currentStepIndex) setStep(s)
                 }}
                 className={cn(
                   'group flex shrink-0 items-center gap-2 text-left',
-                  i >= currentStepIndex && 'cursor-default',
+                  (navigationBlocked || i >= currentStepIndex) && 'cursor-default',
                 )}
               >
                 <span
@@ -357,6 +423,7 @@ export default function YearEndPage() {
           periodId={selectedPeriodId}
           onBack={() => setStep('accruals')}
           onContinue={goToPreview}
+          onNavigationBlockedChange={setNavigationBlocked}
         />
       )}
 

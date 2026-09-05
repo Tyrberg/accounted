@@ -4,7 +4,7 @@ import React, { useState, useCallback, useMemo } from 'react'
 import Link from 'next/link'
 import { ChevronDown, ChevronRight, AlertCircle } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
-import { formatDate } from '@/lib/utils'
+import { formatAmount, formatDate } from '@/lib/utils'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import {
   createSourceLoader,
@@ -97,7 +97,7 @@ export function ReportRowExpansion({
           aria-expanded={expanded}
           aria-controls={`expansion-${rowId}`}
           aria-label={expanded ? 'Dölj verifikat' : 'Visa verifikat'}
-          className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
+          className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
         >
           {expanded ? (
             <ChevronDown className="h-4 w-4" />
@@ -142,7 +142,7 @@ export function useReportRowExpansion(fetcher: ReportSourceFetcher, rowId: strin
       aria-expanded={expanded}
       aria-controls={`expansion-${rowId}`}
       aria-label={expanded ? 'Dölj verifikat' : 'Visa verifikat'}
-      className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
+      className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
     >
       {expanded ? (
         <ChevronDown className="h-4 w-4" />
@@ -299,9 +299,3 @@ function ExpansionContent({
   )
 }
 
-function formatAmount(amount: number): string {
-  return amount.toLocaleString('sv-SE', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })
-}

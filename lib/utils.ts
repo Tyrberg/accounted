@@ -72,15 +72,15 @@ export function formatDate(date: Date | string): string {
  *
  * The shape check (4-digit year) is what stops the native <input type="date">
  * 6-digit-year corruption ('202403-02-05'); the parse + range check also
- * rejects impossible dates (2024-13-40) and absurd years. Exported as the ONE
- * authoritative date rule shared by the client form and the server-side
+ * rejects impossible dates (2024-13-40) and absurd years. The ONE authoritative
+ * date rule shared by the client form and the server-side
  * CreateTransactionSchema, so the two validation layers can never drift.
+ *
+ * Implementation lives in `lib/invariants/iso-date.ts` alongside the other
+ * shared format contracts; re-exported here because this is where callers have
+ * always imported it from.
  */
-export function isSaneDateString(s: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false
-  const d = parseISO(s)
-  return isValid(d) && d.getFullYear() >= 1900 && d.getFullYear() <= 2100
-}
+export { isSaneDateString } from '@/lib/invariants/iso-date'
 
 /**
  * Date + time for audit / metadata displays: `2026-05-11 14:30`. ISO-ordered
@@ -178,23 +178,54 @@ export function formatOrgNumber(orgNumber: string): string {
   return orgNumber
 }
 
+/** UTC YYYYMMDD stamp (e.g. for archive download filenames). */
+export function utcDateStamp(date: Date): string {
+  const year = date.getUTCFullYear()
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(date.getUTCDate()).padStart(2, '0')
+  return `${year}${month}${day}`
+}
+
+/** Resolve after `ms` milliseconds (setTimeout as a promise). */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Split `items` into consecutive slices of at most `size` elements. */
+export function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
+
 export function getCompanyDisplayName(settings: { company_name?: string | null }): string {
   return settings.company_name?.trim() || ''
 }
 
-export function getCompanyPrimaryName(settings: { company_name?: string | null }): string {
-  return settings.company_name?.trim() || ''
-}
-
-export function generateInvoiceNumber(): string {
-  const year = new Date().getFullYear()
-  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0')
-  return `${year}-${random}`
-}
 
 // Shared FX-rate validator: keeps UI, RPC (>= 100000 / <= 0), and the
 // invoices/supplier_invoices CHECK constraints in sync. Single source
 // of truth for the 0 < rate < 100000 bound.
 export function isValidExchangeRate(rate: number | null | undefined): rate is number {
   return rate != null && rate > 0 && rate < 100000
+}
+
+// Run a promise against a wall-clock budget. The underlying work continues to
+// completion on the server when the budget elapses: we just stop waiting for
+// it. For Anthropic calls that's fine: a slow Opus turn finishing later still
+// warms its own cache.
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+    promise.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(timer)
+        reject(e)
+      },
+    )
+  })
 }

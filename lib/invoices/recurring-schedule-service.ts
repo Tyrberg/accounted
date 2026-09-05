@@ -5,10 +5,14 @@
  *  - executeRecurringSchedule: spawn one invoice from a schedule, optionally
  *    sending it. Used by the daily cron and by a manual "run now" admin
  *    action.
- *  - computeNextRunDate: pure date helper. Given today + day_of_month, return
- *    the next date the schedule should run. Day-of-month values >28 are
- *    clamped to the last day of shorter months; the schedule keeps its
- *    original day_of_month so it jumps back in months that have it.
+ *  - computeNextRunDate: pure date helper. Given a reference date,
+ *    day_of_month and interval_months, return the next date the schedule
+ *    should run. Day-of-month values >28 are clamped to the last day of
+ *    shorter months; the schedule keeps its original day_of_month so it
+ *    jumps back in months that have it.
+ *  - rollNextRunDateForward: pure date helper for stale schedules. Advances
+ *    a missed next_run_date in whole intervals so a quarterly or yearly
+ *    schedule keeps its month phase across an outage or a pause.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -27,6 +31,7 @@ import {
 } from '@/lib/invoices/pdf-render-helpers'
 import { applyPaymentLinkToInvoice } from '@/lib/extensions/payment-links'
 import { getEmailService } from '@/lib/email/service'
+import { resolveInvoiceSender } from '@/lib/email/invoice-sender'
 import { hasCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { isSandboxCompany } from '@/lib/sandbox/guard'
@@ -48,6 +53,8 @@ import {
 import {
   hasRequiredInvoicePaymentAccount,
 } from '@/lib/invoices/payment-accounts'
+import { snapshotInvoicePayee } from '@/lib/invoices/invoice-payee'
+import { hasRequiredSellerVatNumber } from '@/lib/invoices/seller-vat-number'
 import { createLogger } from '@/lib/logger'
 import type {
   Invoice,
@@ -76,33 +83,96 @@ function lastDayOfMonth(year: number, monthIndex0: number): number {
   return new Date(Date.UTC(year, monthIndex0 + 1, 0)).getUTCDate()
 }
 
+function isoFromParts(year: number, monthIndex0: number, day: number): string {
+  const yyyy = year.toString().padStart(4, '0')
+  const mm = (monthIndex0 + 1).toString().padStart(2, '0')
+  const dd = day.toString().padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
+}
+
+function assertValidCadence(dayOfMonth: number, intervalMonths: number): void {
+  if (!Number.isInteger(dayOfMonth) || dayOfMonth < 1 || dayOfMonth > 31) {
+    throw new Error(`invalid day_of_month: ${dayOfMonth}`)
+  }
+  if (!Number.isInteger(intervalMonths) || intervalMonths < 1 || intervalMonths > 12) {
+    throw new Error(`invalid interval_months: ${intervalMonths}`)
+  }
+}
+
 /**
- * Compute the next run date for a schedule given a reference date and the
- * stored day_of_month. The reference is always interpreted in UTC to avoid
- * timezone surprises around the day boundary in Vercel cron.
+ * Compute the next run date for a schedule given a reference date, the
+ * stored day_of_month and interval_months. The reference is always
+ * interpreted in UTC to avoid timezone surprises around the day boundary in
+ * Vercel cron.
  *
  * Rules:
  *  - If reference is the same as a valid day_of_month occurrence, returns
- *    NEXT month's occurrence (callers compute the FIRST run via
+ *    the occurrence one interval later (callers compute the FIRST run via
  *    computeInitialRunDate).
  *  - Day 29-31 in shorter months clamps to that month's last day.
  *  - The schedule's stored day_of_month is unchanged: caller passes it in.
+ *  - interval_months (default 1 = monthly) is how many months to advance;
+ *    the cron passes the reference on the schedule's own due date, so the
+ *    month phase of a quarterly/yearly schedule is preserved.
  */
-export function computeNextRunDate(reference: Date, dayOfMonth: number): string {
-  if (dayOfMonth < 1 || dayOfMonth > 31) {
-    throw new Error(`invalid day_of_month: ${dayOfMonth}`)
-  }
+export function computeNextRunDate(
+  reference: Date,
+  dayOfMonth: number,
+  intervalMonths = 1,
+): string {
+  assertValidCadence(dayOfMonth, intervalMonths)
   const refY = reference.getUTCFullYear()
   const refM = reference.getUTCMonth()
-  // Advance to the next month.
-  const nextM = refM + 1
+  // Advance one interval.
+  const nextM = refM + intervalMonths
   const nextYear = refY + Math.floor(nextM / 12)
   const nextMonth = ((nextM % 12) + 12) % 12
   const clamped = Math.min(dayOfMonth, lastDayOfMonth(nextYear, nextMonth))
-  const yyyy = nextYear.toString().padStart(4, '0')
-  const mm = (nextMonth + 1).toString().padStart(2, '0')
-  const dd = clamped.toString().padStart(2, '0')
-  return `${yyyy}-${mm}-${dd}`
+  return isoFromParts(nextYear, nextMonth, clamped)
+}
+
+/**
+ * Roll a missed (or being-edited) next_run_date forward on the schedule's
+ * own month grid: start from the anchor's year-month, apply day_of_month
+ * (clamped per month), and advance in whole interval_months steps until the
+ * result is on-or-after today (allowToday, cron's stale roll-forward) or
+ * strictly after today (edits/reactivation, so nothing can trigger a
+ * same-hour surprise send).
+ *
+ * Anchoring on the stale date rather than on today is what keeps a
+ * quarterly schedule on its Jan/Apr/Jul/Oct phase: a Jan 15 run missed
+ * during an outage rolls to Apr 15, not to Feb 15. For interval 1 every
+ * month is on the grid, so this degenerates to the pre-interval behavior.
+ */
+export function rollNextRunDateForward(
+  anchorDate: string,
+  today: Date,
+  dayOfMonth: number,
+  intervalMonths = 1,
+  { allowToday = false }: { allowToday?: boolean } = {},
+): string {
+  assertValidCadence(dayOfMonth, intervalMonths)
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(anchorDate)
+  if (!match) {
+    throw new Error(`invalid anchor date: ${anchorDate}`)
+  }
+  let year = Number(match[1])
+  let month0 = Number(match[2]) - 1
+  // The regex only shapes the string; reject calendar-invalid anchors like
+  // 2026-13-05 or 2026-02-31 instead of silently normalizing them.
+  const anchorDay = Number(match[3])
+  if (month0 < 0 || month0 > 11 || anchorDay < 1 || anchorDay > lastDayOfMonth(year, month0)) {
+    throw new Error(`invalid anchor date: ${anchorDate}`)
+  }
+  const todayIso = isoFromParts(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())
+  let candidate = isoFromParts(year, month0, Math.min(dayOfMonth, lastDayOfMonth(year, month0)))
+  while (allowToday ? candidate < todayIso : candidate <= todayIso) {
+    const m = month0 + intervalMonths
+    year += Math.floor(m / 12)
+    month0 = m % 12
+    candidate = isoFromParts(year, month0, Math.min(dayOfMonth, lastDayOfMonth(year, month0)))
+  }
+  return candidate
 }
 
 /**
@@ -195,7 +265,7 @@ export async function executeRecurringSchedule(
     throw new Error(`customer not found for schedule ${schedule.id}`)
   }
 
-  const vatRules = getVatRules(customer.customer_type, customer.vat_number_validated)
+  const vatRules = getVatRules(customer.customer_type, customer.vat_number_validated, customer.country)
   // Gate on the PERMITTED set, not the picker default, exactly like
   // buildInvoiceWriteData: the ML 6 kap. supplies taxed where they are performed
   // (hotel/restaurang 12%, persontransport and event admission 6%,
@@ -203,13 +273,32 @@ export async function executeRecurringSchedule(
   // foreign business customer. A monthly hotel or catering retainer to a German
   // company is such a schedule. The default is still 0% (vatRules.rate is the
   // fallback below), so a Swedish rate only lands here when the schedule set it.
-  const permittedRates = getPermittedVatRates(customer.customer_type, customer.vat_number_validated)
+  const permittedRates = getPermittedVatRates(customer.customer_type, customer.vat_number_validated, customer.country)
   const allowedRates = new Set(permittedRates.map((r) => r.rate))
 
   // 2. Compute amounts (mirrors POST /api/invoices).
   const items = (schedule.items || []).slice().sort((a, b) => a.sort_order - b.sort_order)
   if (items.length === 0) {
     throw new Error(`schedule ${schedule.id} has no items`)
+  }
+
+  // VAT registration gate, mirroring buildInvoiceWriteData (issue #1719): a
+  // non-momsregistrerad company books no output VAT, so the spawned invoice
+  // must be momsfri regardless of what the schedule template says. Both a
+  // stored template rate (the dialog defaults new lines to 25%, and older
+  // schedules may predate a deregistration) and the null-rate fallback to the
+  // customer default below (25% for Swedish customers) would otherwise put
+  // VAT on the cron-generated invoice even though momskrysset is off. Zero
+  // every line at spawn time; 0% is a permitted rate for every customer type,
+  // so the allowedRates gate below still passes.
+  const { data: vatSettings } = await supabase
+    .from('company_settings')
+    .select('vat_registered')
+    .eq('company_id', schedule.company_id)
+    .maybeSingle()
+  const notVatRegistered = vatSettings?.vat_registered === false
+  if (notVatRegistered) {
+    for (const item of items) item.vat_rate = 0
   }
 
   const subtotal = items.reduce((sum, it) => sum + it.quantity * it.unit_price, 0)
@@ -284,10 +373,13 @@ export async function executeRecurringSchedule(
       total,
       total_sek: totalSek,
       remaining_amount: total,
-      vat_treatment: vatRules.treatment,
+      // Header VAT fields mirror buildInvoiceWriteData: a not-VAT-registered
+      // company stamps the sale as momsfri (treatment 'exempt', no ruta, no
+      // reverse-charge notation); every line rate is already zeroed above.
+      vat_treatment: notVatRegistered ? 'exempt' : vatRules.treatment,
       vat_rate: isMixedRate ? null : (uniqueRates.values().next().value ?? vatRules.rate),
-      moms_ruta: vatRules.momsRuta,
-      reverse_charge_text: vatRules.reverseChargeText || null,
+      moms_ruta: notVatRegistered ? null : vatRules.momsRuta,
+      reverse_charge_text: notVatRegistered ? null : (vatRules.reverseChargeText || null),
       your_reference: schedule.your_reference,
       our_reference: schedule.our_reference,
       notes: schedule.notes,
@@ -484,6 +576,15 @@ async function sendInvoiceFromSchedule(
   if (!company) {
     throw new Error('company settings missing: cannot send invoice')
   }
+  const payeeSnapshot = await snapshotInvoicePayee(supabase, companyId, invoice)
+  if (!payeeSnapshot.ok) {
+    log.warn('chosen payee account is no longer usable; recurring schedule cannot auto-send', {
+      invoiceId: invoice.id,
+      ...payeeSnapshot.details,
+    })
+    return false
+  }
+  invoice.payment_details = payeeSnapshot.payee
   if (!hasRequiredInvoicePaymentAccount(company, invoice)) {
     log.warn('invoice currency has no usable payment account; recurring schedule cannot auto-send', {
       invoiceId: invoice.id,
@@ -491,10 +592,18 @@ async function sendInvoiceFromSchedule(
     })
     return false
   }
+  if (!hasRequiredSellerVatNumber(company, invoice)) {
+    log.warn('registered company has no VAT number; recurring schedule cannot auto-send', {
+      invoiceId: invoice.id,
+    })
+    return false
+  }
   const recipients = resolveInvoiceEmailRecipients({
     to: invoice.customer.email,
     configuredCc: company.invoice_email_cc_addresses,
     configuredBcc: company.invoice_email_bcc_addresses,
+    customerCc: invoice.customer.invoice_email_cc_addresses,
+    customerBcc: invoice.customer.invoice_email_bcc_addresses,
     legacyCc: company.email,
   })
   if (exceedsInvoiceEmailRecipientLimit(recipients)) {
@@ -548,6 +657,7 @@ async function sendInvoiceFromSchedule(
   const { branding, company: renderCompany } = await prepareInvoicePdfRender(
     company,
     renderableInvoice.currency,
+    { payee: renderableInvoice.payment_details ?? null },
   )
   const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, renderableInvoice)
   const paymentLinkQrDataUrl = await buildPaymentLinkQrDataUrl(renderableInvoice)
@@ -592,6 +702,7 @@ async function sendInvoiceFromSchedule(
       text,
       replyTo: company.email || undefined,
       fromName: company.company_name ?? undefined,
+      from: await resolveInvoiceSender(supabase, companyId, company.company_name),
       filename,
       pdfBuffer,
     })

@@ -339,7 +339,13 @@ export async function findCounterpartyTemplatesBatch(
   }
 
   for (const tx of transactions) {
-    const rawName = tx.merchant_name || tx.description
+    // Identity anchors on the immutable bank original, not the working title:
+    // the ingest boundary strips the trailing channel phrase off description
+    // ("SPOTIFY AB Kortköp" → "SPOTIFY AB") and users can rename it, but
+    // templates were learned from the full bank string, so matching the
+    // original keeps every era's keys and aliases aligned (same rationale as
+    // buildMerchantHistory in lib/transactions/category-suggestions.ts).
+    const rawName = tx.merchant_name || tx.original_description || tx.description
     if (!rawName) continue
 
     const normalized = normalizeCounterpartyName(rawName)
@@ -436,14 +442,15 @@ export async function findCounterpartyTemplatesBatch(
 // ── Build MappingResult ────────────────────────────────────────
 
 /** Which side of a template the money settles on. */
-type TemplateDirection = 'expense' | 'income' | 'unknown'
+export type TemplateDirection = 'expense' | 'income' | 'unknown'
 
 /**
  * Learned direction of a legacy (single debit/credit) template: expenses
  * settle on the credit side (credit bank, debit cost), income settles on the
  * debit side. 'unknown' when neither or both accounts look like settlement.
  */
-function legacyTemplateDirection(debitAccount: string, creditAccount: string): TemplateDirection {
+export function legacyTemplateDirection(debitAccount: string, creditAccount: string): TemplateDirection {
+
   const debitSettles = isSettlementAccount(debitAccount)
   const creditSettles = isSettlementAccount(creditAccount)
   if (creditSettles && !debitSettles) return 'expense'
@@ -452,7 +459,8 @@ function legacyTemplateDirection(debitAccount: string, creditAccount: string): T
 }
 
 /** Learned direction of a multi-line pattern: read off the business sides. */
-function patternDirection(pattern: LinePatternEntry[]): TemplateDirection {
+export function patternDirection(pattern: LinePatternEntry[]): TemplateDirection {
+
   const business = pattern.filter((e) => e.type === 'business')
   if (business.length === 0) return 'unknown'
   const debitCount = business.filter((b) => b.side === 'debit').length
@@ -618,7 +626,8 @@ function buildLegacyMismatchResult(
  * Build a MappingResult from a multi-line counterparty template pattern.
  *
  * VAT is computed from rate (exact), business/tax from ratio against non-VAT subtotal.
- * Rounding difference goes to 3740 (Öresutjämning).
+ * Rounding difference goes to 3740 (Öresutjämning): on the business side when
+ * the ratios under-allocate, on the opposite side when they over-allocate (#1898).
  * Settlement line always equals the exact transaction amount.
  */
 function buildMultiLineMappingResult(
@@ -682,12 +691,18 @@ function buildMultiLineMappingResult(
   const totalAllocated = Math.round((totalVat + nonVatAllocated) * 100) / 100
   const roundingDiff = Math.round((absAmount - totalAllocated) * 100) / 100
   if (roundingDiff !== 0) {
-    // Determine the side for the rounding line (same side as business lines)
+    // A positive diff means the ratios under-allocated: 3740 fills the gap on
+    // the business side. A negative diff means they over-allocated (three
+    // 0.3334 ratios on 100.00 kr give 3 x 33.34 = 100.02): 3740 offsets on
+    // the OPPOSITE side so the non-settlement lines net to absAmount (#1898).
+    // businessSide is already mirror-applied via side(), so flip after it.
     const businessSide = side(pattern.find(e => e.type === 'business')?.side ?? 'credit')
+    const roundingSide: 'debit' | 'credit' =
+      roundingDiff > 0 ? businessSide : (businessSide === 'debit' ? 'credit' : 'debit')
     allLines.push({
       account_number: '3740',
-      debit_amount: businessSide === 'debit' ? Math.abs(roundingDiff) : 0,
-      credit_amount: businessSide === 'credit' ? Math.abs(roundingDiff) : 0,
+      debit_amount: roundingSide === 'debit' ? Math.abs(roundingDiff) : 0,
+      credit_amount: roundingSide === 'credit' ? Math.abs(roundingDiff) : 0,
       description: 'Öresutjämning',
     })
   }
@@ -906,7 +921,11 @@ export async function upsertCounterpartyTemplate(
   // flip the template's accounts and poison future matches.
   if (mappingResult.direction_mismatch) return
 
-  const rawName = transaction.merchant_name || transaction.description
+  // Learn from the immutable bank original (see findCounterpartyTemplatesBatch):
+  // learning and lookup MUST derive the key from the same string, or the
+  // ingest-time phrase strip would fork template identities by era.
+  const rawName =
+    transaction.merchant_name || transaction.original_description || transaction.description
   if (!rawName) return
 
   const normalized = normalizeCounterpartyName(rawName)
@@ -982,7 +1001,8 @@ function toDateString(d: Date): string {
 }
 
 /** Settlement accounts: bank/cash (19xx), receivables (1510), payables (2440), credit card (2890) */
-function isSettlementAccount(account: string): boolean {
+export function isSettlementAccount(account: string): boolean {
+
   return account.startsWith('19') || account === '1510' || account === '2440' || account === '2890'
 }
 

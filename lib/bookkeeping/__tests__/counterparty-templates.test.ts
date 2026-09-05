@@ -142,7 +142,7 @@ describe('counterparty-templates', () => {
   describe('findCounterpartyTemplate', () => {
     it('returns null for transaction without merchant name', async () => {
       const { supabase } = createMockSupabase()
-      const tx = makeTransaction({ merchant_name: null, description: '' })
+      const tx = makeTransaction({ merchant_name: null, description: '', original_description: null })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
       expect(result).toBeNull()
     })
@@ -235,6 +235,34 @@ describe('counterparty-templates', () => {
       expect(result).toBeNull()
     })
 
+    it('anchors identity on original_description: a template learned from the full bank string matches a stripped working title', async () => {
+      // Era-stability regression: the ingest boundary strips the trailing
+      // channel phrase off description ("SPOTIFY AB Kortköp" → "SPOTIFY AB"),
+      // but templates learned BEFORE that carry keys/aliases derived from the
+      // full string. Matching must read the immutable original, or a
+      // single-distinctive-token template (occurrence 1, below the
+      // MIN_SINGLE_TOKEN_OCCURRENCES gate) silently stops matching.
+      const fullString = 'SPOTIFY AB Kortköp'
+      const template = makeCategorizationTemplate({
+        counterparty_name: normalizeCounterpartyName(fullString),
+        confidence: 0.8,
+        counterparty_aliases: [fullString.toLowerCase()],
+        occurrence_count: 1,
+      })
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      enqueue({ data: [template] })
+
+      const tx = makeTransaction({
+        merchant_name: null,
+        description: 'SPOTIFY AB', // stripped working title
+        original_description: fullString, // immutable bank original
+      })
+      const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
+
+      expect(result).not.toBeNull()
+      expect(result!.matchMethod).toBe('exact_alias')
+    })
+
     it('token-subset matches a template token buried in a card descriptor', async () => {
       // The reported Anthropic case: a template learned from manual bookings
       // ("Claude Dec" -> "claude") must match the bank's card descriptor even
@@ -250,6 +278,7 @@ describe('counterparty-templates', () => {
       const tx = makeTransaction({
         merchant_name: null,
         description: 'ANTHROPIC* CLAUDE SUB SAN FRANCISCO',
+        original_description: 'ANTHROPIC* CLAUDE SUB SAN FRANCISCO',
       })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
 
@@ -272,6 +301,7 @@ describe('counterparty-templates', () => {
       const tx = makeTransaction({
         merchant_name: null,
         description: 'ANTHROPIC*CLAUDE SUB LONDON',
+        original_description: 'ANTHROPIC*CLAUDE SUB LONDON',
       })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
 
@@ -291,7 +321,11 @@ describe('counterparty-templates', () => {
       const { supabase, enqueue } = createQueuedMockSupabase()
       enqueue({ data: [template] })
 
-      const tx = makeTransaction({ merchant_name: null, description: 'SWISH ANDERS JOHANSSON' })
+      const tx = makeTransaction({
+        merchant_name: null,
+        description: 'SWISH ANDERS JOHANSSON',
+        original_description: 'SWISH ANDERS JOHANSSON',
+      })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
 
       expect(result).toBeNull()
@@ -310,6 +344,7 @@ describe('counterparty-templates', () => {
       const tx = makeTransaction({
         merchant_name: null,
         description: 'SQ *BLUE BOTTLE COFFEE OAKLAND',
+        original_description: 'SQ *BLUE BOTTLE COFFEE OAKLAND',
       })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
 
@@ -353,6 +388,7 @@ describe('counterparty-templates', () => {
       const tx = makeTransaction({
         merchant_name: null,
         description: 'ANTHROPIC* CLAUDE SUB SAN FRANCISCO',
+        original_description: 'ANTHROPIC* CLAUDE SUB SAN FRANCISCO',
       })
       const result = await findCounterpartyTemplate(supabase as never, 'user-1', tx)
 
@@ -475,6 +511,38 @@ describe('counterparty-templates', () => {
       expect(supabase.from).toHaveBeenCalledWith('categorization_templates')
     })
 
+    it('learns the key from the immutable bank original, not the stripped working title', async () => {
+      // Learning and lookup must derive the key from the same string
+      // (original_description), or the ingest-time phrase strip would fork
+      // template identities by era. Tailored mock: the shared queued mock
+      // does not capture insert payloads.
+      const inserted: Record<string, unknown>[] = []
+      const chain = {
+        select: () => chain,
+        eq: () => chain,
+        maybeSingle: async () => ({ data: null, error: null }),
+        insert: async (payload: Record<string, unknown>) => {
+          inserted.push(payload)
+          return { error: null }
+        },
+      }
+      const supabase = { from: () => chain }
+      const tx = makeTransaction({
+        merchant_name: null,
+        description: 'SPOTIFY AB',
+        original_description: 'SPOTIFY AB Kortköp',
+        date: '2024-06-15',
+      })
+
+      await upsertCounterpartyTemplate(
+        supabase as never, 'user-1', tx, mappingResult, 'auto_learned'
+      )
+
+      expect(inserted).toHaveLength(1)
+      expect(inserted[0].counterparty_name).toBe(normalizeCounterpartyName('SPOTIFY AB Kortköp'))
+      expect(inserted[0].counterparty_aliases).toEqual(['spotify ab kortköp'])
+    })
+
     it('does not throw on insert error', async () => {
       const { supabase, enqueue } = createQueuedMockSupabase()
       const tx = makeTransaction({ merchant_name: 'New Company AB' })
@@ -530,7 +598,7 @@ describe('counterparty-templates', () => {
 
     it('skips upsert for transactions without merchant name', async () => {
       const { supabase } = createQueuedMockSupabase()
-      const tx = makeTransaction({ merchant_name: null, description: '' })
+      const tx = makeTransaction({ merchant_name: null, description: '', original_description: null })
 
       await upsertCounterpartyTemplate(
         supabase as never, 'user-1', tx, mappingResult, 'user_approved'
@@ -1041,6 +1109,116 @@ describe('dimensions propagation (PR7)', () => {
 })
 
 // ── learning-loop repair (issue #865) ────────────────────────
+
+describe('line-pattern rounding diff on 3740 (issue #1898)', () => {
+  const expenseTriple = (ratio: number): LinePatternEntry[] => [
+    { account: '6110', type: 'business', side: 'debit', ratio },
+    { account: '6212', type: 'business', side: 'debit', ratio },
+    { account: '6991', type: 'business', side: 'debit', ratio },
+  ]
+
+  function entrySums(
+    tx: Parameters<typeof buildTransactionEntryLines>[0],
+    result: Parameters<typeof buildTransactionEntryLines>[1],
+  ) {
+    const lines = buildTransactionEntryLines(tx, result)
+    return {
+      debits: roundOre(lines.reduce((s, l) => s + l.debit_amount, 0)),
+      credits: roundOre(lines.reduce((s, l) => s + l.credit_amount, 0)),
+    }
+  }
+
+  it('books an over-allocating pattern rounding diff on 3740 opposite the business side', () => {
+    const template = makeCategorizationTemplate({
+      debit_account: '6110',
+      credit_account: '1930',
+      line_pattern: expenseTriple(0.3334),
+    })
+    const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+    const tx = makeTransaction({ amount: -100 })
+
+    const result = buildMappingResultFromCounterpartyTemplate(match, tx, 'enskild_firma')
+
+    // 3 x 33.34 = 100.02 over-allocates by 0.02: 3740 must offset on the credit side
+    for (const account of ['6110', '6212', '6991']) {
+      expect(result.vat_lines.find((l) => l.account_number === account)?.debit_amount).toBe(33.34)
+    }
+    const rounding = result.vat_lines.find((l) => l.account_number === '3740')
+    expect(rounding?.credit_amount).toBe(0.02)
+    expect(rounding?.debit_amount).toBe(0)
+    const { debits, credits } = entrySums(tx, result)
+    expect(debits).toBe(100.02)
+    expect(credits).toBe(100.02)
+  })
+
+  it('balances a normalized 50/50 pattern on an odd-ore amount', () => {
+    const template = makeCategorizationTemplate({
+      debit_account: '6110',
+      credit_account: '1930',
+      line_pattern: [
+        { account: '6110', type: 'business', side: 'debit', ratio: 0.5 },
+        { account: '6212', type: 'business', side: 'debit', ratio: 0.5 },
+      ],
+    })
+    const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+    const tx = makeTransaction({ amount: -100.03 })
+
+    const result = buildMappingResultFromCounterpartyTemplate(match, tx, 'enskild_firma')
+
+    // 50.015 rounds to 50.02 twice: ratios that sum to exactly 1 still over-allocate
+    expect(result.vat_lines.find((l) => l.account_number === '6110')?.debit_amount).toBe(50.02)
+    expect(result.vat_lines.find((l) => l.account_number === '6212')?.debit_amount).toBe(50.02)
+    const rounding = result.vat_lines.find((l) => l.account_number === '3740')
+    expect(rounding?.credit_amount).toBe(0.01)
+    expect(rounding?.debit_amount).toBe(0)
+    const { debits, credits } = entrySums(tx, result)
+    expect(debits).toBe(credits)
+  })
+
+  it('keeps an under-allocating diff on the business side', () => {
+    const template = makeCategorizationTemplate({
+      debit_account: '6110',
+      credit_account: '1930',
+      line_pattern: expenseTriple(0.333),
+    })
+    const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+    const tx = makeTransaction({ amount: -100 })
+
+    const result = buildMappingResultFromCounterpartyTemplate(match, tx, 'enskild_firma')
+
+    // 3 x 33.30 = 99.90 under-allocates by 0.10: unchanged business-side placement
+    const rounding = result.vat_lines.find((l) => l.account_number === '3740')
+    expect(rounding?.debit_amount).toBe(0.1)
+    expect(rounding?.credit_amount).toBe(0)
+    const { debits, credits } = entrySums(tx, result)
+    expect(debits).toBe(100)
+    expect(credits).toBe(100)
+  })
+
+  it('mirrors the over-allocation rounding leg on sign mismatch', () => {
+    const template = makeCategorizationTemplate({
+      debit_account: '6110',
+      credit_account: '1930',
+      line_pattern: expenseTriple(0.3334),
+    })
+    const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+    const tx = makeTransaction({ amount: 100 }) // refund of a three-way expense
+
+    const result = buildMappingResultFromCounterpartyTemplate(match, tx, 'enskild_firma')
+
+    expect(result.direction_mismatch).toBe(true)
+    for (const account of ['6110', '6212', '6991']) {
+      expect(result.vat_lines.find((l) => l.account_number === account)?.credit_amount).toBe(33.34)
+    }
+    // Mirrored business side is credit, so the over-allocation offset lands on debit
+    const rounding = result.vat_lines.find((l) => l.account_number === '3740')
+    expect(rounding?.debit_amount).toBe(0.02)
+    expect(rounding?.credit_amount).toBe(0)
+    const { debits, credits } = entrySums(tx, result)
+    expect(debits).toBe(100.02)
+    expect(credits).toBe(100.02)
+  })
+})
 
 describe('learning-loop repair (issue #865)', () => {
   /** Queue-based mock that records insert payloads per table (see PR7 block). */

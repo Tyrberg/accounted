@@ -14,6 +14,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { getEmailService } from '@/lib/email/service'
 import { createLogger } from '@/lib/logger'
+import { resolveMemberEmail } from '@/lib/notifications/member-email'
+import { escapeHtml } from '@/lib/email/user-text'
 
 const log = createLogger('cloud-backup-alert')
 
@@ -114,29 +116,6 @@ export async function sendBackupFailureAlert(
   }
 }
 
-/**
- * The recipient must still be an active member of the company: a schedule
- * owner who has since been removed must not receive alerts for it.
- */
-async function resolveMemberEmail(
-  supabase: SupabaseClient,
-  companyId: string,
-  userId: string
-): Promise<string | null> {
-  const { data: member } = await supabase
-    .from('company_members')
-    .select('user_id, profiles!inner(email)')
-    .eq('company_id', companyId)
-    .eq('user_id', userId)
-    .maybeSingle()
-  if (!member) return null
-
-  type ProfileRef = { email?: string | null } | { email?: string | null }[] | null
-  const profiles = (member as { profiles: ProfileRef }).profiles
-  const profile = Array.isArray(profiles) ? profiles[0] : profiles
-  return profile?.email ?? null
-}
-
 async function fetchCompanyName(
   supabase: SupabaseClient,
   companyId: string
@@ -149,11 +128,3 @@ async function fetchCompanyName(
   return (data?.company_name as string) || 'ditt företag'
 }
 
-function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}

@@ -16,7 +16,8 @@ import { ok, noContent } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
 import { registerEndpoint, dataEnvelope, NoBodyResponse } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
-import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import { v1ErrorResponse, v1ErrorResponseFromCode, v1ValidationError } from '@/lib/api/v1/errors'
+import { readV1JsonBody } from '@/lib/api/v1/body'
 
 // Inline; the project's shared isoDate is not exported from lib/api/schemas.
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD date format')
@@ -149,6 +150,8 @@ registerEndpoint({
   pitfalls: [
     'Returns 400 SALARY_RUN_PATCH_NOT_DRAFT if status !== "draft".',
     'period_year + period_month are immutable post-create.',
+    'payment_date may fall outside the run\'s period month (lön i efterskott): the AGI redovisningsperiod follows the payment month (kontantprincipen), so a run for August paid on 25 September is declared for September.',
+    'Supplying payment_date clears every roster row\'s calculation_breakdown, so an already-calculated run must be recalculated before :approve/:book.',
   ],
   example: {
     request: { payment_date: '2026-05-23' },
@@ -175,15 +178,9 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
       })
     }
 
-    let rawBody: unknown
-    try {
-      rawBody = await request.json()
-    } catch {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: { field: 'body', message: 'Body is not valid JSON.' },
-      })
-    }
+    const rawBodyResult = await readV1JsonBody(request, ctx)
+    if (!rawBodyResult.ok) return rawBodyResult.response
+    const rawBody = rawBodyResult.body
 
     // OWASP V4.5: require a plain JSON object. Zod would catch a non-object
     // body downstream, but the rawKeys filter below uses Object.keys on
@@ -197,17 +194,7 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
     }
 
     const parsed = UpdateSalaryRunSchema.safeParse(rawBody)
-    if (!parsed.success) {
-      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
-        requestId: ctx.requestId,
-        details: {
-          issues: parsed.error.issues.map((i) => ({
-            field: i.path.join('.'),
-            message: i.message,
-          })),
-        },
-      })
-    }
+    if (!parsed.success) return v1ValidationError(ctx, parsed.error)
     const body = parsed.data
 
     const { data: existing, error: fetchErr } = await ctx.supabase
@@ -248,6 +235,11 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
       return ok(existing, { requestId: ctx.requestId })
     }
 
+    // The payment date may leave the run's period month: the AGI
+    // redovisningsperiod follows payment_date (kontantprincipen, #2191), so
+    // the verifikat and the declaration always share a month. Same rule as
+    // lib/salary/update-run.ts and the dashboard PATCH.
+
     if (ctx.dryRun) {
       const merged = { ...(existing as object), ...updates }
       return dryRunPreview(merged, { requestId: ctx.requestId, log: ctx.log })
@@ -274,6 +266,24 @@ export const PATCH = withApiV1<{ params: Promise<{ companyId: string; id: string
         requestId: ctx.requestId,
         details: { reason: 'race' },
       })
+    }
+
+    // A supplied payment_date invalidates any existing calculation:
+    // skatteavdrag follows the payment date, so clearing calculation_breakdown
+    // makes both book preflights refuse the roster until a recalculation has
+    // run against the new date (same invariant as setRunEmployeeSalary in
+    // lib/salary/run-employees.ts and lib/salary/update-run.ts). Gated on
+    // SUPPLIED, not on changed, so a retry after a partial failure re-clears
+    // instead of comparing against the already-updated date and skipping.
+    if (updates.payment_date !== undefined) {
+      const { error: clearError } = await ctx.supabase
+        .from('salary_run_employees')
+        .update({ calculation_breakdown: null })
+        .eq('salary_run_id', idParse.data)
+        .eq('company_id', ctx.companyId!)
+      if (clearError) {
+        return v1ErrorResponse(clearError, ctx.log, { requestId: ctx.requestId })
+      }
     }
 
     return ok(data, { requestId: ctx.requestId })

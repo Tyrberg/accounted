@@ -1,4 +1,7 @@
 import { decryptPersonnummer } from '../personnummer'
+import { isOrgNumberShaped } from '@/lib/invariants/org-number'
+import { truncateToWholeKronor } from '@/lib/money'
+import { escapeXml } from '@/lib/xml/escape'
 
 /**
  * AGI XML generator: Arbetsgivardeklaration på individnivå.
@@ -197,11 +200,14 @@ export class AGIIncompleteDataError extends Error {
 
 function assertRequiredCompanyData(company: AGICompanyData): void {
   const missing: string[] = []
-  const orgNumberDigits = (company.orgNumber || '').replace(/\D/g, '')
   // Skatteverket's IDENTITET type requires either 10 digits (AB orgnr, we prefix
-  // with "16") or 12 digits (personnummer for enskild firma). Any other length
-  // is a data-entry error that we cannot silently fix.
-  if (orgNumberDigits.length !== 10 && orgNumberDigits.length !== 12) missing.push('organisationsnummer')
+  // with "16") or 12 digits (personnummer for enskild firma). Any other shape is
+  // a data-entry error that we cannot silently fix.
+  //
+  // Shared rule (lib/invariants/org-number.ts), not a local digit-strip: the
+  // previous `replace(/\D/g, '')` also swallowed letters, so a field holding
+  // stray text still measured 10 digits and passed.
+  if (!isOrgNumberShaped(company.orgNumber)) missing.push('organisationsnummer')
   if (!company.contactName.trim()) missing.push('kontaktperson (namn)')
   if (!company.contactPhone.trim()) missing.push('telefon')
   if (!company.contactEmail.trim()) missing.push('e-post')
@@ -573,10 +579,6 @@ export function generateAGIXml(
     //   - VAB and parental leave are reported via the top-level
     //     <Franvarouppgift> section (FK820-827) as per-event date records,
     //     not as per-IU day counts. Not implemented in this generator yet.
-    void emp.sickDays
-    void emp.vabDays
-    void emp.parentalDays
-
     lines.push('      </gem:IU>')
     lines.push('    </gem:Blankettinnehall>')
     lines.push('  </gem:Blankett>')
@@ -679,17 +681,12 @@ export function buildIndividuppgifterSnapshot(
 // Helpers
 // ============================================================
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;')
-}
-
+// AGI amounts are stated in whole kronor with the öre dropped (öretal
+// bortfaller, SFF 2011:1261 22 kap. 1 §): truncation, never rounding.
+// Math.round here would declare 16 074 kr for an underlag-computed
+// 16 073,84 kr while Skatteverket draws 16 073 kr from the skattekonto.
 function formatAmount(amount: number): string {
-  return Math.round(amount).toString()
+  return truncateToWholeKronor(amount).toString()
 }
 
 /**

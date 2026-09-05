@@ -2,12 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useLocale, useTranslations } from 'next-intl'
+import { useDimensions } from '@/lib/reference-data/hooks'
+import { invalidateReferenceData } from '@/lib/reference-data/invalidate'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { SegmentedControl } from '@/components/ui/segmented-control'
+import { ToolbarSearch } from '@/components/ui/toolbar-search'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { DestructiveConfirmDialog } from '@/components/ui/destructive-confirm-dialog'
 import { TH_CLASS, TD_CLASS, QUIET_LINK_CLASS } from '@/components/ui/dry-table'
 import {
   Dialog,
@@ -42,7 +47,6 @@ import DimensionValueForm, {
   type DimensionValueFormInput,
 } from '@/components/dimensions/DimensionValueForm'
 import {
-  fetchDimensions,
   PROJECT_DIM_NO,
   type DimensionDto,
   type DimensionValueDto,
@@ -74,49 +78,42 @@ export default function DimensionsManager() {
   const { toast } = useToast()
   const { canWrite } = useCanWrite()
 
-  const [dimensions, setDimensions] = useState<DimensionDto[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [loadFailed, setLoadFailed] = useState(false)
-  const [activeDimId, setActiveDimId] = useState<string | null>(null)
+  // The register renders the same session-cached registry the pickers use
+  // (lib/reference-data); every write below invalidates it.
+  const { dimensions: registry, isLoading, error: loadError, refresh: refreshDimensions } = useDimensions()
+  const dimensions = useMemo(
+    () => [...registry].sort((a, b) => a.sort_order - b.sort_order || a.sie_dim_no - b.sie_dim_no),
+    [registry],
+  )
+  const loadFailed = !!loadError
+  // The requested tab, validated against the current registry: a dimension
+  // that disappears falls back to the first one.
+  const [requestedDimId, setActiveDimId] = useState<string | null>(null)
+  const activeDimId =
+    requestedDimId && dimensions.some((d) => d.id === requestedDimId)
+      ? requestedDimId
+      : (dimensions[0]?.id ?? null)
   const [searchTerm, setSearchTerm] = useState('')
   const [sortColumn, setSortColumn] = useState<SortColumn>('code')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [dialog, setDialog] = useState<DialogState>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [newDimDialogOpen, setNewDimDialogOpen] = useState(false)
+  const [confirmDeleteDimOpen, setConfirmDeleteDimOpen] = useState(false)
+  const [isDeletingDim, setIsDeletingDim] = useState(false)
   const [isCreatingDimension, setIsCreatingDimension] = useState(false)
 
-  const loadDimensions = useCallback(
-    async (showSpinner: boolean) => {
-      if (showSpinner) setIsLoading(true)
-      try {
-        const dims = await fetchDimensions()
-        const sorted = [...dims].sort(
-          (a, b) => a.sort_order - b.sort_order || a.sie_dim_no - b.sie_dim_no,
-        )
-        setDimensions(sorted)
-        setLoadFailed(false)
-        setActiveDimId((prev) =>
-          prev && sorted.some((d) => d.id === prev) ? prev : (sorted[0]?.id ?? null),
-        )
-      } catch (err) {
-        setLoadFailed(true)
-        toast({
-          title: t('load_failed_title'),
-          description: getErrorMessage(err, { locale: errorLocale }),
-          variant: 'destructive',
-        })
-      } finally {
-        setIsLoading(false)
-      }
-    },
-    [toast, t, errorLocale],
-  )
-
   useEffect(() => {
-    void loadDimensions(true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    if (!loadError) return
+    toast({
+      title: t('load_failed_title'),
+      description: getErrorMessage(loadError, { locale: errorLocale }),
+      variant: 'destructive',
+    })
+  }, [loadError, toast, t, errorLocale])
+
+  /** After a write: refresh the shared registry (this list and every picker). */
+  const loadDimensions = useCallback(() => invalidateReferenceData('ref:dimensions'), [])
 
   const activeDim = useMemo(
     () => dimensions.find((d) => d.id === activeDimId) ?? null,
@@ -225,7 +222,7 @@ export default function DimensionsManager() {
         })
       }
       setDialog(null)
-      await loadDimensions(false)
+      await loadDimensions()
     } catch (err) {
       toast({
         title: t('save_failed_title'),
@@ -260,7 +257,7 @@ export default function DimensionsManager() {
       const createdId = (json?.data?.dimension as { id?: string } | undefined)?.id
       toast({ title: t('dim_created_title') })
       setNewDimDialogOpen(false)
-      await loadDimensions(false)
+      await loadDimensions()
       if (createdId) {
         setActiveDimId(createdId)
         setSearchTerm('')
@@ -273,6 +270,34 @@ export default function DimensionsManager() {
       })
     } finally {
       setIsCreatingDimension(false)
+    }
+  }
+
+  // Remove a custom dimension nobody has booked on (issue #2219). The DB
+  // registry guard refuses the delete with a Swedish P0001 when any posted
+  // line carries the number; the route passes that message through, so the
+  // toast says exactly which dimension and why.
+  async function handleDeleteDimension() {
+    if (!activeDim || activeDim.is_system) return
+    setIsDeletingDim(true)
+    try {
+      const res = await fetch(`/api/dimensions/${activeDim.id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const json = await res.json().catch(() => null)
+        toast({
+          title: t('delete_failed_title'),
+          description: getErrorMessage(json, { locale: errorLocale }),
+          variant: 'destructive',
+        })
+        return
+      }
+      toast({ title: t('dimension_deleted_title') })
+      setConfirmDeleteDimOpen(false)
+      setActiveDimId(null)
+      setSearchTerm('')
+      await loadDimensions()
+    } finally {
+      setIsDeletingDim(false)
     }
   }
 
@@ -298,7 +323,7 @@ export default function DimensionsManager() {
       }
       toast({ title: t('deleted_title') })
       setDialog(null)
-      await loadDimensions(false)
+      await loadDimensions()
     } finally {
       setIsSaving(false)
     }
@@ -357,7 +382,7 @@ export default function DimensionsManager() {
         title={t('load_failed_title')}
         description={t('load_failed_description')}
         actionLabel={t('retry')}
-        onAction={() => void loadDimensions(true)}
+        onAction={() => void refreshDimensions()}
       />
     )
   }
@@ -368,40 +393,32 @@ export default function DimensionsManager() {
           muted value count, search, and the actions far right. */}
       <div className="space-y-2">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-[3px]" role="tablist">
-            {dimensions.map((dim) => (
-              <button
-                key={dim.id}
-                type="button"
-                role="tab"
-                aria-selected={activeDimId === dim.id}
-                onClick={() => {
-                  setActiveDimId(dim.id)
-                  setSearchTerm('')
-                }}
-                className={cn(
-                  'inline-flex items-center gap-1.5 rounded-md px-3.5 py-[5px] text-[12.5px] transition-colors duration-150',
-                  activeDimId === dim.id
-                    ? 'border border-border bg-card font-medium text-foreground'
-                    : 'text-muted-foreground hover:text-foreground',
-                )}
-              >
-                {dim.name}
-                {dim.values.length > 0 && (
-                  <span className="text-muted-foreground tabular-nums">{dim.values.length}</span>
-                )}
-              </button>
-            ))}
-          </div>
-          <div className="relative min-w-[180px] max-w-xs flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              placeholder={t('search_placeholder')}
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="h-9 pl-10"
-            />
-          </div>
+          <SegmentedControl
+            value={activeDimId ?? ''}
+            onChange={(id) => {
+              setActiveDimId(id)
+              setSearchTerm('')
+            }}
+            options={dimensions.map((dim) => ({
+              value: dim.id,
+              label: (
+                // data-ph-mask: dimension names are user data; the wrapper
+                // keeps the segment button's inline gap between name and count.
+                <span data-ph-mask="" className="inline-flex items-center gap-1.5">
+                  {dim.name}
+                  {dim.values.length > 0 && (
+                    <span className="text-muted-foreground tabular-nums">{dim.values.length}</span>
+                  )}
+                </span>
+              ),
+            }))}
+          />
+          <ToolbarSearch
+            placeholder={t('search_placeholder')}
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            containerClassName="min-w-[180px] max-w-xs flex-1"
+          />
           <div className="ml-auto flex items-center gap-4">
             <button
               type="button"
@@ -412,6 +429,17 @@ export default function DimensionsManager() {
             >
               {t('new_dimension')}
             </button>
+            {activeDim && !activeDim.is_system && (
+              <button
+                type="button"
+                className={cn(QUIET_LINK_CLASS, 'disabled:pointer-events-none disabled:opacity-50')}
+                disabled={!canWrite || isDeletingDim}
+                title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+                onClick={() => setConfirmDeleteDimOpen(true)}
+              >
+                {t('delete_dimension')}
+              </button>
+            )}
             <Button
               disabled={!canWrite}
               title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
@@ -435,13 +463,15 @@ export default function DimensionsManager() {
           <EmptyState
             icon={Search}
             title={t('no_search_results_title')}
-            description={t('no_search_results_description', { term: searchTerm })}
+            /* data-ph-mask: the search term is user data */
+            description={<span data-ph-mask="">{t('no_search_results_description', { term: searchTerm })}</span>}
           />
         ) : (
           <EmptyState
             icon={Tags}
             title={t('empty_title')}
-            description={t('empty_description', { dimension: activeDim?.name ?? '' })}
+            /* data-ph-mask: the dimension name is user data */
+            description={<span data-ph-mask="">{t('empty_description', { dimension: activeDim?.name ?? '' })}</span>}
             actionLabel={canWrite ? t('new_value') : undefined}
             onAction={canWrite ? () => setDialog({ mode: 'create' }) : undefined}
           />
@@ -505,7 +535,8 @@ export default function DimensionsManager() {
       <Dialog open={dialog !== null} onOpenChange={(open) => !open && setDialog(null)}>
         <DialogContent className="sm:max-w-2xl max-h-[95dvh] sm:max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>
+            {/* data-ph-mask: the dimension name is user data */}
+            <DialogTitle data-ph-mask="">
               {dialog?.mode === 'edit'
                 ? t('edit_value_title')
                 : t('new_value_title', { dimension: activeDim?.name ?? '' })}
@@ -526,6 +557,18 @@ export default function DimensionsManager() {
 
       {/* New dimension dialog — the content (and thus the form state)
           unmounts on close, so each open starts from a blank form. */}
+      {activeDim && !activeDim.is_system && (
+        <DestructiveConfirmDialog
+          open={confirmDeleteDimOpen}
+          onOpenChange={setConfirmDeleteDimOpen}
+          title={t('delete_dimension_confirm_title')}
+          description={t('delete_dimension_confirm_description', { name: activeDim.name })}
+          confirmLabel={t('delete_confirm_label')}
+          cancelLabel={t('delete_cancel_label')}
+          onConfirm={handleDeleteDimension}
+        />
+      )}
+
       <Dialog
         open={newDimDialogOpen}
         onOpenChange={(open) => !open && setNewDimDialogOpen(false)}

@@ -1,28 +1,29 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { useDocumentExtraction } from '@/lib/hooks/use-document-extraction'
 import ExtractionStatus from '@/components/ui/extraction-status'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { TD_CLASS, RowFoldout } from '@/components/ui/dry-table'
+import { TD_CLASS, CHECKBOX_REVEAL_CLASS, RowFoldout } from '@/components/ui/dry-table'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { isImportedTransaction } from '@/lib/transactions/origin'
 import {
   AlertCircle,
+  ArrowRightLeft,
   ChevronRight,
   EyeOff,
   FileSearch,
   Link2,
   Loader2,
-  MessageCircle,
   MoreHorizontal,
   Paperclip,
   Pencil,
   Split,
   Trash2,
+  Unlink,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -39,14 +40,19 @@ import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-exten
 const HAS_AI_EXTRACTION = ENABLED_EXTENSION_IDS.has('document-extraction')
 import { TransactionAttachmentIndicator } from './TransactionAttachmentIndicator'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
-import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
+import { canDetachDocument } from './detach-underlag'
 import type { TransactionWithInvoice, CategorizeHandler } from './transaction-types'
+import type { CashAccount } from '@/types'
 
 interface TransactionInboxCardProps {
   transaction: TransactionWithInvoice
   /** When set, this bank tx looks like the bank side of a 1930↔1630
    *  transfer that the user will later see on /skattekonto. */
   skvCounterpartDate?: string
+  /** The row was just booked/ignored/deleted and is animating out during the
+   *  page's 350ms removal window: .row-exit fades and collapses it, and
+   *  pointer events are off. Instant removal under prefers-reduced-motion. */
+  isExiting?: boolean
   processingId: string | null
   isSelected: boolean
   /** Row expansion (concept foldout): controlled by the page so only one
@@ -69,13 +75,27 @@ interface TransactionInboxCardProps {
   /** Open the attach-underlag dialog: pin an inbox document or a fresh upload
    *  to the transaction (the tx→doc mirror of the Documents view's matcher). */
   onOpenAttachDocument?: (transaction: TransactionWithInvoice) => void
+  /** Detach the pinned underlag (DELETE attach-document). Unbooked rows only:
+   *  once the doc has propagated onto a verifikation the route answers 409. */
+  onDetachDocument?: (transaction: TransactionWithInvoice) => void
   onOpenCategoryDialog: (transaction: TransactionWithInvoice) => void
   onDelete?: (id: string) => void
   /** Mark the transaction as ignored so it leaves the inbox without a journal entry. */
   onIgnore?: (transaction: TransactionWithInvoice) => void
   /** Open the edit-title dialog. Only wired for editable (unbooked/unmatched) rows. */
   onEditTitle?: (transaction: TransactionWithInvoice) => void
-  onToggleSelect: (id: string) => void
+  /** Open the move-to-another-cash-account dialog. Only shown when the company
+   *  has more than one enabled cash account (see `cashAccounts`). */
+  onMoveCashAccount?: (transaction: TransactionWithInvoice) => void
+  /** The company's enabled cash accounts (the page's ?enabled_only=true fetch):
+   *  gates the move action, which is pointless with a single account. */
+  cashAccounts?: CashAccount[]
+  onToggleSelect: (id: string, extend?: boolean) => void
+  /** End date of the company's completed SIE-import coverage. Rows on or
+   *  before it are pre-migration history: they most likely correspond to an
+   *  already-imported verifikat, so the row carries a quiet marker steering
+   *  toward matching rather than re-booking. */
+  preMigrationCutoff?: string | null
 }
 
 /**
@@ -87,6 +107,7 @@ interface TransactionInboxCardProps {
 export default function TransactionInboxCard({
   transaction,
   skvCounterpartDate,
+  isExiting = false,
   processingId,
   isSelected,
   isExpanded,
@@ -96,21 +117,26 @@ export default function TransactionInboxCard({
   onOpenSplitMatch,
   onOpenMatchVoucher,
   onOpenAttachDocument,
+  onDetachDocument,
   onOpenCategoryDialog,
   onDelete,
   onIgnore,
   onEditTitle,
+  onMoveCashAccount,
+  cashAccounts,
   onToggleSelect,
+  preMigrationCutoff = null,
 }: TransactionInboxCardProps) {
   const t = useTranslations('tx_inbox_card')
+  const tDetach = useTranslations('tx_detach')
+  const tMethod = useTranslations('tx_method')
+  // Radix' onCheckedChange carries no mouse event, so the shift state is
+  // captured from the click that precedes it (Radix composes our onClick
+  // before its own handler) and read back when the toggle fires.
+  const shiftHeld = useRef(false)
   // Attaching underlag is a write: hide the affordance from viewers so they
   // don't dead-end on a 403 (mirrors the gate in TransactionHistoryList).
   const { canWrite } = useCanWrite()
-  // The transaction-side entry point to the assistant ("Lena"). openAgentSheet
-  // hands this specific bank line to the transaction.categorization intent:
-  // the mirror of "Fråga assistenten" in Dokumentinkorgen, so the user can
-  // start a booking with the agent from the inbox they actually live in.
-  const { openAgentSheet, identity } = useAgentSheet()
   const isProcessing = processingId === transaction.id
   const isDisabled = processingId !== null && processingId !== transaction.id
   const isIncome = transaction.amount > 0
@@ -127,8 +153,19 @@ export default function TransactionInboxCard({
       if (!detail || detail.transaction_id !== transaction.id || !detail.document_id) return
       setOptimisticDocumentId(detail.document_id)
     }
+    // Detach (page handler) drops the override too, or the indicator would
+    // keep showing a doc the row no longer carries.
+    function onUnlinked(e: Event) {
+      const detail = (e as CustomEvent<{ transaction_id?: string }>).detail
+      if (!detail || detail.transaction_id !== transaction.id) return
+      setOptimisticDocumentId(null)
+    }
     window.addEventListener('Accounted:transaction-document-linked', onLinked)
-    return () => window.removeEventListener('Accounted:transaction-document-linked', onLinked)
+    window.addEventListener('Accounted:transaction-document-unlinked', onUnlinked)
+    return () => {
+      window.removeEventListener('Accounted:transaction-document-linked', onLinked)
+      window.removeEventListener('Accounted:transaction-document-unlinked', onUnlinked)
+    }
   }, [transaction.id])
   const attachedDocumentId =
     optimisticDocumentId ?? (transaction as { document_id?: string | null }).document_id ?? null
@@ -144,17 +181,14 @@ export default function TransactionInboxCard({
   const hasInvoiceMatch = !!transaction.potential_invoice && !transaction.invoice_id
   const hasSupplierInvoiceMatch =
     !!transaction.potential_supplier_invoice && !transaction.supplier_invoice_id
+  // Skatteverkets ROT/RUT-utbetalning for an open begäran: same 1-click
+  // shortcut as an invoice match, confirmed in its own dialog.
+  const hasRotRutPayoutMatch = !!transaction.potential_rot_rut_payout && !transaction.journal_entry_id
   const isUncategorized = transaction.is_business === null && !transaction.journal_entry_id
   const selectable = isUncategorized && canWrite
   // Unbooked rows are still actionable (match, split, edit, categorize): that
   // includes imported bank rows, which are the whole point of the inbox.
   const isUnbooked = !transaction.journal_entry_id
-  // "Fråga [namn]" hands the row to the assistant for categorization/booking.
-  // Only on unbooked rows (nothing to categorize once it's a verifikat) and
-  // only after the user has built their agent in /onboarding/agent
-  // (identity.isVerified): same gate as the FAB / AgentSparkleButton.
-  const assistantName = identity.displayName?.trim() || 'min assistent'
-  const showAskAssistant = isUnbooked && identity.isVerified
   // ...but only rows the USER created in the app may be deleted. Imported rows
   // (bank sync / CSV) are ignore-only: mirrors the server guard in
   // DELETE /api/transactions/[id]. See lib/transactions/origin.ts.
@@ -171,7 +205,9 @@ export default function TransactionInboxCard({
       ? t('match_supplier_invoice_btn', {
           number: transaction.potential_supplier_invoice!.supplier_invoice_number ?? '',
         })
-      : null
+      : hasRotRutPayoutMatch
+        ? t('match_rot_rut_payout_btn', { name: transaction.potential_rot_rut_payout!.name })
+        : null
 
   // Primary action: invoice/supplier-invoice match keeps the 1-click
   // shortcut; otherwise the user opens the template picker. Rendered as the
@@ -185,7 +221,7 @@ export default function TransactionInboxCard({
   // Manual invoice-match affordance. Hidden once an auto-detected match is
   // already shown as the primary button: having both makes the row noisy.
   const showInvoiceMatchButton =
-    isUnbooked && !hasInvoiceMatch && !hasSupplierInvoiceMatch
+    isUnbooked && !hasInvoiceMatch && !hasSupplierInvoiceMatch && !hasRotRutPayoutMatch
 
   const invoiceMatchLabel = isIncome
     ? 'Matcha mot kundfaktura'
@@ -205,31 +241,49 @@ export default function TransactionInboxCard({
   // "Matcha mot underlag": pin an inbox doc / fresh upload to the tx. The
   // tx→doc mirror of the Documents view's "Matcha mot transaktion".
   const showAttachDocumentItem = isUnbooked && canWrite && !!onOpenAttachDocument
+  // Same gate as attach, plus an actual pin to remove.
+  const showDetachDocumentItem =
+    showAttachDocumentItem &&
+    canDetachDocument({
+      isBooked: !isUnbooked,
+      canWrite,
+      documentId: attachedDocumentId,
+      hasHandler: !!onDetachDocument,
+    })
   const showSplitItem = showInvoiceMatchButton && !!onOpenSplitMatch
   const showEditItem = isTitleEditable && !!onEditTitle
+  // Moving between cash accounts only makes sense with somewhere to move TO,
+  // and only for rows the server would accept: same movable gate as the title
+  // (not booked, not confirmed-matched: mirrors PATCH .../cash-account).
+  const showMoveAccountItem =
+    isTitleEditable && canWrite && (cashAccounts?.length ?? 0) > 1 && !!onMoveCashAccount
   const showIgnoreItem = isUnbooked && isImportedTransaction(transaction) && !!onIgnore
   const showDeleteItem = canDelete && !!onDelete
   const showOverflowMenu =
-    showInvoiceMatchButton || showAskAssistant || showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showIgnoreItem || showDeleteItem
+    showInvoiceMatchButton || showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showMoveAccountItem || showIgnoreItem || showDeleteItem
 
-  const askAssistant = () =>
-    openAgentSheet({
-      intentId: 'transaction.categorization',
-      intentArgs: { transaction_id: transaction.id },
-      contextRef: `transaction:${transaction.id}`,
-    })
+  // Pre-migration history row (ISO dates compare lexically): most likely
+  // corresponds to an already-imported verifikat, so it carries a quiet
+  // marker steering toward matching rather than re-booking.
+  const isPreMigration = !!preMigrationCutoff && transaction.date <= preMigrationCutoff
 
   // The foldout carries row detail only (actions live on the row: pill + ⋯).
-  // Rows with nothing to show don't expand at all; once bank-tx metadata
-  // classification lands (see the transactions-metadata issue) every imported
-  // row will have foldout content again.
+  // Rows with nothing to show don't expand at all; classified imported rows
+  // always have at least the payment-method line.
   const hasFoldoutContent =
+    Boolean(transaction.transaction_method) ||
     (transaction.currency !== 'SEK' && transaction.amount_sek != null) ||
-    Boolean(transaction.title_edited_at && originalName) ||
+    // No originalName requirement: below md the inline "redigerad" marker is
+    // hidden, so the foldout is the only place the edited state survives; it
+    // must open even when the original bank name is missing.
+    Boolean(transaction.title_edited_at) ||
     Boolean(skvCounterpartDate) ||
+    isPreMigration ||
     (HAS_AI_EXTRACTION && (extraction.status === 'running' || extraction.status === 'failed'))
   const canExpand = hasFoldoutContent
-  const expanded = isExpanded && canExpand
+  // An exiting row's foldout closes with it: the foldout <tr> has no exit
+  // styling of its own and would otherwise linger un-animated.
+  const expanded = isExpanded && canExpand && !isExiting
 
   return (
     <>
@@ -241,7 +295,12 @@ export default function TransactionInboxCard({
           expanded ? 'bg-secondary/25' : 'hover:bg-secondary/35',
           isSelected && 'bg-secondary/40',
           isDisabled && 'opacity-50',
+          isExiting && 'row-exit',
         )}
+        // .row-exit only blocks pointer input; `inert` also drops keyboard
+        // focus and activation (row expand, Bokför, the ⋯ menu) during the
+        // 350ms removal window.
+        inert={isExiting || undefined}
         role={canExpand ? 'button' : undefined}
         tabIndex={canExpand ? 0 : undefined}
         aria-expanded={canExpand ? expanded : undefined}
@@ -249,6 +308,10 @@ export default function TransactionInboxCard({
         onKeyDown={
           canExpand
             ? (e) => {
+                // Only when the row itself is focused: Enter/Space on a nested
+                // control (Bokför, ⋯, checkbox) bubbles here, and preventDefault
+                // would cancel the button's keyboard activation.
+                if (e.target !== e.currentTarget) return
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault()
                   onToggleExpand(transaction.id)
@@ -257,23 +320,24 @@ export default function TransactionInboxCard({
             : undefined
         }
       >
-        {/* Hover-revealed selection checkbox (concept .cb) */}
+        {/* Always-visible selection checkbox (concept .cb) */}
         {/* Zero-width cell: the checkbox hangs in the left page margin so
             the date column can sit flush with the page edge. */}
         <td
-          className={cn(TD_CLASS, 'relative w-0 !p-0')}
+          className={cn(TD_CLASS, 'relative w-0 !p-0 select-none')}
           onClick={(e) => e.stopPropagation()}
         >
           {selectable && (
             <Checkbox
               checked={isSelected}
-              onCheckedChange={() => onToggleSelect(transaction.id)}
+              onClick={(e) => {
+                shiftHeld.current = e.shiftKey
+              }}
+              onCheckedChange={() => onToggleSelect(transaction.id, shiftHeld.current)}
               aria-label="Välj transaktion"
               className={cn(
-                'absolute -left-5 top-1/2 -translate-y-1/2 transition-opacity duration-150 md:-left-6',
-                isSelected
-                  ? 'opacity-100'
-                  : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+                'absolute -left-5 top-1/2 -translate-y-1/2 border-foreground duration-150 md:-left-6',
+                isSelected ? 'opacity-100' : CHECKBOX_REVEAL_CLASS,
               )}
             />
           )}
@@ -281,23 +345,37 @@ export default function TransactionInboxCard({
         <td className={cn(TD_CLASS, '!pl-0 whitespace-nowrap tabular-nums text-muted-foreground')}>
           {formatDate(transaction.date)}
         </td>
-        <td className={cn(TD_CLASS, 'max-w-0 w-full')}>
-          <span className="flex min-w-0 items-center gap-2">
+        {/* overflow-hidden: the shrink-0 markers below don't truncate, so on
+            a viewport too narrow for them the cell must clip instead of
+            painting over the Belopp column. */}
+        <td className={cn(TD_CLASS, 'max-w-0 w-full overflow-hidden')}>
+          <span className="row-collapsible flex min-w-0 items-center gap-2">
             <span className="truncate">{transaction.description}</span>
             <TransactionAttachmentIndicator documentId={attachedDocumentId} />
+            {/* The markers below are desktop-only (hidden md:*): on mobile
+                they overflowed the cell into Belopp; their info stays
+                reachable in the foldout (TransactionHistoryList gates its
+                markers the same way). */}
             {transaction.title_edited_at && (
               <span
-                className="shrink-0 text-xs text-muted-foreground"
+                className="hidden shrink-0 text-xs text-muted-foreground md:inline"
                 title={originalName ? t('original_name_tooltip', { name: originalName }) : undefined}
               >
                 {t('edited_badge')}
               </span>
             )}
             {skvCounterpartDate && (
-              <Badge variant="warning" className="h-4 shrink-0 gap-1 px-1.5 py-0 text-[10px]">
+              <Badge variant="warning" className="hidden h-4 shrink-0 gap-1 px-1.5 py-0 text-[10px] md:inline-flex">
                 <AlertCircle className="h-3 w-3" />
                 Möjlig 1930↔1630
               </Badge>
+            )}
+            {/* Quiet pre-migration marker (muted text, not a chip: it is
+                context, not an exception state). */}
+            {isPreMigration && (
+              <span className="hidden shrink-0 text-xs text-muted-foreground md:inline">
+                {t('pre_migration_marker')}
+              </span>
             )}
           </span>
         </td>
@@ -312,7 +390,7 @@ export default function TransactionInboxCard({
           {formatCurrency(transaction.amount, transaction.currency)}
         </td>
         <td className={cn(TD_CLASS, 'relative whitespace-nowrap text-right !pr-0 py-[9px]')}>
-          <span className="inline-flex items-center justify-end gap-2">
+          <span className="row-collapsible inline-flex items-center justify-end gap-2">
             <Button
               size="sm"
               variant="outline"
@@ -355,17 +433,6 @@ export default function TransactionInboxCard({
                       {invoiceMatchLabel}
                     </DropdownMenuItem>
                   )}
-                  {showAskAssistant && (
-                    <DropdownMenuItem
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        askAssistant()
-                      }}
-                    >
-                      <MessageCircle className="h-4 w-4" />
-                      {`Fråga ${assistantName}`}
-                    </DropdownMenuItem>
-                  )}
                   {showMatchVoucherItem && (
                     <DropdownMenuItem
                       onClick={(e) => {
@@ -386,6 +453,17 @@ export default function TransactionInboxCard({
                     >
                       <Paperclip className="h-4 w-4" />
                       {t('attach_document_btn')}
+                    </DropdownMenuItem>
+                  )}
+                  {showDetachDocumentItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onDetachDocument!(transaction)
+                      }}
+                    >
+                      <Unlink className="h-4 w-4" />
+                      {tDetach('menu_item')}
                     </DropdownMenuItem>
                   )}
                   {showSplitItem && (
@@ -410,7 +488,18 @@ export default function TransactionInboxCard({
                       {t('edit_title_aria')}
                     </DropdownMenuItem>
                   )}
-                  {(showIgnoreItem || showDeleteItem) && (showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem) && (
+                  {showMoveAccountItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onMoveCashAccount!(transaction)
+                      }}
+                    >
+                      <ArrowRightLeft className="h-4 w-4" />
+                      {t('move_account_btn')}
+                    </DropdownMenuItem>
+                  )}
+                  {(showIgnoreItem || showDeleteItem) && (showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showMoveAccountItem) && (
                     <DropdownMenuSeparator />
                   )}
                   {showIgnoreItem && (
@@ -457,10 +546,19 @@ export default function TransactionInboxCard({
           <td colSpan={5} className="border-b border-border p-0">
             <RowFoldout>
               <div className="pb-6 pt-1">
-                {(transaction.currency !== 'SEK' && transaction.amount_sek != null) ||
+                {transaction.transaction_method ||
+                (transaction.currency !== 'SEK' && transaction.amount_sek != null) ||
                 transaction.title_edited_at ||
-                skvCounterpartDate ? (
+                skvCounterpartDate ||
+                isPreMigration ? (
                   <div className="space-y-1 py-1 text-xs text-muted-foreground">
+                    {transaction.transaction_method && (
+                      <p>
+                        {t('method_line', {
+                          method: tMethod(transaction.transaction_method),
+                        })}
+                      </p>
+                    )}
                     {transaction.currency !== 'SEK' && transaction.amount_sek != null && (
                       <p className="tabular-nums">
                         {formatCurrency(transaction.amount, transaction.currency)}
@@ -468,8 +566,12 @@ export default function TransactionInboxCard({
                         {formatCurrency(transaction.amount_sek)}
                       </p>
                     )}
-                    {transaction.title_edited_at && originalName && (
-                      <p>{t('original_name_tooltip', { name: originalName })}</p>
+                    {transaction.title_edited_at && (
+                      <p>
+                        {originalName
+                          ? t('original_name_tooltip', { name: originalName })
+                          : t('edited_no_original')}
+                      </p>
                     )}
                     {skvCounterpartDate && (
                       <p>
@@ -477,6 +579,7 @@ export default function TransactionInboxCard({
                         {t('skv_counterpart_body', { date: skvCounterpartDate })}
                       </p>
                     )}
+                    {isPreMigration && <p>{t('pre_migration_foldout')}</p>}
                   </div>
                 ) : null}
 

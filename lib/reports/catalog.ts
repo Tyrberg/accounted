@@ -67,6 +67,13 @@ export interface ReportDescriptor {
    * lib/reports/__tests__/dimension-statutory-guard.test.ts.
    */
   dimensions?: boolean
+  /**
+   * Extra words the library search should match, beyond the translated name
+   * and description. For the vocabulary a user brings from another product or
+   * from the task they are doing ("verifikat per konto", "kontoanalys"), which
+   * is often not the word we chose for the report.
+   */
+  searchTerms?: string
   /** Only shown when company_settings.dimensions_enabled is true. */
   needsDimensions?: boolean
   /**
@@ -76,15 +83,6 @@ export interface ReportDescriptor {
    */
   standalone?: boolean
 }
-
-/** Categories shown in the legacy desktop rail, in order. */
-export const NAV_CATEGORIES: ReportCategory[] = [
-  'interim',
-  'year_end',
-  'tax_vat',
-  'ledgers',
-  'reconciliation',
-]
 
 /** All categories shown on the library landing, in order. */
 export const LIBRARY_CATEGORIES: ReportCategory[] = [
@@ -249,6 +247,11 @@ export const REPORT_CATALOG: ReportDescriptor[] = [
     params: 'fiscal-range',
     exports: ['xlsx'],
     dimensions: true,
+    // This is the "show me the verifikat behind account 1930" report, which
+    // is what people search for when reconciling before årsredovisningen.
+    // Fortnox calls it Kontoanalys, Björn Lundén Kontokontroll.
+    searchTerms:
+      'verifikat verifikationer per konto kontoanalys kontokort kontohistorik stäm av stämma avstämning ledger account statement vouchers',
   },
   {
     slug: 'grundbok',
@@ -286,7 +289,17 @@ export const REPORT_CATALOG: ReportDescriptor[] = [
     // which left the view to host its OWN fiscal-year selector inside a
     // loading-gated action bar: a render deadlock that hung the page on a
     // permanent skeleton (#771).
-    params: 'fiscal',
+    //
+    // 'fiscal-range' since 2026-08-20: the view used to host its own "Datum
+    // från / Datum till" inputs plus a Filtrera button, a second period control
+    // competing with the header's räkenskapsår picker (convention 8). It now
+    // uses the shared ReportDateRange like every other report, mounted with a
+    // full-year default and its own preset memory (see FocusedReport).
+    params: 'fiscal-range',
+    // 2026-08-25: the bank view was absorbed by /reconciliation (matcher,
+    // manual N:1 matching, residual booking, IB tag, move-to-account all live
+    // there). The slug stays for old links and the report library; it redirects.
+    route: '/reconciliation',
   },
 
   // --- Export & arkiv: library-only ---
@@ -298,6 +311,36 @@ export const REPORT_CATALOG: ReportDescriptor[] = [
     params: 'fiscal',
     route: '/import?view=export#sie-export',
     libraryOnly: true,
+  },
+  {
+    // Behandlingshistorik (BFL 5 kap. 11 §, BFNAR 2013:2 p. 9.16): the
+    // per-räkenskapsår processing history revisorer ask for at bokslut. Lives
+    // with export & arkiv like Visma's Bokföring > Rapporter placement; the
+    // date sub-range narrows to "what happened between these dates".
+    slug: 'behandlingshistorik',
+    labelKey: 'name_behandlingshistorik',
+    descKey: 'desc_behandlingshistorik',
+    category: 'export',
+    params: 'fiscal-range',
+    exports: ['pdf', 'xlsx'],
+    libraryOnly: true,
+    searchTerms:
+      'behandlingshistorik audit trail audit log händelselogg ändringslogg logg historik vem gjorde vad processing history revision systemdokumentation',
+  },
+  {
+    // Bokslutsbilagor (Reko 140/760/765): the pärm per räkenskapsår, one
+    // bilaga per balance account as of the balansdag with balances, the
+    // specification or stated balance, the sign-off and the underlag files.
+    // Whole period only: a bilaga is per balansdag, not per date range.
+    slug: 'bokslutsbilagor',
+    labelKey: 'name_bokslutsbilagor',
+    descKey: 'desc_bokslutsbilagor',
+    category: 'export',
+    params: 'fiscal',
+    exports: ['pdf'],
+    libraryOnly: true,
+    searchTerms:
+      'bokslutsbilagor bilagor bilaga bokslutspärm pärm avstämning avstämningar underlag signering reko balanskonton specifikation kontoutdrag engagemangsbesked checklista',
   },
 ]
 
@@ -333,23 +376,6 @@ export interface ReportSection {
   items: ReportDescriptor[]
 }
 
-/** Grouped reports for the legacy desktop rail (excludes library-only items). */
-export function getNavSections(
-  entityType?: EntityType,
-  dimensionsEnabled?: boolean,
-): ReportSection[] {
-  return NAV_CATEGORIES.map((category) => ({
-    category,
-    labelKey: CATEGORY_LABEL_KEY[category],
-    items: REPORT_CATALOG.filter(
-      (r) =>
-        r.category === category &&
-        !r.libraryOnly &&
-        isVisible(r, entityType, undefined, dimensionsEnabled),
-    ),
-  })).filter((s) => s.items.length > 0)
-}
-
 /** Grouped reports for the library landing (includes everything visible). */
 export function getLibrarySections(
   entityType?: EntityType,
@@ -363,4 +389,25 @@ export function getLibrarySections(
       (r) => r.category === category && isVisible(r, entityType, hasEmployees, dimensionsEnabled),
     ),
   })).filter((s) => s.items.length > 0)
+}
+
+/**
+ * Token-AND match used by the report library's search box.
+ *
+ * Every whitespace-separated token in the query must appear somewhere in the
+ * haystack, so narrowing words keep narrowing. Case- and diacritic-insensitive
+ * so "stam av" finds "stäm av" and a Swedish keyboard is not required.
+ */
+export function reportMatchesQuery(haystack: string, query: string): boolean {
+  const tokens = fold(query).split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) return true
+  const hay = fold(haystack)
+  return tokens.every((token) => hay.includes(token))
+}
+
+function fold(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
 }

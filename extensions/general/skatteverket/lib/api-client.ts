@@ -1,6 +1,11 @@
 import crypto from 'crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createLogger } from '@/lib/logger'
+import {
+  CONNECTOR_UPSTREAM_AUTH_HEADER,
+  CONNECTOR_UPSTREAM_CONTENT_TYPE_HEADER,
+} from '@/lib/connect/instance/upstreams'
+import { baseUrlToService, parseConnectorCode, skatteverketConnectorMode } from './connector-mode'
 import { refreshAccessToken } from './oauth'
 import { getTokens, storeTokens, deleteTokens } from './token-store'
 import { getSystemAccessToken, invalidateSystemToken } from './system-auth/token-provider'
@@ -14,9 +19,13 @@ import type { SkatteverketTokens } from '../types'
  * 'system' : Accounted's own Client Credentials token (org certificate),
  *            authorized per company via an ombud grant at Skatteverket.
  *            Used by background reads; carries no user session at all.
+ *            NEVER brokered through the connector: the org certificate and
+ *            ombud grants are a hosted-only feature, so system mode always
+ *            takes the direct path and fails with SYSTEM_AUTH_FAILED on a
+ *            credential-less self-host (deliberate, PR6b-2).
  */
 export type SkvAuth =
-  | { mode: 'user'; supabase: SupabaseClient; userId: string }
+  | { mode: 'user'; supabase: SupabaseClient; userId: string; companyId: string }
   | { mode: 'system' }
 
 const log = createLogger('skatteverket-api-client')
@@ -87,6 +96,13 @@ function isDisabled(): boolean {
  * filings will hit Skatteverket's production system.
  */
 export function getSkatteverketEnvironment(): 'test' | 'prod' {
+  // Connector mode: the actual upstream environment is resolved from the
+  // HOSTED broker's env, not this instance's (whose base URLs are usually
+  // unset and default to test). Reporting 'test' here would show a Testmiljö
+  // badge on real filings, so report 'prod', the hosted upstream's
+  // environment once connector keys are sold. (Reporting hosted's actual env
+  // through /api/connector/status is a #2090 follow-up.)
+  if (skatteverketConnectorMode()) return 'prod'
   const baseUrl =
     process.env.SKATTEVERKET_API_BASE_URL ||
     process.env.SKATTEVERKET_AGD_INLAMNING_API_BASE_URL ||
@@ -123,9 +139,10 @@ const refreshInFlight = new Map<string, Promise<string>>()
  */
 async function getValidToken(
   supabase: SupabaseClient,
-  userId: string
+  userId: string,
+  companyId: string
 ): Promise<string> {
-  const tokens = await getTokens(supabase, userId)
+  const tokens = await getTokens(supabase, userId, companyId)
   if (!tokens) {
     throw new SkatteverketAuthError(
       'Inte ansluten till Skatteverket. Anslut med BankID först.',
@@ -138,24 +155,26 @@ async function getValidToken(
     return tokens.access_token
   }
 
-  // Need refresh: coalesce concurrent attempts.
-  const inFlight = refreshInFlight.get(userId)
+  // Need refresh: coalesce concurrent attempts per (user, company) row.
+  const flightKey = `${userId}:${companyId}`
+  const inFlight = refreshInFlight.get(flightKey)
   if (inFlight) return inFlight
 
-  const promise = refreshTokenForUser(supabase, userId)
-    .finally(() => refreshInFlight.delete(userId))
-  refreshInFlight.set(userId, promise)
+  const promise = refreshTokenForUser(supabase, userId, companyId)
+    .finally(() => refreshInFlight.delete(flightKey))
+  refreshInFlight.set(flightKey, promise)
   return promise
 }
 
 async function refreshTokenForUser(
   supabase: SupabaseClient,
   userId: string,
+  companyId: string,
 ): Promise<string> {
   // Re-read after entering the critical section. Another process may have
   // refreshed while we were waiting; if so, the row now has a new
   // refresh_token and a future expiry: just hand it back.
-  const tokens = await getTokens(supabase, userId)
+  const tokens = await getTokens(supabase, userId, companyId)
   if (!tokens) {
     throw new SkatteverketAuthError(
       'Inte ansluten till Skatteverket. Anslut med BankID först.',
@@ -199,7 +218,17 @@ async function refreshTokenForUser(
       (/\b404\b/.test(message) && /id_not_found|refresh token is not found/i.test(message)) ||
       (/\b400\b/.test(message) &&
         (/refresh token status is expired/i.test(message) ||
-          /"error"\s*:\s*"invalid_grant"/i.test(message)))
+          /"error"\s*:\s*"invalid_grant"/i.test(message))) ||
+      // Broker dialects (connector mode): CONNECTOR_SKV_REFRESH_DEAD is the
+      // broker's classification of SKV's own dead-token dialects (the
+      // dominant refresh outcome: per-flow refresh tokens live 65 minutes),
+      // and 404 CONNECTOR_NOT_OWNED means the hosted ledger no longer
+      // vouches for this refresh token (rotated away or revoked). Both are
+      // terminal: only a fresh BankID consent recovers. The broker's generic
+      // 502 (CONNECTOR_SKV_TOKEN_FAILED) deliberately stays a raw error: a
+      // transient SKV outage must not flag the row for reconnect (#1155).
+      /CONNECTOR_SKV_REFRESH_DEAD/.test(message) ||
+      (/\b404\b/.test(message) && /CONNECTOR_NOT_OWNED/.test(message))
     if (deadRefreshToken) {
       throw new SkatteverketAuthError(
         'Sessionen har gått ut. Logga in med BankID igen.',
@@ -212,28 +241,107 @@ async function refreshTokenForUser(
     ...refreshed,
     scope: tokens.scope,
   }
-  await storeTokens(supabase, userId, updatedTokens)
+  await storeTokens(supabase, userId, updatedTokens, companyId)
   return updatedTokens.access_token
 }
 
 /**
- * MuleSoft APIGW contract enforcement, observed verbatim in production:
+ * MuleSoft APIGW scope enforcement, observed verbatim in production:
  *
  *   { "error": "The required scopes are not authorized" }
  *
- * The gateway emits this when OUR APIGW client (SKATTEVERKET_APIGW_CLIENT_ID)
- * has no subscription for the API being called (#973). It is decided before
- * the bearer is ever evaluated, so it says nothing about the user's token.
+ * TWO different misconfigurations produce this one body, and they are fixed
+ * with different knobs:
  *
- * It has to be ruled out explicitly because it contains the substring
- * "required scope", which is how the SKV token-scope rejection used to be
- * detected: that collision classified every gateway 403 as MISSING_SCOPE, and
- * MISSING_SCOPE is in RECONSENT_ERROR_CODES, so a successful reconnect
- * (runPostConnectRefresh -> syncSkattekonto -> 403) instantly re-flagged the
- * token row and the reconnect banner perpetuated itself (#1155).
+ *   1. Our APIGW client (SKATTEVERKET_APIGW_CLIENT_ID) has no subscription for
+ *      the API being called (#973). Fixed in Utvecklarportalen.
+ *   2. The token is missing the scope that API requires, because the SKV
+ *      application was never registered for it, or because we never asked for
+ *      it. AGI needs `agd` for inlamning AND `agdredovisningperiod` for
+ *      hanteraredovisningsperiod; a token holding only the first files and
+ *      signs perfectly, then dies on the kvittens read. `ska` behaved the same
+ *      way for skattekonto (#431). Fixed by registering/requesting the scope
+ *      and reconnecting.
+ *
+ * The gateway will not tell us which, so neither can we: the message names
+ * both, and callers still classify it as ACCESS_DENIED. That verdict is about
+ * blast radius, not about cause. ACCESS_DENIED is deliberately NOT in
+ * RECONSENT_ERROR_CODES: guessing "reconnect" is what made a successful
+ * reconnect (runPostConnectRefresh -> syncSkattekonto -> 403) instantly
+ * re-flag the token row, so the banner perpetuated itself (#1155). Case 2 does
+ * need a reconnect, but only AFTER the scope exists, so an automatic reconsent
+ * loop would still be wrong.
+ *
+ * It also has to be ruled out before isTokenScopeRejection, which matches the
+ * substring "required scope".
+ *
+ * To tell the two apart, call the API with a deliberately invalid bearer and
+ * the same Client_Id/Client_Secret. Case 1 fails at the gateway with this same
+ * body; case 2 reaches the bearer check and answers 401 invalid/revoked token.
+ * Compare against an API the client is known to be subscribed to.
  */
 function isApigwScopeContractError(body: string): boolean {
   return /required scopes?\s+are\s+not\s+authorized/i.test(body)
+}
+
+/**
+ * The API segment of a SKV URL ("arbetsgivardeklaration/inlamning/v1"), for
+ * error messages that have to say WHICH service refused. Without it the user
+ * cannot tell which subscription or scope to go check, which is exactly the
+ * dead end the 403 message used to leave them in.
+ */
+function apiHintFromUrl(url: string): string {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean)
+    return parts.length >= 1 ? parts.slice(0, 3).join('/') : url
+  } catch {
+    return url
+  }
+}
+
+/**
+ * User-facing message for the ambiguous gateway/scope refusal. Single-sourced
+ * so the 401 and 403 paths cannot drift apart.
+ */
+function apigwOrScopeMessage(url: string): string {
+  return (
+    `Skatteverket nekade anropet till tjänsten "${apiHintFromUrl(url)}". ` +
+    'Två saker ger samma svar: APIGW-klienten (SKATTEVERKET_APIGW_CLIENT_ID) ' +
+    'saknar prenumeration på tjänsten, eller så saknar anslutningen det scope ' +
+    'tjänsten kräver. Kontrollera båda i Utvecklarportalen: prenumerationen på ' +
+    'API:et, och att applikationens scope-lista täcker det. Om ett scope har ' +
+    'lagts till behöver du koppla bort och ansluta igen via Inställningar → ' +
+    'Skatteverket för att få en ny token.'
+  )
+}
+
+/**
+ * Connector-mode variant of the gateway-refusal guidance: the APIGW client
+ * and its subscriptions belong to the connector's OPERATOR (the broker the
+ * instance routes through), so telling a self-host operator to check
+ * SKATTEVERKET_APIGW_CLIENT_ID or visit Utvecklarportalen points at knobs
+ * their instance does not have. The token they hold was also minted by the
+ * broker, so the only local actions are checking the connector status and
+ * contacting the operator. The message names the operator by the connector
+ * host rather than saying "support": hosted is itself a Connect
+ * installation for the canary companies (#2209), so "support" no longer
+ * says whose (#2226).
+ */
+function connectorGatewayMessage(url: string, connectBaseUrl: string): string {
+  return (
+    `Skatteverkets API-gateway nekade anropet till tjänsten "${apiHintFromUrl(url)}" via connectorn. ` +
+    `Felet ligger hos connectorns operatör (${connectorHost(connectBaseUrl)}), i gateway-prenumerationen ` +
+    'eller scope-listan, inte på din instans: kontakta operatören. Anslutningsläget syns på /api/connector/status.'
+  )
+}
+
+/** The connector operator's host, for messages that have to say WHOM to contact. */
+function connectorHost(connectBaseUrl: string): string {
+  try {
+    return new URL(connectBaseUrl).host
+  } catch {
+    return connectBaseUrl
+  }
 }
 
 /**
@@ -260,12 +368,13 @@ function isTokenScopeRejection(body: string): boolean {
 export async function skvRequest(
   supabase: SupabaseClient,
   userId: string,
+  companyId: string,
   method: string,
   path: string,
   body?: unknown,
   options?: { baseUrl?: string; contentType?: string }
 ): Promise<Response> {
-  return skvRequestWithAuth({ mode: 'user', supabase, userId }, method, path, body, options)
+  return skvRequestWithAuth({ mode: 'user', supabase, userId, companyId }, method, path, body, options)
 }
 
 /**
@@ -288,7 +397,7 @@ export async function skvRequestWithAuth(
   method: string,
   path: string,
   body?: unknown,
-  options?: { baseUrl?: string; contentType?: string }
+  options?: { baseUrl?: string; contentType?: string; accept?: string }
 ): Promise<Response> {
   if (isDisabled()) {
     throw new SkatteverketAuthError(
@@ -299,7 +408,7 @@ export async function skvRequestWithAuth(
 
   let accessToken: string
   if (auth.mode === 'user') {
-    accessToken = await getValidToken(auth.supabase, auth.userId)
+    accessToken = await getValidToken(auth.supabase, auth.userId, auth.companyId)
   } else {
     try {
       accessToken = await getSystemAccessToken()
@@ -313,13 +422,38 @@ export async function skvRequestWithAuth(
 
   await enforceRateLimit()
 
-  const url = `${options?.baseUrl || getApiBaseUrl()}${path}`
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${accessToken}`,
-    'Client_Id': getApiGwClientId(),
-    'Client_Secret': getApiGwClientSecret(),
-    'skv_client_correlation_id': crypto.randomUUID(),
+  // Connector mode (self-host with GNUBOK_CONNECTOR_KEY and no own SKV
+  // credentials): route through the hosted data proxy. The base URL only
+  // selects the SERVICE segment (the proxy resolves the real upstream from
+  // hosted's env); the user's SKV Bearer moves to the upstream-auth header,
+  // the connector key becomes the proxy auth, and the gateway
+  // Client_Id/Client_Secret are omitted entirely (the proxy adds Arcim's;
+  // this instance has none, which is precisely why it is in connector mode).
+  // System (CCG) auth is deliberately NOT brokered: background ombud reads
+  // are a hosted-only feature and stay on the direct path, where a
+  // credential-less self-host fails with SYSTEM_AUTH_FAILED.
+  // The company id lets CONNECT_SKV_CANARY_COMPANIES route a few companies
+  // through the connector while this installation still has own credentials
+  // (hosted moving to Connect upstream by upstream); token refresh stays on
+  // whichever path the installation as a whole is on.
+  const connector = auth.mode === 'user' ? skatteverketConnectorMode(auth.companyId) : null
+  const effectiveBase = options?.baseUrl || getApiBaseUrl()
+  let url: string
+  const headers: Record<string, string> = {}
+  if (connector) {
+    url = `${connector.baseUrl}/api/${baseUrlToService(effectiveBase)}${path}`
+    headers['Authorization'] = `Bearer ${connector.key}`
+    headers[CONNECTOR_UPSTREAM_AUTH_HEADER] = `Bearer ${accessToken}`
+  } else {
+    url = `${effectiveBase}${path}`
+    headers['Authorization'] = `Bearer ${accessToken}`
+    headers['Client_Id'] = getApiGwClientId()
+    headers['Client_Secret'] = getApiGwClientSecret()
+    headers['skv_client_correlation_id'] = crypto.randomUUID()
   }
+  // Ombudshantering lists Accept as a required header (406 otherwise); the
+  // moms/skattekonto/AGI services never needed it, so it stays opt-in.
+  if (options?.accept) headers['Accept'] = options.accept
 
   // contentType defaults to application/json, which is right for moms +
   // skattekonto. AGI's POST /underlag takes application/xml: callers pass
@@ -328,15 +462,59 @@ export async function skvRequestWithAuth(
   if (body !== undefined) {
     const contentType = options?.contentType ?? 'application/json'
     headers['Content-Type'] = contentType
+    if (connector) headers[CONNECTOR_UPSTREAM_CONTENT_TYPE_HEADER] = contentType
     serializedBody = typeof body === 'string' ? body : JSON.stringify(body)
   }
 
-  const response = await fetch(url, {
+  let response = await fetch(url, {
     method,
     headers,
     body: serializedBody,
     signal: AbortSignal.timeout(15_000),
   })
+
+  // Connector-layer refusals FIRST: a 4xx here can come from the broker
+  // itself, not Skatteverket, and the SKV-shaped sniffing below would then
+  // misdiagnose it (an empty connector 401 would tell the operator to check
+  // SKATTEVERKET_APIGW_CLIENT_ID, which does not exist on their instance).
+  // Bodies without a CONNECTOR_* code are upstream SKV responses passed
+  // through the proxy: re-wrap and fall through to the normal mapping.
+  if (connector && [400, 401, 403, 404, 429].includes(response.status)) {
+    const text = await response.text().catch(() => '')
+    const connectorCode = parseConnectorCode(text)
+    if (connectorCode) {
+      log.warn('connector broker rejected SKV call', {
+        url,
+        statusCode: response.status,
+        code: connectorCode,
+      })
+      if (connectorCode === 'CONNECTOR_RATE_LIMITED') {
+        throw new SkatteverketAuthError(
+          'Skatteverket-connectorn är upptagen. Försök igen om en stund.',
+          'RATE_LIMITED'
+        )
+      }
+      if (connectorCode === 'CONNECTOR_NOT_OWNED') {
+        // The hosted ledger no longer vouches for this token (rotated away
+        // or revoked); only a fresh BankID consent recovers.
+        throw new SkatteverketAuthError(
+          'Sessionen har gått ut. Logga in med BankID igen.',
+          'SESSION_EXPIRED'
+        )
+      }
+      throw new SkatteverketAuthError(
+        `Connectorn nekade anropet (${connectorCode}). Kontrollera instansens ` +
+        'connector-nyckel (GNUBOK_CONNECTOR_KEY) och att abonnemanget omfattar ' +
+        'Skatteverket. Se /api/connector/status för anslutningsläget.',
+        'ACCESS_DENIED'
+      )
+    }
+    response = new Response(text, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+  }
 
   // Handle Skatteverket-specific auth/throttle errors uniformly so callers
   // can catch a single error type rather than parsing status codes inline.
@@ -402,9 +580,7 @@ export async function skvRequestWithAuth(
     // so either verdict re-arms the banner the user just tried to clear.
     if (isApigwScopeContractError(text)) {
       throw new SkatteverketAuthError(
-        'Skatteverkets API-gateway nekade anropet. Kontrollera att din ' +
-        'APIGW-klient (SKATTEVERKET_APIGW_CLIENT_ID) har prenumeration på ' +
-        'denna tjänst i Utvecklarportalen.',
+        connector ? connectorGatewayMessage(url, connector.baseUrl) : apigwOrScopeMessage(url),
         'ACCESS_DENIED'
       )
     }
@@ -437,7 +613,7 @@ export async function skvRequestWithAuth(
     // primary auth error to the user.
     if (lower.includes('revoked') || lower.includes('token has been revoked')) {
       try {
-        await deleteTokens(auth.supabase, auth.userId)
+        await deleteTokens(auth.supabase, auth.userId, auth.companyId)
       } catch (cleanupErr) {
         log.error('failed to clear revoked token row', cleanupErr as Error, { userId: auth.userId })
       }
@@ -462,10 +638,16 @@ export async function skvRequestWithAuth(
       lower.includes('api key') ||
       lower.includes('consumer')
     if (looksLikeApigwIssue) {
+      // Named the subscription outright: unlike the scope-contract body above,
+      // these shapes (client_id, consumer, subscription) point at the gateway
+      // client alone, so the message must not muddy it with the scope story.
+      // Connector mode: the gateway client is the broker's, not the instance's.
       throw new SkatteverketAuthError(
-        'Skatteverkets API-gateway nekade anropet. Kontrollera att din ' +
-        'APIGW-klient (SKATTEVERKET_APIGW_CLIENT_ID) har prenumeration på ' +
-        'denna tjänst i Utvecklarportalen.',
+        connector
+          ? connectorGatewayMessage(url, connector.baseUrl)
+          : `Skatteverkets API-gateway nekade anropet till "${apiHintFromUrl(url)}". ` +
+            'Kontrollera att din APIGW-klient (SKATTEVERKET_APIGW_CLIENT_ID) har ' +
+            'prenumeration på denna tjänst i Utvecklarportalen.',
         'ACCESS_DENIED'
       )
     }
@@ -479,18 +661,10 @@ export async function skvRequestWithAuth(
     // "log in again" sends them down a dead end; be explicit about the
     // likely fix instead.
     if (!text) {
-      // Extract the API segment of the URL so the message tells the user
-      // exactly which subscription is missing. Falls back to the raw URL
-      // if parsing fails.
-      let apiHint = url
-      try {
-        const u = new URL(url)
-        const parts = u.pathname.split('/').filter(Boolean)
-        // Take the first 3 segments, e.g. arbetsgivardeklaration/inlamning/v1
-        if (parts.length >= 1) apiHint = parts.slice(0, 3).join('/')
-      } catch {
-        // keep raw url
+      if (connector) {
+        throw new SkatteverketAuthError(connectorGatewayMessage(url, connector.baseUrl), 'ACCESS_DENIED')
       }
+      const apiHint = apiHintFromUrl(url)
       throw new SkatteverketAuthError(
         'Skatteverkets API-gateway nekade anropet utan motivering. ' +
         'Trolig orsak: APIGW-klienten (SKATTEVERKET_APIGW_CLIENT_ID) har ' +
@@ -525,9 +699,10 @@ export async function skvRequestWithAuth(
       // point at the scope list when the gateway is what refused.
       if (isApigwScopeContractError(text)) {
         throw new SkatteverketAuthError(
-          'Skatteverkets API-gateway nekade systemanropet: APIGW-klienten ' +
-          '(SKATTEVERKET_APIGW_CLIENT_ID) saknar prenumeration på denna ' +
-          'tjänst i Utvecklarportalen.',
+          'Skatteverket nekade systemanropet till tjänsten ' +
+          `"${apiHintFromUrl(url)}": antingen saknar APIGW-klienten ` +
+          '(SKATTEVERKET_APIGW_CLIENT_ID) prenumeration på tjänsten, eller så ' +
+          'täcker inte SKATTEVERKET_SYSTEM_SCOPES det scope tjänsten kräver.',
           'SYSTEM_AUTH_FAILED'
         )
       }
@@ -548,15 +723,14 @@ export async function skvRequestWithAuth(
         'OMBUD_GRANT_MISSING'
       )
     }
-    // Gateway contract failure, checked first: it wears scope wording but is
-    // our APIGW subscription, not the user's token. Reconnecting cannot fix
-    // it, and calling it MISSING_SCOPE made every reconnect re-flag the row
-    // (#1155). ACCESS_DENIED is deliberately not in RECONSENT_ERROR_CODES.
+    // Gateway scope enforcement, checked first: the body wears token-scope
+    // wording but names neither cause, so it must not reach
+    // isTokenScopeRejection below. ACCESS_DENIED is deliberately not in
+    // RECONSENT_ERROR_CODES (#1155): a reconnect is only the fix once the
+    // scope actually exists, so it can never be automatic.
     if (isApigwScopeContractError(text)) {
       throw new SkatteverketAuthError(
-        'Skatteverkets API-gateway nekade anropet. Kontrollera att din ' +
-        'APIGW-klient (SKATTEVERKET_APIGW_CLIENT_ID) har prenumeration på ' +
-        'denna tjänst i Utvecklarportalen.',
+        connector ? connectorGatewayMessage(url, connector.baseUrl) : apigwOrScopeMessage(url),
         'ACCESS_DENIED'
       )
     }

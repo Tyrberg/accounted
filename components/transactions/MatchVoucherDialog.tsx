@@ -1,16 +1,16 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
+import { useCashAccounts } from '@/lib/reference-data/hooks'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
+import { HelpPopover } from '@/components/ui/help-popover'
 import {
   MatchVerifikationPicker,
   type UnlinkedGLLine,
@@ -21,7 +21,6 @@ import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { useToast } from '@/components/ui/use-toast'
 import { ArrowUpRight, ArrowDownRight, Loader2 } from 'lucide-react'
 import type { TransactionWithInvoice } from './transaction-types'
-import type { CashAccount } from '@/types'
 import { resolveAccount } from '@/lib/cash-accounts/resolve-account'
 
 interface MatchVoucherDialogProps {
@@ -62,28 +61,19 @@ export function MatchVoucherDialog({
   // so several transactions can settle one verifikat (N:1: a salary run paid in
   // multiple transfers, an invoice paid in instalments).
   const [includeMatched, setIncludeMatched] = useState(false)
+  // Session-cached (lib/reference-data): resolving the settlement account no
+  // longer costs a /api/cash-accounts round trip per candidate load.
+  const { cashAccounts } = useCashAccounts()
 
   const loadCandidates = useCallback(
     async (tx: TransactionWithInvoice, wide: boolean, matched: boolean, signal: { cancelled: boolean }) => {
       setLoading(true)
       try {
-        // Resolve the settlement account from the company's cash accounts.
-        let account = '1930'
-        let fallback = true
-        try {
-          const caRes = await fetch('/api/cash-accounts')
-          if (caRes.ok) {
-            const caJson = await caRes.json()
-            if (!signal.cancelled) {
-              const accounts = (caJson.data ?? []) as CashAccount[]
-              const resolved = resolveAccount(accounts, tx.cash_account_id ?? null, tx.currency ?? 'SEK')
-              account = resolved.account
-              fallback = resolved.fallback
-            }
-          }
-        } catch {
-          // Network hiccup: fall back to 1930 and let the user see the note.
-        }
+        // Resolve the settlement account from the company's cash accounts
+        // (an empty list resolves to 1930 with the fallback note shown).
+        const resolved = resolveAccount(cashAccounts, tx.cash_account_id ?? null, tx.currency ?? 'SEK')
+        const account = resolved.account
+        const fallback = resolved.fallback
         if (!signal.cancelled) {
           setAccountNumber(account)
           setAccountFallback(fallback)
@@ -122,7 +112,7 @@ export function MatchVoucherDialog({
         if (!signal.cancelled) setLoading(false)
       }
     },
-    [],
+    [cashAccounts],
   )
 
   // (Re)load whenever the dialog opens for a transaction, the range widens, or
@@ -188,11 +178,23 @@ export function MatchVoucherDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Matcha mot befintlig verifikation</DialogTitle>
-          <DialogDescription>
-            Koppla bankhändelsen till en verifikation som redan är bokförd (t.ex. en
-            lön eller en post importerad från Fortnox). Ingen ny bokföring skapas.
-          </DialogDescription>
+          {/* Convention 7: the how-it-works copy lives behind the "?", not in
+              the dialog flow. */}
+          <div className="flex items-center gap-2">
+            <DialogTitle>Matcha mot befintlig verifikation</DialogTitle>
+            <HelpPopover>
+              <p>
+                Kopplar bankhändelsen till en verifikation som redan är bokförd,
+                t.ex. en lön eller en post importerad från Fortnox. Ingen ny
+                bokföring skapas.
+              </p>
+              <p className="mt-2">
+                Med &quot;Visa även matchade&quot; kan flera bankhändelser kopplas
+                till samma verifikation, t.ex. en lön utbetald i flera
+                överföringar.
+              </p>
+            </HelpPopover>
+          </div>
         </DialogHeader>
 
         {/* Transaction summary */}
@@ -240,26 +242,33 @@ export function MatchVoucherDialog({
               <MatchVerifikationPicker glLines={glLines} value={selected} onChange={setSelected} inline />
               {(selectedLine?.linked_transaction_count ?? 0) > 0 && (
                 <p className="text-xs text-muted-foreground">
-                  Verifikationen är redan matchad mot {selectedLine?.linked_transaction_count}{' '}
-                  transaktion{(selectedLine?.linked_transaction_count ?? 0) === 1 ? '' : 'er'}.
-                  Kopplingen lägger till den här transaktionen också: t.ex. en lön utbetald i
-                  flera överföringar.
+                  Redan matchad mot {selectedLine?.linked_transaction_count}{' '}
+                  transaktion{(selectedLine?.linked_transaction_count ?? 0) === 1 ? '' : 'er'};
+                  den här läggs till.
                 </p>
               )}
             </>
           )}
 
+          {/* One verifikat per dialog, by design: the 1:N split (one bank
+              row over several verifikat) needs the sum arithmetic of the
+              worksheet, so this stays a single pick and points there. */}
+          <p className="text-xs text-muted-foreground">
+            Ska händelsen delas på flera verifikat? Använd Bankavstämning → Matcha manuellt.
+          </p>
+
           {/* Discovery affordances: widen the date window, and surface vouchers
-              already matched so another transaction can be attached (N:1). */}
+              already matched so another transaction can be attached (N:1).
+              Quiet links, not switches: these are list filters, and the switch
+              idiom belongs to settings (convention 15). */}
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 pt-1">
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-              <Switch
-                checked={includeMatched}
-                onCheckedChange={setIncludeMatched}
-                aria-label="Visa även matchade verifikationer"
-              />
-              Visa även matchade verifikationer
-            </label>
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+              onClick={() => setIncludeMatched((v) => !v)}
+            >
+              {includeMatched ? 'Dölj matchade' : 'Visa även matchade'}
+            </button>
             {!wideRange && (
               <button
                 type="button"
