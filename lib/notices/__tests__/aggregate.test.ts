@@ -7,6 +7,7 @@ const detectMocks = vi.hoisted(() => ({
   broken: vi.fn(),
   skv: vi.fn(),
   backup: vi.fn(),
+  leaseGap: vi.fn(),
   expiring: vi.fn(),
   unexplained: vi.fn(),
   other: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock('../categories', () => ({
   detectBrokenBankConnections: detectMocks.broken,
   detectSkvDisconnected: detectMocks.skv,
   detectBackupFailing: detectMocks.backup,
+  detectLeaseScheduleGap: detectMocks.leaseGap,
   detectExpiringBankConnections: detectMocks.expiring,
   detectSkvUnexplained: detectMocks.unexplained,
   detectOtherAccountHint: detectMocks.other,
@@ -40,6 +42,7 @@ beforeEach(() => {
   detectMocks.broken.mockResolvedValue(null)
   detectMocks.skv.mockResolvedValue(null)
   detectMocks.backup.mockResolvedValue(null)
+  detectMocks.leaseGap.mockResolvedValue(null)
   detectMocks.expiring.mockResolvedValue(null)
   detectMocks.unexplained.mockResolvedValue(null)
   detectMocks.other.mockResolvedValue(null)
@@ -58,6 +61,7 @@ describe('getCompanyNotices', () => {
     detectMocks.expiring.mockResolvedValue(notice('bank_connection_expiring', 'exp:1'))
     detectMocks.broken.mockResolvedValue(notice('bank_connection_broken', 'broken:1'))
     detectMocks.backup.mockResolvedValue(notice('backup_failing', 'backup:1'))
+    detectMocks.leaseGap.mockResolvedValue(notice('lease_schedule_gap', 'gap:1'))
     detectMocks.skv.mockResolvedValue(notice('skv_disconnected', 'skv:1'))
 
     const notices = await getCompanyNotices(supabase, 'company-1', { userId: 'user-1' })
@@ -65,6 +69,7 @@ describe('getCompanyNotices', () => {
       'bank_connection_broken',
       'skv_disconnected',
       'backup_failing',
+      'lease_schedule_gap',
       'bank_connection_expiring',
       'other_account_hint',
     ])

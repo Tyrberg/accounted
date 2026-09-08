@@ -232,6 +232,7 @@ describe('applyRecurringScheduleUpdate', () => {
         unit: 'st',
         unit_price: 5000,
         vat_rate: null,
+        revenue_account: null,
         dimensions: {},
       },
       {
@@ -242,6 +243,7 @@ describe('applyRecurringScheduleUpdate', () => {
         unit: 'st',
         unit_price: 5000,
         vat_rate: 25,
+        revenue_account: null,
         dimensions: {},
       },
     ])
@@ -498,5 +500,83 @@ describe('applyRecurringScheduleUpdate', () => {
 
     expect(result).toMatchObject({ ok: false, itemsRestored: true, headerRestored: true })
     expect(h.inserts[ITEMS]).toHaveLength(1)
+  })
+})
+
+describe('applyRecurringScheduleUpdate revenue-account validation', () => {
+  it('rejects a class 1-2 override on a VAT-bearing line before touching either table', async () => {
+    const from = vi.fn(() => {
+      throw new Error('validation must reject before any table is read or written')
+    })
+    const result = await applyRecurringScheduleUpdate({ from } as unknown as SupabaseClient, {
+      scheduleId: SCHEDULE_ID,
+      companyId: COMPANY_ID,
+      fields: {},
+      items: [makeItem({ revenue_account: '2611', vat_rate: 25 })],
+      log: { error: vi.fn() },
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: 'validation',
+      code: 'INVOICE_CREATE_POSTING_ACCOUNT_VAT_CONFLICT',
+      details: { account: '2611', vatRate: 25 },
+    })
+    expect(from).not.toHaveBeenCalled()
+  })
+
+  it('rejects a class 1-2 override when vat_rate is omitted, since it resolves to the customer default at spawn time, not zero', async () => {
+    const from = vi.fn(() => {
+      throw new Error('validation must reject before any table is read or written')
+    })
+    const result = await applyRecurringScheduleUpdate({ from } as unknown as SupabaseClient, {
+      scheduleId: SCHEDULE_ID,
+      companyId: COMPANY_ID,
+      fields: {},
+      items: [makeItem({ description: 'Deposition', revenue_account: '2420' })],
+      log: { error: vi.fn() },
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: 'validation',
+      code: 'INVOICE_CREATE_POSTING_ACCOUNT_VAT_CONFLICT',
+      details: { account: '2420', vatRate: null },
+    })
+    expect(from).not.toHaveBeenCalled()
+  })
+
+  it('rejects a revenue_account that is not an active class 1-3 account in the chart', async () => {
+    const from = vi.fn((table: string) => {
+      expect(table).toBe('chart_of_accounts')
+      return {
+        select: () => ({
+          eq: () => ({
+            gte: () => ({
+              lte: () => ({
+                eq: () => ({
+                  in: () => Promise.resolve({ data: [], error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+      }
+    })
+
+    const result = await applyRecurringScheduleUpdate({ from } as unknown as SupabaseClient, {
+      scheduleId: SCHEDULE_ID,
+      companyId: COMPANY_ID,
+      fields: {},
+      items: [makeItem({ revenue_account: '3011', vat_rate: 0 })],
+      log: { error: vi.fn() },
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      stage: 'validation',
+      code: 'INVOICE_CREATE_REVENUE_ACCOUNT_INVALID',
+      details: { invalidAccounts: ['3011'] },
+    })
   })
 })

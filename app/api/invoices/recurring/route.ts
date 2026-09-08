@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
-import { errorResponse } from '@/lib/errors/get-structured-error'
+import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { CreateRecurringScheduleSchema } from '@/lib/api/schemas'
-import { computeInitialRunDate } from '@/lib/invoices/recurring-schedule-service'
+import { createRecurringSchedule } from '@/lib/invoices/create-recurring-schedule'
 
 ensureInitialized()
 
@@ -89,70 +89,24 @@ export const POST = withRouteContext(
       )
     }
 
-    const nextRunDate = computeInitialRunDate(
-      new Date(),
-      input.day_of_month,
-      input.start_date,
-    )
+    const created = await createRecurringSchedule(supabase, {
+      companyId,
+      userId: user.id,
+      input,
+    })
 
-    const { data: schedule, error: insertError } = await supabase
-      .from('recurring_invoice_schedules')
-      .insert({
-        company_id: companyId,
-        user_id: user.id,
-        customer_id: input.customer_id,
-        name: input.name,
-        day_of_month: input.day_of_month,
-        interval_months: input.interval_months,
-        send_hour: input.send_hour,
-        payment_terms_days: input.payment_terms_days,
-        currency: input.currency,
-        your_reference: input.your_reference ?? null,
-        our_reference: input.our_reference ?? null,
-        notes: input.notes ?? null,
-        auto_send: input.auto_send,
-        default_dimensions: input.default_dimensions ?? {},
-        next_run_date: nextRunDate,
-        status: 'active',
-      })
-      .select()
-      .single()
-
-    if (insertError || !schedule) {
-      log.error('failed to insert recurring schedule', insertError)
-      return errorResponse(insertError ?? new Error('insert failed'), log, { requestId })
-    }
-
-    const itemRows = input.items.map((item, idx) => ({
-      schedule_id: schedule.id,
-      sort_order: idx,
-      description: item.description,
-      quantity: item.quantity,
-      unit: item.unit,
-      unit_price: item.unit_price,
-      vat_rate: item.vat_rate ?? null,
-      dimensions: item.dimensions ?? {},
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('recurring_invoice_schedule_items')
-      .insert(itemRows)
-
-    if (itemsError) {
-      // Roll back the parent so a half-created schedule doesn't ship.
-      await supabase
-        .from('recurring_invoice_schedules')
-        .delete()
-        .eq('id', schedule.id)
-        .eq('company_id', companyId)
-      log.error('failed to insert schedule items; rolled back schedule', itemsError)
-      return errorResponse(itemsError, log, { requestId })
+    if (!created.ok) {
+      if ('dbError' in created) {
+        log.error('failed to create recurring schedule', created.dbError as Error)
+        return errorResponse(created.dbError, log, { requestId })
+      }
+      return errorResponseFromCode(created.code, log, { requestId, details: created.details })
     }
 
     const { data: complete } = await supabase
       .from('recurring_invoice_schedules')
       .select('*, customer:customers(id,name,email), items:recurring_invoice_schedule_items(*)')
-      .eq('id', schedule.id)
+      .eq('id', created.scheduleId)
       .single()
 
     return NextResponse.json({ data: complete }, { status: 201 })

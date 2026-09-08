@@ -167,7 +167,15 @@ const KNOWN_STALE_ON_CONFLICT: Record<string, string> = {}
 // (parties phase 1, #2162/#2168/#2169) at 395: 397.
 // 2026-09-04: +2 recurring lines (#2044, see the 2026-08-30 recurring payroll
 // lines note above); merged with main (#2141/#2164/#2170/#2192) at 397: 399.
-const UNRESOLVED_CEILING = 399
+// 2026-09-07: +1 for t1331 hyresaviseringskedjan: extensions/general/propmate/
+// api-routes.ts builds the lease PATCH payload (leaseUpdateRow, only the
+// fields the caller actually touched) and its rollback-on-sync-failure
+// payload (revertRow, exactly those same keys reverted to their pre-PATCH
+// values) as Record<string, unknown>, the same partial-update shape
+// lib/invoices/apply-recurring-schedule-update.ts's `fields`/`restoreRow`
+// already use for the schedule side of this exact write path (already
+// counted below). Two new call sites, net +1 after other changes in this PR.
+const UNRESOLVED_CEILING = 400
 
 /**
  * Floor on statically resolved column references. Guards the guard: if a change

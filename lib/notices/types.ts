@@ -60,6 +60,19 @@ export const NOTICE_CATEGORIES = [
    */
   'skv_unexplained',
   /**
+   * A propmate lease's linked recurring-invoice schedule was deleted on the
+   * core recurring-invoice page; the daily resync cron refuses to
+   * auto-recreate it (operator's delete must stick, see CLAUDE.md decision
+   * log, 2026-09-07), so the lease generates no invoices until a human acts.
+   * Pending:  leases.status = 'active' AND recurring_schedule_id IS NULL AND
+   *           last_synced_at IS NOT NULL (was synced before, now unlinked):
+   *           extensions/general/propmate/lib/lease-schedule-sync.ts's own
+   *           "schedule deleted, not never-synced" discriminator.
+   * Done:     the lease is ended (status: 'ended'), or an operator
+   *           deliberately resyncs it (POST /leases/:id/sync).
+   */
+  'lease_schedule_gap',
+  /**
    * The signed-in account looks bookkeeping-empty while a same-orgnr company
    * with real bookkeeping exists in another account (#1231).
    * Pending:  lib/company/other-account-hint shouldShowOtherAccountHint().
@@ -80,6 +93,7 @@ export const NOTICE_PRIORITY: readonly NoticeCategory[] = [
   'bank_connection_broken',
   'skv_disconnected',
   'backup_failing',
+  'lease_schedule_gap',
   'bank_connection_expiring',
   'skv_unexplained',
   'other_account_hint',

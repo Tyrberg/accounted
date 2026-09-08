@@ -398,10 +398,12 @@ export async function executeRecurringSchedule(
 
   // 6. Insert items.
   // NOTE (artikelregister Phase 2): recurring schedule template items have no
-  // article_id / revenue_account columns (see recurring_invoice_schedule_items),
-  // so generated invoices fall back to the VAT-treatment-derived revenue account.
-  // Wiring per-article overrides into recurring invoices needs a schema change
-  // and is deliberately out of the artikelregister MVP scope.
+  // article_id column, so generated invoices cannot carry an article link.
+  // revenue_account IS carried through (schema hyresaviseringskedjan, 2026-09):
+  // a schedule item's per-line posting-account override is frozen-copied here,
+  // same idiom as build-invoice-write.ts copying an article's override onto a
+  // manually created invoice_items row. A null override still falls back to
+  // the VAT-treatment-derived revenue account downstream.
   const itemRows = items.map((item, index) => {
     const itemRate = item.vat_rate != null ? item.vat_rate : vatRules.rate
     const lineTotal = item.quantity * item.unit_price
@@ -416,6 +418,7 @@ export async function executeRecurringSchedule(
       line_total: lineTotal,
       vat_rate: itemRate,
       vat_amount: itemVat,
+      revenue_account: item.revenue_account ?? null,
       dimensions: item.dimensions ?? {},
     }
   })

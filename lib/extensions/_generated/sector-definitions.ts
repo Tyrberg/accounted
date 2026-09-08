@@ -196,5 +196,22 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "hasOwnData": true,
           "subscriptionNotice": "Kräver ett Google-konto. Varje brevlåda kopplas av sin egen ägare och kan kopplas från när som helst."
     },
+    {
+          "slug": "propmate",
+          "name": "Propmate",
+          "sector": "general",
+          "category": "operations",
+          "icon": "Building2",
+          "dataPattern": "both",
+          "description": "Hyresaviseringskedjan: kopplar dina leasingavtal till gnuboks återkommande fakturor",
+          "longDescription": "Registrera hyresgäster och lokaler som leasingavtal (grundhyra, tillägg, kampanjpris, KPI-index som avtalsreferens). Propmate skapar och underhåller en återkommande fakturaserie per avtal via gnuboks recurring-schedule-service, inklusive moms på lokalhyra vid frivillig skattskyldighet. Depositioner och automatisk indexuppräkning hanteras inte än.",
+          "readsCoreTables": [
+                "customers",
+                "recurring_invoice_schedules",
+                "recurring_invoice_schedule_items",
+                "chart_of_accounts"
+          ],
+          "hasOwnData": true
+    },
   ],
 }
