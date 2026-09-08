@@ -103,6 +103,10 @@
       "schedule": "15 5 * * *"
     },
     {
+      "path": "/api/extensions/propmate/lease-resync/cron",
+      "schedule": "0 5 * * *"
+    },
+    {
       "path": "/api/receipt-hunt/cron",
       "schedule": "30 5 * * *"
     },

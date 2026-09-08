@@ -3,6 +3,10 @@ import type { z } from 'zod'
 import type { RecurringScheduleItemSchema } from '@/lib/api/schemas'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { createLogger } from '@/lib/logger'
+import {
+  validateScheduleRevenueAccounts,
+  type ValidateScheduleRevenueAccountsResult,
+} from '@/lib/invoices/validate-schedule-revenue-accounts'
 
 /**
  * Apply an edit to a recurring invoice schedule: the header fields first, then
@@ -61,6 +65,14 @@ export type ApplyRecurringScheduleUpdateResult =
    * proof + rollback snapshot) failed, or the header update itself did.
    */
   | { ok: false; stage: 'header'; error: PostgrestError }
+  /**
+   * Nothing was written at all: a replacement item carries a revenue_account
+   * override that fails validate-schedule-revenue-accounts (invalid/inactive
+   * chart account, or a class 1-2 account on a VAT-bearing line). Checked
+   * before the header read so an invalid edit can never touch either table,
+   * same guarantee createRecurringSchedule gives on create.
+   */
+  | (Extract<ValidateScheduleRevenueAccountsResult, { ok: false }> & { stage: 'validation' })
   | {
       ok: false
       stage: 'items_delete' | 'items_insert'
@@ -86,6 +98,11 @@ export async function applyRecurringScheduleUpdate(
   const { scheduleId, companyId, fields, items, log = moduleLog } = opts
   const hasFields = Object.keys(fields).length > 0
   if (!hasFields && !items) return { ok: true }
+
+  if (items) {
+    const revenueAccountCheck = await validateScheduleRevenueAccounts(supabase, companyId, items)
+    if (!revenueAccountCheck.ok) return { ...revenueAccountCheck, stage: 'validation' }
+  }
 
   // Read the header row up front whenever the items are replaced. It does two
   // jobs at once:
@@ -223,6 +240,7 @@ export async function applyRecurringScheduleUpdate(
     unit: item.unit,
     unit_price: item.unit_price,
     vat_rate: item.vat_rate ?? null,
+    revenue_account: item.revenue_account ?? null,
     dimensions: item.dimensions ?? {},
   }))
 

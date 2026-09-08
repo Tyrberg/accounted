@@ -851,6 +851,13 @@ export const RecurringScheduleItemSchema = z.object({
     .union([z.literal(0), z.literal(6), z.literal(12), z.literal(25)])
     .nullable()
     .optional(),
+  // Optional per-line posting-account override (BAS class 1-3), same shape as
+  // InvoiceItemSchema's revenue_account. Zod only constrains the shape here;
+  // lib/invoices/validate-schedule-revenue-accounts.ts is the server-side
+  // guard that confirms it against the company's chart and the zero-VAT rule
+  // for a class 1-2 override, called from both createRecurringSchedule and
+  // applyRecurringScheduleUpdate before any write.
+  revenue_account: z.string().regex(INVOICE_POSTING_ACCOUNT_REGEX).nullable().optional(),
   // Copied onto the generated invoice_items.dimensions; merges over the
   // schedule's default_dimensions on that item's revenue line.
   dimensions: DimensionsBagSchema.optional(),

@@ -10,6 +10,7 @@ import {
   rollNextRunDateForward,
   getStockholmDateHour,
 } from '@/lib/invoices/recurring-schedule-service'
+import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 
 ensureInitialized()
 
@@ -69,6 +70,48 @@ export const PATCH = withRouteContext(
     }
     const input = parsed.data
     const { items, ...scheduleFields } = input
+
+    // A lease-managed schedule is rebuilt from the lease row every night by
+    // the propmate resync cron (extensions/general/propmate/lib/lease-schedule-sync.ts),
+    // which always wins because it runs unattended after this route would
+    // have run. That resync (syncLeaseToRecurringSchedule) unconditionally
+    // rewrites customer_id/name/day_of_month (and, with items, the rent/
+    // tillägg lines) on every pass, so an edit to any of those here would
+    // look like it worked and then get silently reverted before the next
+    // invoice goes out. status/auto_send are NOT at risk: the resync only
+    // touches them via an explicit opt-in the cron never sets (resumeSchedule/
+    // syncAutoSend, PATCH /leases/:id only), so a header-only status toggle
+    // (the pause button on this page) is safe to let through. Refuse instead
+    // of letting the unsafe fields race: the operator edits the lease (PATCH
+    // /leases/:id), which pushes the same change through the one write path
+    // both routes share. Core must not import from @/extensions/, so this is
+    // a direct table read gated on the extension actually being enabled,
+    // same pattern as lib/notices/categories.ts's detectLeaseScheduleGap.
+    const LEASE_MANAGED_FIELDS = ['customer_id', 'name', 'day_of_month'] as const
+    const touchesLeaseManagedField =
+      items !== undefined || LEASE_MANAGED_FIELDS.some((field) => field in scheduleFields)
+    if (touchesLeaseManagedField && ENABLED_EXTENSION_IDS.has('propmate')) {
+      const { data: managingLease, error: leaseError } = await supabase
+        .from('leases')
+        .select('id')
+        .eq('recurring_schedule_id', id)
+        .eq('company_id', companyId)
+        .maybeSingle()
+      if (leaseError) {
+        // Fail closed, not open: a PostgREST error here (including "more than
+        // one row" if a data bug ever links two leases to one schedule) must
+        // not be read as "no managing lease" and let the exact silent
+        // override through that this guard exists to stop.
+        log.error('failed to check lease-managed guard', leaseError)
+        return errorResponse(leaseError, log, { requestId })
+      }
+      if (managingLease) {
+        return errorResponseFromCode('SCHEDULE_MANAGED_BY_LEASE', log, {
+          requestId,
+          details: { leaseId: managingLease.id },
+        })
+      }
+    }
 
     // Only forward fields the user actually supplied.
     const updateRow: Record<string, unknown> = {}
@@ -210,6 +253,13 @@ export const PATCH = withRouteContext(
     })
 
     if (!result.ok) {
+      if (result.stage === 'validation') {
+        if ('dbError' in result) {
+          log.error('recurring schedule item revenue-account check failed on a DB lookup', result.dbError as Error)
+          return errorResponse(result.dbError, log, { requestId })
+        }
+        return errorResponseFromCode(result.code, log, { requestId, details: result.details })
+      }
       if (result.stage === 'header') {
         log.error('failed to update recurring schedule', result.error)
         return errorResponse(result.error, log, { requestId })

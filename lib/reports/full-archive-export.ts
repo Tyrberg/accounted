@@ -1005,6 +1005,11 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
     orderBy: 'received_at',
   },
   { name: 'recurring_invoice_schedules', file: 'recurring_invoice_schedules.json' },
+  // Propmate's avtalskälla (hyresaviseringskedjan): not räkenskapsinformation
+  // on its own, but the source contract every recurring_invoice_schedule row
+  // it links to was derived from (leases.recurring_schedule_id), same
+  // provenance rationale as sales_orders one section down.
+  { name: 'leases', file: 'leases.json', orderBy: 'created_at' },
   // Supplier invoicing
   { name: 'supplier_invoices', file: 'supplier_invoices.json', orderBy: 'invoice_date' },
   {
