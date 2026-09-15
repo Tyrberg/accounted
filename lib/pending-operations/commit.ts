@@ -110,6 +110,7 @@ import {
   resolveVoucherLinkedEntryIds,
 } from '@/lib/transactions/inbox-underlag'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
+import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import { parseSIEFile } from '@/lib/import/sie-parser'
 import { executeSIEImport, undoSIEImport } from '@/lib/import/sie-import'
 import type { AccountMapping } from '@/lib/import/types'
@@ -201,6 +202,7 @@ import { deleteDraftInvoice } from '@/lib/invoices/delete-draft-invoice'
 import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
 import { replaceInvoiceItems } from '@/lib/invoices/replace-invoice-items'
 import { applyRecurringScheduleUpdate } from '@/lib/invoices/apply-recurring-schedule-update'
+import { createRecurringSchedule } from '@/lib/invoices/create-recurring-schedule'
 import { BulkBookInboxSchema, OpeningBalancesBulkSchema } from '@/lib/api/schemas'
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
 import { isValidRevenueAccount } from '@/lib/articles/validate-revenue-account'
@@ -792,69 +794,33 @@ async function commitCreateRecurringSchedule(
     }
   }
 
-  const nextRunDate = computeInitialRunDate(
-    new Date(),
-    validated.day_of_month,
-    validated.start_date,
-  )
+  // Shared write path (lib/invoices/create-recurring-schedule.ts): same
+  // insert-then-items, same rollback-on-item-failure, and critically the same
+  // validate-schedule-revenue-accounts.ts guard the cookie-session POST route
+  // runs. This executor used to duplicate that insert inline with no
+  // revenue_account check at all, which would have let a staged MCP op book
+  // a class 1-2 account on a VAT-bearing line the UI already refuses.
+  const created = await createRecurringSchedule(supabase, {
+    companyId,
+    userId,
+    input: validated,
+  })
 
-  const { data: schedule, error: insertError } = await supabase
-    .from('recurring_invoice_schedules')
-    .insert({
-      company_id: companyId,
-      user_id: userId,
-      customer_id: validated.customer_id,
-      name: validated.name,
-      day_of_month: validated.day_of_month,
-      interval_months: validated.interval_months,
-      send_hour: validated.send_hour,
-      payment_terms_days: validated.payment_terms_days,
-      currency: validated.currency,
-      your_reference: validated.your_reference ?? null,
-      our_reference: validated.our_reference ?? null,
-      notes: validated.notes ?? null,
-      auto_send: validated.auto_send,
-      default_dimensions: validated.default_dimensions ?? {},
-      next_run_date: nextRunDate,
-      status: 'active',
-    })
-    .select()
-    .single()
-
-  if (insertError || !schedule) {
-    return { error: insertError?.message ?? 'Failed to insert recurring schedule', status: 500 }
-  }
-
-  const itemRows = validated.items.map((item, idx) => ({
-    schedule_id: schedule.id,
-    sort_order: idx,
-    description: item.description,
-    quantity: item.quantity,
-    unit: item.unit,
-    unit_price: item.unit_price,
-    vat_rate: item.vat_rate ?? null,
-    dimensions: item.dimensions ?? {},
-  }))
-
-  const { error: itemsError } = await supabase
-    .from('recurring_invoice_schedule_items')
-    .insert(itemRows)
-
-  if (itemsError) {
-    // Roll back the parent so a half-created schedule doesn't ship: an
-    // item-less schedule makes every cron run throw "schedule has no items"
-    // and silently skip billing dates.
-    await supabase
-      .from('recurring_invoice_schedules')
-      .delete()
-      .eq('id', schedule.id)
-      .eq('company_id', companyId)
-    return { error: itemsError.message, status: 500 }
+  if (!created.ok) {
+    if ('dbError' in created) {
+      return { error: (created.dbError as { message?: string } | null)?.message ?? 'Database error', status: 500 }
+    }
+    const entry = getErrorEntry(created.code)
+    return {
+      error: entry?.message_sv ?? created.code,
+      status: entry?.httpStatus ?? 400,
+      data: created.details as Record<string, unknown> | undefined,
+    }
   }
 
   return {
     data: {
-      recurring_schedule_id: schedule.id,
+      recurring_schedule_id: created.scheduleId,
       name: validated.name,
       customer_id: validated.customer_id,
       day_of_month: validated.day_of_month,
@@ -863,8 +829,10 @@ async function commitCreateRecurringSchedule(
       currency: validated.currency,
       auto_send: validated.auto_send,
       status: 'active',
-      next_run_date: nextRunDate,
-      item_count: itemRows.length,
+      // Pure display recomputation (no DB call): identical to what
+      // createRecurringSchedule derived internally for the actual insert.
+      next_run_date: computeInitialRunDate(new Date(), validated.day_of_month, validated.start_date),
+      item_count: validated.items.length,
     },
   }
 }
@@ -900,6 +868,45 @@ async function commitUpdateRecurringSchedule(
 
   if (existingError) return { error: existingError.message, status: 500 }
   if (!existing) return { error: 'Recurring schedule not found', status: 404 }
+
+  // Same lease-managed guard as app/api/invoices/recurring/[id]/route.ts: a
+  // schedule linked to a propmate lease has customer_id/name/day_of_month
+  // (and, with items, the rent/tillägg lines) rebuilt from the lease row
+  // every night by the resync cron, so an MCP-staged edit to one of those
+  // fields would look approved and then get silently reverted before the
+  // next invoice goes out; status/auto_send are exempt because the resync
+  // only ever touches them via an explicit opt-in the cron never sets. Core
+  // must not import from @/extensions/, so this is a direct table read
+  // gated on the extension actually being enabled, mirroring
+  // lib/notices/categories.ts's detectLeaseScheduleGap.
+  const leaseManagedFields = ['customer_id', 'name', 'day_of_month'] as const
+  if (
+    (items !== undefined || leaseManagedFields.some((field) => fieldChanges[field] !== undefined)) &&
+    ENABLED_EXTENSION_IDS.has('propmate')
+  ) {
+    const { data: managingLease, error: leaseError } = await supabase
+      .from('leases')
+      .select('id')
+      .eq('recurring_schedule_id', scheduleId)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (leaseError) {
+      // Fail closed, not open: an unchecked PostgREST error here (including
+      // "more than one row" if a data bug ever links two leases to one
+      // schedule) must not be read as "no managing lease" and let the exact
+      // silent override through this guard exists to stop.
+      return { error: leaseError.message, status: 500 }
+    }
+    if (managingLease) {
+      const entry = getErrorEntry('SCHEDULE_MANAGED_BY_LEASE')
+      return {
+        error: entry?.message_sv ?? 'SCHEDULE_MANAGED_BY_LEASE',
+        errorCode: 'SCHEDULE_MANAGED_BY_LEASE',
+        status: entry?.httpStatus ?? 409,
+        data: { leaseId: managingLease.id },
+      }
+    }
+  }
 
   // Turning auto_send on (or moving the schedule to another customer) needs
   // the target customer checked: email when auto_send is effectively on
@@ -982,6 +989,22 @@ async function commitUpdateRecurringSchedule(
     log,
   })
   if (!result.ok) {
+    if (result.stage === 'validation') {
+      // Nothing was written: same revenue-account guard the PATCH route
+      // enforces (lib/invoices/validate-schedule-revenue-accounts.ts), so an
+      // MCP-staged edit can't reach a different outcome than the UI for the
+      // same payload.
+      if ('dbError' in result) {
+        const message = (result.dbError as { message?: string } | null)?.message
+        return { error: message ?? 'Database error', status: 500 }
+      }
+      const entry = getErrorEntry(result.code)
+      return {
+        error: entry?.message_sv ?? result.code,
+        status: entry?.httpStatus ?? 400,
+        data: result.details as Record<string, unknown> | undefined,
+      }
+    }
     if (result.stage !== 'header' && (!result.itemsRestored || !result.headerRestored)) {
       // Same registry sentence the PATCH route returns, so the two surfaces
       // cannot drift on what the user is told.

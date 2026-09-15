@@ -49,6 +49,7 @@ import { applyAccountOverride } from '@/lib/bookkeeping/account-override'
 import { ACCOUNT_NUMBER_RE } from '@/lib/invariants/account-number'
 import { isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
+import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import { ACCOUNTS_NOT_IN_CHART } from '@/lib/bookkeeping/errors'
 import { dbError, errorCauseTag } from '@/lib/errors/db-error'
 import { getStructuredError } from '@/lib/errors/get-structured-error'
@@ -20717,6 +20718,7 @@ export const tools: McpTool[] = [
               unit: { type: 'string' },
               unit_price: { type: 'number' },
               vat_rate: { type: ['number', 'null'], description: 'null = customer default at spawn time' },
+              revenue_account: { type: ['string', 'null'], description: 'Line-level BAS account override; null = the invoice engine default' },
               dimensions: { type: 'object', description: 'Per-item dims bag; wins per key over default_dimensions' },
             },
           },
@@ -20733,7 +20735,7 @@ export const tools: McpTool[] = [
       let query = supabase
         .from('recurring_invoice_schedules')
         .select(
-          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, auto_send, default_dimensions, next_run_date, last_run_at, last_invoice_id, last_run_warning, generated_count, customer:customers(name), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, dimensions, sort_order)',
+          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, auto_send, default_dimensions, next_run_date, last_run_at, last_invoice_id, last_run_warning, generated_count, customer:customers(name), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, revenue_account, dimensions, sort_order)',
           { count: 'exact' },
         )
         .eq('company_id', companyId)
@@ -21126,7 +21128,7 @@ export const tools: McpTool[] = [
       const { data: current, error } = await supabase
         .from('recurring_invoice_schedules')
         .select(
-          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, your_reference, our_reference, notes, auto_send, default_dimensions, next_run_date, customer:customers(name, email), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, dimensions, sort_order)',
+          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, your_reference, our_reference, notes, auto_send, default_dimensions, next_run_date, customer:customers(name, email), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, revenue_account, dimensions, sort_order)',
         )
         .eq('id', parsed.data.schedule_id)
         .eq('company_id', companyId)
@@ -21134,6 +21136,27 @@ export const tools: McpTool[] = [
 
       if (error) throw dbError(error)
       if (!current) throw new Error('Recurring schedule not found. Use gnubok_list_recurring_schedules to find IDs.')
+
+      // Same lease-managed guard commitUpdateRecurringSchedule enforces at
+      // commit time (lib/pending-operations/commit.ts), checked here too so a
+      // change targeting an unsafe field (customer_id/name/day_of_month/items;
+      // see that guard's comment for why status/auto_send are exempt) fails at
+      // staging instead of only at approval: an agent should not be told a
+      // staged edit succeeded when commit will always refuse it.
+      const leaseManagedFields = ['customer_id', 'name', 'day_of_month'] as const
+      if (
+        (parsedChanges.items !== undefined || leaseManagedFields.some((field) => parsedChanges[field] !== undefined)) &&
+        ENABLED_EXTENSION_IDS.has('propmate')
+      ) {
+        const { data: managingLease, error: leaseError } = await supabase
+          .from('leases')
+          .select('id')
+          .eq('recurring_schedule_id', parsed.data.schedule_id)
+          .eq('company_id', companyId)
+          .maybeSingle()
+        if (leaseError) throw dbError(leaseError)
+        if (managingLease) throw registryError('SCHEDULE_MANAGED_BY_LEASE')
+      }
 
       // Turning auto_send on, or moving the schedule to another customer,
       // requires the (target) customer to have an email when auto_send is
@@ -21168,6 +21191,7 @@ export const tools: McpTool[] = [
           unit: it.unit,
           unit_price: it.unit_price,
           vat_rate: it.vat_rate ?? null,
+          revenue_account: it.revenue_account ?? null,
           dimensions: it.dimensions ?? {},
         }))
 

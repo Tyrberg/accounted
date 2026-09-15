@@ -17,6 +17,7 @@ import {
 import { useToast } from '@/components/ui/use-toast'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import { formatDate } from '@/lib/utils'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { Plus, Repeat, Lock, AlertTriangle } from 'lucide-react'
 import NewRecurringScheduleDialog from '@/components/invoices/NewRecurringScheduleDialog'
 import type { RecurringInvoiceSchedule, Customer } from '@/types'
@@ -104,8 +105,18 @@ export default function RecurringInvoicesPage() {
         })
         fetchSchedules()
       } else {
+        // errorResponse()/errorResponseFromCode() return the nested envelope
+        // { error: { code, message } }: reading body.error directly would
+        // stringify to "[object Object]", and a lease-managed schedule (see
+        // app/api/invoices/recurring/[id]/route.ts's guard) has a specific
+        // Swedish explanation worth showing instead of the generic fallback.
+        const body = (await res.json().catch(() => ({}))) as {
+          error?: string | { message?: string }
+        }
+        const message = typeof body.error === 'string' ? body.error : body.error?.message
         toast({
           title: t('schedule_update_failed_title'),
+          description: message ? getErrorMessage(new Error(message)) : undefined,
           variant: 'destructive',
         })
       }

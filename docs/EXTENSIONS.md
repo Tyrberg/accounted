@@ -68,6 +68,7 @@ extensions/
     invoice-inbox/            ← Dokumentinkorg: forward supplier invoices to a unique address
     mail/                     ← Brevlådor: lets Kvittojakten (receipt hunt) search the user's mailboxes
     mcp-server/               ← MCP-server (API): bookkeeping via Claude, Cursor or any MCP client
+    propmate/                 ← Hyresavisering: propmate Lease as lease source, billed via the recurring-invoice engine
     push-notifications/       ← Push-notiser: event notifications
     shopify/                  ← Shopify: paid orders and refunds into the Ordersidan
     skatteverket/             ← Skatteverket: VAT declaration submission via BankID, skattekonto

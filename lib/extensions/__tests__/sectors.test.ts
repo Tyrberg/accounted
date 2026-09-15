@@ -49,7 +49,7 @@ describe('sectors registry', () => {
   })
 
   it('should have 18 total extensions', () => {
-    expect(getAllExtensions().length).toBe(18)
+    expect(getAllExtensions().length).toBe(19)
   })
 
   it('should have unique slugs within each sector', () => {
@@ -94,7 +94,7 @@ describe('sectors registry', () => {
 
   it('getExtensionsBySector returns extensions for a sector', () => {
     const extensions = getExtensionsBySector('general')
-    expect(extensions.length).toBe(18)
+    expect(extensions.length).toBe(19)
   })
 
   it('all extensions have required fields', () => {

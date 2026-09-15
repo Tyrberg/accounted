@@ -6,7 +6,7 @@ import { createQueuedMockSupabase } from '@/tests/helpers'
 const otherAccountHintMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/extensions/_generated/enabled-extensions', () => ({
-  ENABLED_EXTENSION_IDS: new Set(['cloud-backup', 'skatteverket']),
+  ENABLED_EXTENSION_IDS: new Set(['cloud-backup', 'skatteverket', 'propmate']),
 }))
 vi.mock('@/lib/company/other-account-hint', () => ({
   shouldShowOtherAccountHint: otherAccountHintMock,
@@ -16,6 +16,7 @@ import {
   detectBackupFailing,
   detectBrokenBankConnections,
   detectExpiringBankConnections,
+  detectLeaseScheduleGap,
   detectOtherAccountHint,
   detectSkvDisconnected,
   detectSkvUnexplained,
@@ -406,6 +407,48 @@ describe('detectBackupFailing', () => {
   it('soft-fails to null on query error', async () => {
     enqueue({ error: { message: 'boom' } })
     await expect(detectBackupFailing(supabase, COMPANY)).resolves.toBeNull()
+  })
+})
+
+describe('detectLeaseScheduleGap', () => {
+  it('returns null when no active lease is missing its schedule', async () => {
+    enqueue({ data: [] })
+    await expect(detectLeaseScheduleGap(supabase, COMPANY)).resolves.toBeNull()
+  })
+
+  it('fires for a single lease whose schedule was deleted', async () => {
+    enqueue({
+      data: [{ id: 'lease-1', property_name: 'Bohed', unit_description: 'Lokal 2' }],
+    })
+    const notice = await detectLeaseScheduleGap(supabase, COMPANY)
+    expect(notice).toMatchObject({
+      id: 'lease_schedule_gap:lease-1',
+      category: 'lease_schedule_gap',
+      severity: 'error',
+      messageKey: 'lease_schedule_gap_one',
+      messageParams: { lease: 'Bohed - Lokal 2' },
+      actionKey: 'lease_schedule_gap_action',
+      actionHref: '/invoices/recurring',
+    })
+  })
+
+  it('folds multiple gapped leases into one notice with a count', async () => {
+    enqueue({
+      data: [
+        { id: 'lease-1', property_name: 'Bohed', unit_description: null },
+        { id: 'lease-2', property_name: 'Molleborgen', unit_description: 'Kontor 3' },
+      ],
+    })
+    const notice = await detectLeaseScheduleGap(supabase, COMPANY)
+    expect(notice).toMatchObject({
+      messageKey: 'lease_schedule_gap_many',
+      messageParams: { count: 2 },
+    })
+  })
+
+  it('soft-fails to null on query error', async () => {
+    enqueue({ error: { message: 'boom' } })
+    await expect(detectLeaseScheduleGap(supabase, COMPANY)).resolves.toBeNull()
   })
 })
 

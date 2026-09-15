@@ -1681,6 +1681,10 @@ export interface RecurringInvoiceScheduleItem {
   unit_price: number
   // null = inherit customer's default VAT rate at spawn time
   vat_rate: number | null
+  // Optional per-line posting-account override (BAS class 1-3), frozen-copied
+  // onto the spawned invoice_items row. null = derive from VAT treatment.
+  // Validated server-side by validate-schedule-revenue-accounts.ts.
+  revenue_account?: string | null
   // Per-item bag copied onto the generated invoice_items.dimensions; merges
   // over the schedule default on that item's revenue line.
   dimensions?: Record<string, string>

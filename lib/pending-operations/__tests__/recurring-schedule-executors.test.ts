@@ -206,6 +206,7 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: existingRow }) // existing schedule
+    enqueue({ data: null }) // lease-managed guard (no linked lease)
     // The helper re-reads the header row scoped by company_id before touching
     // the items: the items table has no company_id of its own, so this read is
     // what keeps the schedule_id-scoped delete/insert inside the tenant on the
@@ -241,16 +242,18 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
       items_replaced: true,
       item_count: 2,
     })
-    expect(supabase.from).toHaveBeenNthCalledWith(3, 'recurring_invoice_schedules')
-    expect(supabase.from).toHaveBeenNthCalledWith(4, 'recurring_invoice_schedule_items')
+    expect(supabase.from).toHaveBeenNthCalledWith(3, 'leases')
+    expect(supabase.from).toHaveBeenNthCalledWith(4, 'recurring_invoice_schedules')
     expect(supabase.from).toHaveBeenNthCalledWith(5, 'recurring_invoice_schedule_items')
     expect(supabase.from).toHaveBeenNthCalledWith(6, 'recurring_invoice_schedule_items')
+    expect(supabase.from).toHaveBeenNthCalledWith(7, 'recurring_invoice_schedule_items')
   })
 
   it('keeps existing items when items are omitted', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: existingRow }) // existing schedule
+    enqueue({ data: null }) // lease-managed guard (no linked lease)
     enqueue({ data: null }) // schedule update
     enqueue({ data: null }) // finalize
 
@@ -278,6 +281,9 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, updates } = createCapturingSupabase([
       { data: { id: 'op-recurring-1' }, error: null }, // claim
       { data: existingRow, error: null }, // existing schedule
+      // No lease-managed guard lookup: a status-only change never touches the
+      // fields the nightly resync would silently revert, so the guard skips
+      // the query entirely (see the comment above the guard in commit.ts).
       { data: null, error: null }, // schedule update
       { data: null, error: null }, // finalize
     ])
@@ -300,6 +306,7 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, updates } = createCapturingSupabase([
       { data: { id: 'op-recurring-1' }, error: null }, // claim
       { data: { ...existingRow, status: 'paused', next_run_date: '2020-01-01' }, error: null },
+      // No lease-managed guard lookup: status-only change (see above).
       { data: null, error: null }, // schedule update
       { data: null, error: null }, // finalize
     ])
@@ -327,6 +334,7 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, updates } = createCapturingSupabase([
       { data: { id: 'op-recurring-1' }, error: null }, // claim
       { data: { ...existingRow, status: 'paused' }, error: null }, // next_run_date 2999-01-25
+      // No lease-managed guard lookup: status-only change (see above).
       { data: null, error: null }, // schedule update
       { data: null, error: null }, // finalize
     ])
@@ -351,6 +359,8 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: existingRow }) // existing schedule
+    // No lease-managed guard lookup: auto_send-only change never touches the
+    // fields the nightly resync would silently revert (see commit.ts).
     enqueue({ data: { id: CUSTOMER_ID, email: null } }) // customer check
     enqueue({ data: null }) // status update
 
@@ -367,6 +377,82 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     expect(result.status).toBe('failed')
     expect(result.http_status).toBe(400)
     expect(result.error).toMatch(/email/i)
+  })
+
+  it('refuses an edit when a propmate lease links the schedule', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-recurring-1' } }) // claim
+    enqueue({ data: existingRow }) // existing schedule
+    enqueue({ data: { id: 'lease-1' } }) // lease-managed guard (linked lease found)
+    enqueue({ data: null }) // status update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp('update_recurring_schedule', {
+        schedule_id: SCHEDULE_ID,
+        changes: { name: 'Nytt namn' },
+      }),
+    )
+
+    // A 409 auto-rejects (same bucket as e.g. INVOICE_QUOTE_NOT_PAYABLE): the
+    // op is releasable rather than a hard failure, since the caller can fix
+    // it by editing the lease instead.
+    expect(result.status).toBe('rejected')
+    expect(result.auto_rejected).toBe(true)
+    expect(result.http_status).toBe(409)
+    expect(result.code).toBe('SCHEDULE_MANAGED_BY_LEASE')
+    const touchedTables = supabase.from.mock.calls.map((c) => c[0])
+    expect(touchedTables).not.toContain('recurring_invoice_schedule_items')
+  })
+
+  it('lets a status-only change through even when a propmate lease links the schedule', async () => {
+    const { supabase, updates } = createCapturingSupabase([
+      { data: { id: 'op-recurring-1' }, error: null }, // claim
+      { data: existingRow, error: null }, // existing schedule
+      // No lease-managed guard lookup at all for a status-only change: it can
+      // never be silently reverted by the resync cron, so it is safe to skip
+      // the check regardless of whether a lease actually links this schedule.
+      { data: null, error: null }, // schedule update
+      { data: null, error: null }, // finalize
+    ])
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp('update_recurring_schedule', {
+        schedule_id: SCHEDULE_ID,
+        changes: { status: 'paused' },
+      }),
+    )
+
+    expect(result.status).toBe('committed')
+    expect(updates.recurring_invoice_schedules).toEqual([{ status: 'paused' }])
+  })
+
+  it('fails closed instead of open when the lease-managed lookup itself errors', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-recurring-1' } }) // claim
+    enqueue({ data: existingRow }) // existing schedule
+    enqueue({ data: null, error: { message: 'connection reset' } }) // lease-managed guard lookup fails
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp('update_recurring_schedule', {
+        schedule_id: SCHEDULE_ID,
+        changes: { name: 'Nytt namn' },
+      }),
+    )
+
+    // Must not fall through to a committed write: a discarded PostgREST error
+    // on this lookup is exactly the fail-open bug that would let the guard's
+    // exact silent-override scenario through.
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(500)
   })
 
   it('auto-rejects when the schedule no longer exists', async () => {
@@ -424,6 +510,7 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: fullExistingRow }) // existing schedule
+    enqueue({ data: null }) // lease-managed guard (no linked lease)
     enqueue({ data: fullExistingRow }) // header snapshot
     enqueue({ data: { updated_at: '2026-07-30T09:00:00.000Z' } }) // header update
     enqueue({ data: [snapshotItem] }) // items snapshot
@@ -452,6 +539,7 @@ describe('commitPendingOperation: update_recurring_schedule', () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-recurring-1' } }) // claim
     enqueue({ data: fullExistingRow }) // existing schedule
+    enqueue({ data: null }) // lease-managed guard (no linked lease)
     enqueue({ data: fullExistingRow }) // header snapshot
     enqueue({ data: { updated_at: '2026-07-30T09:00:00.000Z' } }) // header update
     enqueue({ data: [snapshotItem] }) // items snapshot

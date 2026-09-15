@@ -377,6 +377,9 @@ describe('gnubok_update_recurring_schedule: validation and staging', () => {
     const otherCustomerId = '33333333-3333-4333-8333-333333333333'
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: currentSchedule() })
+    // customer_id is a lease-managed field, so the staging-time guard queries
+    // `leases` before the customer check; no lease links this schedule.
+    enqueue({ data: null })
     enqueue({ data: null })
 
     await expect(
@@ -387,7 +390,40 @@ describe('gnubok_update_recurring_schedule: validation and staging', () => {
         supabase as never,
       ),
     ).rejects.toThrow(/not found/i)
-    expect(supabase.from).toHaveBeenNthCalledWith(2, 'customers')
+    expect(supabase.from).toHaveBeenNthCalledWith(2, 'leases')
+    expect(supabase.from).toHaveBeenNthCalledWith(3, 'customers')
+  })
+
+  it('refuses a staged edit that touches a lease-managed field before it is ever committable', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: currentSchedule() })
+    enqueue({ data: { id: 'lease-1' } }) // lease-managed guard: linked lease found
+
+    await expect(
+      updateTool().execute(
+        { schedule_id: SCHEDULE_ID, name: 'Nytt namn' },
+        'company-1',
+        'user-1',
+        supabase as never,
+      ),
+    ).rejects.toThrow(/hyresavtal|lease/i)
+  })
+
+  it('lets a status-only staged edit through even when a lease links the schedule', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: currentSchedule() })
+    // No lease-managed guard lookup: status is exempt (see the guard's
+    // comment in server.ts), so staging never even checks for a lease.
+    enqueue({ data: { id: 'op-recurring-5' } })
+
+    const result = (await updateTool().execute(
+      { schedule_id: SCHEDULE_ID, status: 'paused' },
+      'company-1',
+      'user-1',
+      supabase as never,
+    )) as { staged: boolean }
+
+    expect(result.staged).toBe(true)
   })
 })
 

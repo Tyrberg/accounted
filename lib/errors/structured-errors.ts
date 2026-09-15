@@ -1451,6 +1451,33 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_en:
       'The recurring schedule update failed and the compensating rollback did not fully apply: the schedule may be left in a partial state (header fields and items out of sync). Inspect the schedule fields and items before retrying.',
   },
+  LEASE_SCHEDULE_DELETED: {
+    httpStatus: 409,
+    message_sv:
+      'Aviseringsschemat för det här avtalet har tagits bort på sidan Återkommande fakturor. Aviseringen är stoppad och återskapas inte automatiskt: avsluta avtalet om hyresgästen flyttat ut, eller synka igen för att medvetet skapa ett nytt schema.',
+    message_en:
+      'The recurring schedule linked to this lease was deleted on the core recurring-invoice page. Billing is stopped and will not be recreated automatically: end the lease if the tenant has moved out, or call sync again to deliberately provision a new schedule.',
+  },
+  // POST /leases/:id/sync must never hand an ended lease a new active
+  // schedule (the operator's ended-lease decision, not a deletion): if the
+  // linked schedule was also deleted, provisioning one here would resume
+  // billing a tenant the operator already ended. Distinct from
+  // LEASE_SCHEDULE_DELETED, which is about the schedule, not the lease
+  // status: an ended lease is refused before the sync engine ever runs.
+  LEASE_SYNC_ENDED: {
+    httpStatus: 409,
+    message_sv:
+      'Avtalet är avslutat och kan inte få ett nytt aktivt aviseringsschema. Sätt avtalet till aktivt igen om det avslutades av misstag, annars behövs ingen synk.',
+    message_en:
+      'The lease is ended and cannot be given a new active billing schedule. Set the lease back to active first if it was ended by mistake; otherwise no sync is needed.',
+  },
+  SCHEDULE_MANAGED_BY_LEASE: {
+    httpStatus: 409,
+    message_sv:
+      'Det här schemat styrs av ett hyresavtal och synkas om varje natt: en ändring här skulle skrivas över av nästa synk. Ändra istället avtalet (PATCH /leases/:id) så förs ändringen vidare till schemat.',
+    message_en:
+      'This schedule is managed by a lease and is resynced every night: an edit here would be silently overwritten by the next sync. Edit the lease instead (PATCH /leases/:id); the change propagates to the schedule from there.',
+  },
   // Quotes / Offerter
   QUOTE_NOT_FOUND: {
     httpStatus: 404,

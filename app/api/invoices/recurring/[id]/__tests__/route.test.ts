@@ -7,6 +7,12 @@ import { createMockRequest, parseJsonResponse } from '@/tests/helpers'
 const updatePayloads: Record<string, unknown>[] = []
 let scheduleRow: Record<string, unknown> | null = null
 let customerRow: Record<string, unknown> | null = null
+// null = no lease links this schedule (the common case in these tests, which
+// predate the propmate lease-managed guard); set per-test to exercise it.
+let leaseRow: Record<string, unknown> | null = null
+// Set per-test to exercise the guard's fail-closed handling of a PostgREST
+// error on the lease lookup itself (distinct from "no lease found").
+let leaseError: Record<string, unknown> | null = null
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const chain: any = {
@@ -23,11 +29,22 @@ const chain: any = {
   then: (resolve: (v: unknown) => void) => resolve({ error: null }),
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const leaseChain: any = {
+  select: () => leaseChain,
+  eq: () => leaseChain,
+  maybeSingle: () => Promise.resolve({ data: leaseError ? null : leaseRow, error: leaseError }),
+}
+
 const mockSupabase = {
   auth: { getUser: vi.fn() },
   // The table name is unused by the shared chain, but declared so a test can
-  // install a table-aware implementation of its own.
-  from: vi.fn((_table?: string) => chain),
+  // install a table-aware implementation of its own. 'leases' is routed
+  // separately: the PATCH handler's lease-managed guard queries it before
+  // touching recurring_invoice_schedules, and reusing `chain`'s
+  // maybeSingle() (which resolves customerRow) would wrongly trip the guard
+  // on the auto_send tests below, which set customerRow to a truthy value.
+  from: vi.fn((table?: string) => (table === 'leases' ? leaseChain : chain)),
 }
 
 vi.mock('@/lib/supabase/server', () => ({
@@ -53,6 +70,8 @@ describe('PATCH /api/invoices/recurring/[id] reactivation', () => {
     vi.clearAllMocks()
     updatePayloads.length = 0
     customerRow = null
+    leaseRow = null
+    leaseError = null
     mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
     vi.useFakeTimers()
     // 08:30 UTC = 10:30 Stockholm (CEST) -> today is 2026-07-06 in Sweden.
@@ -229,11 +248,18 @@ describe('PATCH /api/invoices/recurring/[id] combined edit rollback', () => {
     itemsInsertErrors = []
     itemsSnapshot = []
     headerExists = true
+    leaseRow = null
+    leaseError = null
     mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
 
     let headerUpdateCall = 0
     let itemsInsertCall = 0
     mockSupabase.from.mockImplementation((table?: string) => {
+      if (table === 'leases') {
+        // None of these rollback tests exercise a lease-managed schedule: no
+        // row means the guard's lookup passes through.
+        return leaseChain
+      }
       if (table === SCHEDULES) {
         const selectChain: Record<string, unknown> = {
           eq: () => selectChain,
@@ -282,9 +308,10 @@ describe('PATCH /api/invoices/recurring/[id] combined edit rollback', () => {
   })
 
   afterEach(() => {
-    // clearAllMocks does not reset implementations, so hand the shared chain
-    // back or the first describe breaks when the file order changes.
-    mockSupabase.from.mockImplementation(() => chain)
+    // clearAllMocks does not reset implementations, so hand the shared,
+    // table-aware routing back or the other describes break when the file
+    // order changes.
+    mockSupabase.from.mockImplementation((table?: string) => (table === 'leases' ? leaseChain : chain))
   })
 
   const items = [{ description: 'Rad A', quantity: 1, unit: 'st', unit_price: 1000 }]
@@ -340,6 +367,119 @@ describe('PATCH /api/invoices/recurring/[id] combined edit rollback', () => {
 
     expect(status).toBe(404)
     expect(body.type).toBe('not_found')
+    expect(updatePayloads).toHaveLength(0)
+  })
+})
+
+/**
+ * A propmate lease resyncs its linked schedule every night from the lease
+ * row (extensions/general/propmate/lib/lease-schedule-sync.ts), so an edit
+ * made here would be silently reverted before the next invoice goes out.
+ * PATCH must refuse instead of racing the cron; DELETE stays allowed (an
+ * operator deleting the schedule is the sanctioned way to stop a lease's
+ * billing, per CLAUDE.md decision log 2026-09-07).
+ */
+describe('PATCH /api/invoices/recurring/[id] lease-managed guard', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    updatePayloads.length = 0
+    customerRow = null
+    leaseError = null
+    mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
+  })
+
+  it('returns 409 SCHEDULE_MANAGED_BY_LEASE without writing when a lease links the schedule', async () => {
+    leaseRow = { id: 'lease-1' }
+    scheduleRow = { next_run_date: '2026-07-20', day_of_month: 20 }
+
+    const { status, body } = await parseJsonResponse<{ error: { code: string; details?: unknown } }>(
+      await PATCH(patchReq({ name: 'Sänkt hyra' }), params),
+    )
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('SCHEDULE_MANAGED_BY_LEASE')
+    expect(body.error.details).toEqual({ leaseId: 'lease-1' })
+    expect(updatePayloads).toHaveLength(0)
+  })
+
+  it('blocks an item-only edit on a lease-managed schedule too', async () => {
+    leaseRow = { id: 'lease-1' }
+
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await PATCH(
+        patchReq({ items: [{ description: 'Hyra', quantity: 1, unit: 'mån', unit_price: 10000 }] }),
+        params,
+      ),
+    )
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('SCHEDULE_MANAGED_BY_LEASE')
+  })
+
+  it('allows the edit through when no lease links the schedule', async () => {
+    leaseRow = null
+    scheduleRow = { next_run_date: '2026-07-20', day_of_month: 20 }
+
+    const { status } = await parseJsonResponse(await PATCH(patchReq({ name: 'Nytt namn' }), params))
+
+    expect(status).toBe(200)
+    expect(updatePayloads).toHaveLength(1)
+  })
+
+  // The nightly resync (syncLeaseToRecurringSchedule) only ever rewrites
+  // customer_id/name/day_of_month unconditionally; status and auto_send are
+  // only touched via an opt-in the cron never sets. A header-only status
+  // write (the pause button on /invoices/recurring) is therefore safe to let
+  // through even on a lease-managed schedule: it can never be silently
+  // reverted by the resync cron.
+  it('lets a header-only status PATCH through on a lease-managed schedule', async () => {
+    leaseRow = { id: 'lease-1' }
+
+    const { status } = await parseJsonResponse(await PATCH(patchReq({ status: 'paused' }), params))
+
+    expect(status).toBe(200)
+    expect(updatePayloads).toHaveLength(1)
+    expect(updatePayloads[0]).toEqual({ status: 'paused' })
+  })
+
+  it('still blocks a header-only day_of_month edit on a lease-managed schedule', async () => {
+    leaseRow = { id: 'lease-1' }
+
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await PATCH(patchReq({ day_of_month: 10 }), params),
+    )
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('SCHEDULE_MANAGED_BY_LEASE')
+    expect(updatePayloads).toHaveLength(0)
+  })
+
+  it('still blocks a header-only customer_id edit on a lease-managed schedule', async () => {
+    leaseRow = { id: 'lease-1' }
+
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await PATCH(patchReq({ customer_id: '11111111-1111-4111-8111-111111111111' }), params),
+    )
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('SCHEDULE_MANAGED_BY_LEASE')
+    expect(updatePayloads).toHaveLength(0)
+  })
+
+  it('fails closed instead of open when the lease-managed lookup itself errors', async () => {
+    leaseError = { message: 'connection reset' }
+
+    const { status } = await parseJsonResponse(
+      await PATCH(
+        patchReq({ items: [{ description: 'Hyra', quantity: 1, unit: 'mån', unit_price: 10000 }] }),
+        params,
+      ),
+    )
+
+    // Must not fall through to a 200 write: a discarded PostgREST error on
+    // this lookup is exactly the fail-open bug that would let the guard's
+    // exact silent-override scenario through.
+    expect(status).toBe(500)
     expect(updatePayloads).toHaveLength(0)
   })
 })

@@ -321,6 +321,64 @@ export async function detectBackupFailing(
 }
 
 /**
+ * lease_schedule_gap: an active propmate lease whose linked recurring-invoice
+ * schedule was deleted on the core recurring-invoice page. The sync engine
+ * (extensions/general/propmate/lib/lease-schedule-sync.ts) deliberately
+ * refuses to auto-recreate it: an operator's delete must stick, not get
+ * fought every night by the resync cron (CLAUDE.md decision log, 2026-09-07
+ * operator answer). But that refusal must never be a SILENT stop: a lease
+ * left in this state generates no invoices at all until a human either ends
+ * the lease or explicitly resyncs it (POST /leases/:id/sync). Reads the
+ * leases table directly (core must not import from @/extensions/; propmate's
+ * schema lives in the migration, mirrored here the same way
+ * detectBackupFailing mirrors cloud-backup's extension_data shape).
+ * recurring_schedule_id IS NULL alone is ambiguous (also true of a lease
+ * that's simply never been synced yet); last_synced_at IS NOT NULL is what
+ * narrows it to "was synced, now unlinked", exactly the sync engine's own
+ * discriminator.
+ */
+export async function detectLeaseScheduleGap(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<Notice | null> {
+  try {
+    if (!ENABLED_EXTENSION_IDS.has('propmate')) return null
+    const { data, error } = await supabase
+      .from('leases')
+      .select('id, property_name, unit_description')
+      .eq('company_id', companyId)
+      .eq('status', 'active')
+      .is('recurring_schedule_id', null)
+      .not('last_synced_at', 'is', null)
+    if (error) return logAndNull('lease_schedule_gap', companyId, error)
+    const rows = (data ?? []) as { id: string; property_name: string; unit_description: string | null }[]
+    if (rows.length === 0) return null
+    // The lease id set discriminates: the SAME gap stays dismissed while it
+    // persists, and a NEW lease entering the gap state changes the id so it
+    // resurfaces even if an old dismissal is still on file.
+    const discriminator = boundedDiscriminator(rows.map((r) => r.id))
+    const label = rows[0].unit_description
+      ? `${rows[0].property_name} - ${rows[0].unit_description}`
+      : rows[0].property_name
+    return {
+      id: `lease_schedule_gap:${discriminator}`,
+      category: 'lease_schedule_gap',
+      severity: 'error',
+      messageKey: rows.length === 1 ? 'lease_schedule_gap_one' : 'lease_schedule_gap_many',
+      messageParams: rows.length === 1 ? { lease: label } : { count: rows.length },
+      actionKey: 'lease_schedule_gap_action',
+      actionHref: '/invoices/recurring',
+    }
+  } catch (err) {
+    return logAndNull(
+      'lease_schedule_gap',
+      companyId,
+      err instanceof Error ? { message: err.message } : null,
+    )
+  }
+}
+
+/**
  * other_account_hint: the wrong-login nudge (#1231). Delegates the detection
  * to lib/company/other-account-hint (which already fails soft to false); this
  * wrapper only shapes it as the lowest-priority notice. The id carries no
