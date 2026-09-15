@@ -107,6 +107,12 @@ function NewRecurringScheduleForm({
         .union([z.literal(0), z.literal(6), z.literal(12), z.literal(25)])
         .nullable()
         .optional(),
+      // Not user-editable here: this dialog has no input for it. Carried
+      // through prefill -> submit only so an existing per-line posting-account
+      // override (set by propmate's lease sync or the MCP staged-op executor)
+      // survives an edit instead of being silently overwritten with null, see
+      // lib/invoices/apply-recurring-schedule-update.ts.
+      revenue_account: z.string().nullable().optional(),
     })
     return z.object({
       customer_id: z.string().uuid(t('validation_customer_required')),
@@ -158,6 +164,7 @@ function NewRecurringScheduleForm({
                     unit: it.unit,
                     unit_price: it.unit_price,
                     vat_rate: (it.vat_rate as 0 | 6 | 12 | 25 | null) ?? null,
+                    revenue_account: it.revenue_account ?? null,
                   }))
               : [{ description: '', quantity: 1, unit: 'st', unit_price: 0, vat_rate: 25 }],
         }
