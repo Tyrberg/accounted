@@ -271,6 +271,26 @@
           "reason": "Upstream's namespace reappeared somewhere in this file, which means a future push will fail the same installation-does-not-exist error this adaptation exists to fix."
         }
       ]
+    },
+    {
+      "id": "docker-extensions-preset-underlagsjakt",
+      "tier": 2,
+      "summary": "docker/extensions.self-hosted.json lists underlagsjakt, so the published image actually contains the extension.",
+      "why": "The Dockerfile copies docker/extensions.<preset>.json over the repo-root extensions.config.json and then runs setup:extensions, so the registration that underlagsjakt-extension makes in extensions.config.json is discarded at image build time. Without this line the extension is in the source tree and green in the fork's tests, but absent from every image we publish: on the first deploy of our own image on 2026-09-17 the operator found no Underlagsjakt entry in the UI, and the running container had no extensions.config.json containing it. upstream.status is not-applicable: the preset is upstream's list of the extensions it ships, and this one is ours.",
+      "paths": ["docker/extensions.self-hosted.json"],
+      "tracked": true,
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "docker/extensions.self-hosted.json",
+          "pattern": "\"underlagsjakt\"",
+          "reason": "The image build reads this preset, not extensions.config.json. If underlagsjakt falls out of it the extension silently disappears from the deployed app while every other check stays green."
+        }
+      ],
+      "branch": "main"
     }
   ]
 }
