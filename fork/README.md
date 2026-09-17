@@ -545,3 +545,5 @@ it cannot be mistaken for done.
 | The 611-migration schema jump, if any environment is still on the old schema | Follows from q657-1  |
 | Revoke and remove the GitLab `glpat-` token       | Whoever has GitLab admin, per section 9       |
 | Archive the GitLab project as read-only           | Same                                          |
+| Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Mattias, after this fork is deployed to his instance. Until then no real post has been shown there |
+| Underlagsjakt: teach the extension bertil's next contract version once bertil#180 (the `reglering` field) is merged; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
