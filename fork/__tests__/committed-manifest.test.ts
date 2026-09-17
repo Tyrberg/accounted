@@ -46,6 +46,19 @@ const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
     'docker/cron.Dockerfile',
     'scripts/__tests__/generate-crontabs.test.ts',
   ],
+  'underlagsjakt-extension': [
+    'extensions/general/underlagsjakt/',
+    'components/extensions/general/UnderlagsjaktWorkspace.tsx',
+    'components/extensions/general/underlagsjakt/',
+    'extensions.config.json',
+    'lib/extensions/_generated/enabled-extensions.ts',
+    'lib/extensions/_generated/extension-list.ts',
+    'lib/extensions/_generated/sector-definitions.ts',
+    'lib/extensions/_generated/workspace-map.tsx',
+    'lib/extensions/__tests__/sectors.test.ts',
+    'messages/sv.json',
+    'messages/en.json',
+  ],
 }
 
 function findUnreviewedPaths(adaptations: typeof manifest.adaptations): string[] {
@@ -118,7 +131,7 @@ describe('the committed manifest', () => {
     // a file at that same path, which is exactly the collision each
     // adaptation's `why` claims to guard against. Every such adaptation needs
     // an `upstream-absent` check, not just a `local-*` one.
-    const wholesaleNewFileIds = ['fork-maintenance-layer', 'sie-migration-validation']
+    const wholesaleNewFileIds = ['fork-maintenance-layer', 'sie-migration-validation', 'underlagsjakt-extension']
 
     for (const id of wholesaleNewFileIds) {
       const adaptation = manifest.adaptations.find((candidate) => candidate.id === id)
@@ -145,6 +158,7 @@ describe('the committed manifest', () => {
       'fork-maintenance-layer',
       'sie-migration-validation',
       'docker-cron-entrypoint-hardening',
+      'underlagsjakt-extension',
     ]
 
     for (const id of multiPathAdaptationIds) {
@@ -190,6 +204,12 @@ describe('the committed manifest', () => {
     //   ENTRYPOINT literal: without it declared too, a future upstream merge
     //   that drops the guard goes undetected while the Dockerfile check alone
     //   stays green.
+    // - underlagsjakt-extension: a tier 1 extension (Mattias decision
+    //   2026-09-17). Its code is new files only, but enabling it through the
+    //   extension seam modifies extensions.config.json, the committed registry
+    //   under lib/extensions/_generated/ and the pinned count in
+    //   lib/extensions/__tests__/sectors.test.ts, and its UI strings must live
+    //   in messages/*.json (the message-keys test); each is named on purpose.
     expect(findUnreviewedPaths(manifest.adaptations)).toEqual([])
   })
 

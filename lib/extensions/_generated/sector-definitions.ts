@@ -196,5 +196,26 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "hasOwnData": true,
           "subscriptionNotice": "Kräver ett Google-konto. Varje brevlåda kopplas av sin egen ägare och kan kopplas från när som helst."
     },
+    {
+          "slug": "underlagsjakt",
+          "name": "Underlagsjakt",
+          "sector": "general",
+          "category": "operations",
+          "icon": "TextSearch",
+          "dataPattern": "manual",
+          "description": "Svara på bertils frågor om utbetalningar som saknar underlag: rätt faktura, annat bolag eller osäker",
+          "longDescription": "Läs in exporten från bertils underlagsjakt. Varje utbetalning som saknar underlag visas med läsbart kontonamn, datum, belopp, motpart och de dokument som kan höra till den, med bevisgrunden i klartext. Välj rätt dokument, ange att betalningen gäller ett annat bolag eller skjut upp frågan. Svaren laddas ned som en svarsfil som bertil läser in och lär sig av, så att samma motpart känns igen nästa månad. Ingenting bokförs här.",
+          "readsCoreTables": [
+                "company_members"
+          ],
+          "hasOwnData": true,
+          "quickAction": {
+                "label": "Underlagsjakt",
+                "description": "Svara på bertils frågor om underlag",
+                "icon": "TextSearch",
+                "href": "/e/general/underlagsjakt",
+                "order": 40
+          }
+    },
   ],
 }
