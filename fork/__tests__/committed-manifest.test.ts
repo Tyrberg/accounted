@@ -42,6 +42,7 @@ const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
     'lib/import/sie-migration-validation.ts',
     'lib/import/__tests__/sie-migration-validation.test.ts',
   ],
+  'docker-extensions-preset-underlagsjakt': ['docker/extensions.self-hosted.json'],
   'docker-publish-ghcr-namespace': ['.github/workflows/docker-publish.yml'],
   'docker-cron-entrypoint-hardening': [
     'docker/cron.Dockerfile',
@@ -217,6 +218,12 @@ describe('the committed manifest', () => {
     //   does not have, so every publish failed at push-by-digest and the fork
     //   never produced an image at all. IMAGE_NAME has to name a namespace we
     //   own; the file is upstream's, so the path is named here on purpose.
+    // - docker-extensions-preset-underlagsjakt: the image build copies
+    //   docker/extensions.<preset>.json over extensions.config.json, so the
+    //   underlagsjakt-extension registration is discarded at build time and
+    //   the extension is missing from every published image. Found on the
+    //   first deploy of our own image (2026-09-17): green tests, no entry in
+    //   the UI. The preset is upstream's file, so the path is named here.
     expect(findUnreviewedPaths(manifest.adaptations)).toEqual([])
   })
 
