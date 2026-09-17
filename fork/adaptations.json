@@ -245,6 +245,32 @@
           "reason": "An upstream merge dropped the underlagsjakt namespace from the English messages, so the workspace renders raw keys."
         }
       ]
+    },
+    {
+      "id": "docker-publish-ghcr-namespace",
+      "tier": 2,
+      "summary": "docker-publish.yml publishes to ghcr.io/tyrberg/accounted instead of upstream's ghcr.io/erp-mafia/gnubok.",
+      "why": "Upstream's GHCR namespace is scoped to the erp-mafia GitHub App installation, which this fork does not have. Every push to main since 2026-09-05 has failed both platform builds identically at the push-by-digest step, before either platform reaches the merge job (runs 35246610958 on 2026-09-17, 33984840175 and 33955376313 on 2026-09-05): 'ERROR: failed to build: failed to solve: failed to push ghcr.io/erp-mafia/gnubok: denied: permission_denied: The requested installation does not exist.' The fork can only push under a namespace it owns, so IMAGE_NAME moves to tyrberg/accounted: it matches this fork's actual GitHub repo, Tyrberg/accounted, rather than the old gnubok codename upstream still uses for the image itself. Every other reference in this workflow (metadata extraction, the push-by-digest outputs line, the per-arch buildcache cache-from/cache-to tags, the sentinel-verification digest lookup, the merge job's tag list, imagetools create/inspect, cosign sign, the Trivy image-ref) resolves through the IMAGE_NAME env var, either as the workflow expression env.IMAGE_NAME or as the shell variable of the same name, so the one env line is the whole fix; confirmed by grep that no other line in this file hardcodes erp-mafia/gnubok. It modifies an upstream-owned file (.github/workflows/docker-publish.yml), so it is a genuine tier 2 patch. Like docker-cron-entrypoint-hardening it lands directly on main rather than on a dedicated fork/patches branch: a repeat of the same documented deviation from the fork/README.md section 4 procedure, because standing up a whole patch-series branch for a one-line env value is out of proportion. This will never go upstream (upstream's own namespace is correct for upstream), so upstream.status is not-applicable rather than planned.",
+      "paths": [".github/workflows/docker-publish.yml"],
+      "tracked": true,
+      "branch": "main",
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": ".github/workflows/docker-publish.yml",
+          "pattern": "^  IMAGE_NAME: tyrberg/accounted$",
+          "reason": "The image namespace no longer reads tyrberg/accounted, so a push either targets upstream's namespace again (denied: permission_denied: The requested installation does not exist) or some other value nothing here has verified."
+        },
+        {
+          "kind": "local-absent",
+          "path": ".github/workflows/docker-publish.yml",
+          "pattern": "erp-mafia/gnubok",
+          "reason": "Upstream's namespace reappeared somewhere in this file, which means a future push will fail the same installation-does-not-exist error this adaptation exists to fix."
+        }
+      ]
     }
   ]
 }
