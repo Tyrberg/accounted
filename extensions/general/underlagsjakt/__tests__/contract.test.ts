@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import fixture from './fixtures/export-1.1.json'
+import fixture14 from './fixtures/export-1.4.json'
 import {
   ANSWER_VERSION,
   buildAnswerFile,
@@ -17,13 +18,13 @@ import {
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T
 
-function posts(): Post[] {
-  const parsed = parseExport(clone(fixture))
+function posts(fx: typeof fixture = fixture): Post[] {
+  const parsed = parseExport(clone(fx))
   if (!parsed.ok) throw new Error('fixture must parse')
   return parsed.export.sammanstallningar.flatMap((s) => s.posts)
 }
 
-const post = (id: string) => posts().find((p) => p.transaction_id === id)!
+const post = (id: string, fx?: typeof fixture) => posts(fx).find((p) => p.transaction_id === id)!
 
 describe('parseExport', () => {
   it('reads the CLI wrapper at version 1.1', () => {
@@ -42,9 +43,14 @@ describe('parseExport', () => {
     expect(parsed.export.export_version).toBe('1.1')
   })
 
-  it.each([['1.0'], ['1.2'], ['2.0']])('refuses export version %s instead of guessing', (version) => {
+  it.each([['1.0'], ['2.0'], ['0.9']])('refuses export version %s instead of guessing', (version) => {
     const raw = { ...clone(fixture), export_version: version }
     expect(parseExport(raw)).toEqual({ ok: false, code: 'UNSUPPORTED_VERSION', version })
+  })
+
+  it('accepts a newer minor version within the same major (new fields are additive)', () => {
+    const raw = { ...clone(fixture), export_version: '1.5' }
+    expect(parseExport(raw).ok).toBe(true)
   })
 
   it('refuses a file without a version', () => {
@@ -72,6 +78,22 @@ describe('parseExport', () => {
 
   it('accepts forslag: null, as bertil writes it when it has no suggestion', () => {
     expect(post('tx-ocr-20260812').forslag).toBeNull()
+  })
+
+  it('reads a 1.4 export with new fields (reglering, leverantor_sokord)', () => {
+    const parsed = parseExport(clone(fixture14))
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.export.export_version).toBe('1.4')
+    expect(parsed.export.sammanstallningar).toHaveLength(2)
+    expect(parsed.export.sammanstallningar[0].posts).toHaveLength(3)
+  })
+
+  it('ignores unknown fields in 1.4 posts (leverantor_sokord, reglering)', () => {
+    const moankPost = post('tx-moank-20260821', fixture14)
+    const googlePost = post('tx-google-20260803', fixture14)
+    expect(moankPost.transaction_id).toBe('tx-moank-20260821')
+    expect(googlePost.transaction_id).toBe('tx-google-20260803')
   })
 })
 
@@ -223,7 +245,7 @@ describe('buildBeslut', () => {
     expect(result).toEqual({ ok: false, code: 'CANDIDATE_WITHOUT_HASH' })
   })
 
-  it('keeps the settlement out of a 1.1 fel_bolag beslut but returns it for local storage', () => {
+  it('stores the settlement in a fel_bolag beslut when company is known', () => {
     const p = post('tx-moank-20260821')
     const result = buildBeslut(p, {
       svarstyp: 'fel_bolag',
@@ -240,6 +262,7 @@ describe('buildBeslut', () => {
         svarstyp: 'fel_bolag',
         fel_bolag_mottagare: 'Villa Viola AB',
         till_bolag: 'Villa Viola',
+        reglering: 'mellanhavande',
       },
     })
   })
@@ -255,8 +278,48 @@ describe('buildBeslut', () => {
 })
 
 describe('buildAnswerFile', () => {
-  it('writes the answer version bertil accepts file choices from', () => {
-    expect(ANSWER_VERSION).toBe('1.1')
-    expect(buildAnswerFile([])).toEqual({ version: '1.1', beslut: [] })
+  it('writes the answer version with reglering support', () => {
+    expect(ANSWER_VERSION).toBe('1.4')
+    expect(buildAnswerFile([])).toEqual({ version: '1.4', beslut: [] })
+  })
+
+  it('includes reglering in fel_bolag beslut', () => {
+    const p = post('tx-moank-20260821')
+    const result = buildBeslut(p, {
+      svarstyp: 'fel_bolag',
+      transaction_id: p.transaction_id,
+      fel_bolag_mottagare: 'Villa Viola AB',
+      till_bolag: 'Villa Viola',
+      reglering: 'mellanhavande',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.beslut).toEqual({
+      transaction_id: 'tx-moank-20260821',
+      svarstyp: 'fel_bolag',
+      fel_bolag_mottagare: 'Villa Viola AB',
+      till_bolag: 'Villa Viola',
+      reglering: 'mellanhavande',
+    })
+  })
+
+  it('omits reglering from fel_bolag when company is unknown', () => {
+    const p = post('tx-moank-20260821')
+    const result = buildBeslut(p, {
+      svarstyp: 'fel_bolag',
+      transaction_id: p.transaction_id,
+      fel_bolag_mottagare: 'Villa Viola AB',
+      till_bolag: null,
+      reglering: null,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.beslut).toEqual({
+      transaction_id: 'tx-moank-20260821',
+      svarstyp: 'fel_bolag',
+      fel_bolag_mottagare: 'Villa Viola AB',
+      till_bolag: null,
+    })
+    expect(result.beslut).not.toHaveProperty('reglering')
   })
 })

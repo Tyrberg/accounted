@@ -4,6 +4,7 @@ import { underlagsjaktExtension } from '@/extensions/general/underlagsjakt'
 import { createMockRequest, parseJsonResponse } from '@/tests/helpers'
 import type { ExtensionContext } from '@/lib/extensions/types'
 import fixture from './fixtures/export-1.1.json'
+import fixture14 from './fixtures/export-1.4.json'
 
 const writePermission = vi.fn()
 vi.mock('@/lib/auth/require-write', () => ({
@@ -117,7 +118,7 @@ describe('GET /', () => {
     expect(status).toBe(200)
     expect(body.data.export).toBeNull()
     expect(body.data.posts).toEqual([])
-    expect(body.data.supported_export_versions).toEqual(['1.1'])
+    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4'])
   })
 })
 
@@ -133,11 +134,13 @@ describe('POST /export', () => {
 
   it('returns 400 UNSUPPORTED_VERSION and stores nothing for an unknown contract version', async () => {
     const ctx = buildCtx()
-    const { status, body } = await parseJsonResponse<{ error: { code: string; version: string } }>(
+    const { status, body } = await parseJsonResponse<{ error: { code: string; version: string; message: string } }>(
       await route('POST', '/export').handler(post('/export', { ...fixture, export_version: '1.0' }), ctx),
     )
     expect(status).toBe(400)
     expect(body.error).toMatchObject({ code: 'UNSUPPORTED_VERSION', version: '1.0' })
+    expect(body.error.message).toContain('Exportversion 1.0 stöds inte')
+    expect(body.error.message).toContain('Stödda versioner: 1.1, 1.2, 1.3, 1.4')
     expect(store.size).toBe(0)
   })
 
@@ -147,6 +150,19 @@ describe('POST /export', () => {
     )
     expect(status).toBe(400)
     expect(body.error.code).toBe('INVALID_EXPORT')
+  })
+
+  it('accepts a 1.4 export with new fields (reglering, leverantor_sokord)', async () => {
+    const ctx = buildCtx()
+    const res = await route('POST', '/export').handler(post('/export', fixture14), ctx)
+    const { status, body: imported } = await parseJsonResponse<{ data: { posts: number; export_version: string } }>(res)
+    expect(status).toBe(200)
+    expect(imported.data.posts).toBe(3)
+    expect(imported.data.export_version).toBe('1.4')
+
+    const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(body.data.export?.export_version).toBe('1.4')
+    expect(body.data.bolag_choices).toEqual(['Tyrberg Fastigheter', 'Tyrberg Group'])
   })
 
   it('stores the export and shows each post with readable account and evidence', async () => {
@@ -251,13 +267,14 @@ describe('POST /svar', () => {
     const file = await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx)
     expect(file.headers.get('Content-Disposition')).toMatch(/attachment; filename="underlagsjakt-svar-.*\.json"/)
     expect(await file.json()).toEqual({
-      version: '1.1',
+      version: '1.4',
       beslut: [
         {
           transaction_id: 'tx-moank-20260821',
           svarstyp: 'fel_bolag',
           fel_bolag_mottagare: 'Villa Viola AB',
           till_bolag: 'Villa Viola',
+          reglering: 'vidarefakturera',
         },
       ],
     })

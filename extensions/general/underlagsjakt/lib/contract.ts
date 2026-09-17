@@ -16,10 +16,18 @@
 import { z } from 'zod'
 import { accountNumberSchema } from '@/lib/invariants/zod'
 
-/** Export versions this extension reads. Anything else is refused, never guessed at. */
-export const SUPPORTED_EXPORT_VERSIONS = ['1.1'] as const
-/** Answer version this extension writes. 1.1 is the first that can carry a file choice (sha256). */
-export const ANSWER_VERSION = '1.1'
+/**
+ * Version range this extension reads. Only the major component is bounded on
+ * both ends: a minor bump within a supported major adds optional fields only
+ * (see "Forward Compatibility" in the schema doc), so it is accepted even
+ * before this file has ever seen it. A different major is refused outright.
+ */
+export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
+export const MAX_SUPPORTED_EXPORT_VERSION = '1.4'
+/** Export versions this extension has been built and tested against, for error messages. */
+export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
+/** Answer version this extension writes. 1.4 adds reglering to fel_bolag and val_kandidat beslut. */
+export const ANSWER_VERSION = '1.4'
 
 /** `SVARSKATEGORIER` in bertil. */
 export const KATEGORIER = [
@@ -40,9 +48,7 @@ export type Momstyp = (typeof MOMSTYPER)[number]
 
 /**
  * How a wrong-company payment should be settled. Mattias decision 2026-09-17.
- * NOT part of contract 1.1: bertil#180 adds it under a new contract version.
- * Until this extension is taught that version, the value is kept here and
- * shown in the re-billing view, but left out of the answer file.
+ * Added to export in 1.2 (bertil#180), included in answer schema from 1.4.
  */
 export const REGLERINGAR = ['vidarefakturera', 'mellanhavande'] as const
 export type Reglering = (typeof REGLERINGAR)[number]
@@ -55,70 +61,81 @@ export function isValidSha256(value: string | null | undefined): value is string
   return typeof value === 'string' && SHA256_RE.test(value)
 }
 
-const kandidatSchema = z.object({
-  filnamn: z.string(),
-  kalla: z.string(),
-  datum: z.string().nullable(),
-  bevisgrund: z.string(),
-  sha256: z.string(),
-})
+const kandidatSchema = z
+  .object({
+    filnamn: z.string(),
+    kalla: z.string(),
+    datum: z.string().nullable(),
+    bevisgrund: z.string(),
+    sha256: z.string(),
+  })
+  .passthrough()
 export type Kandidat = z.infer<typeof kandidatSchema>
 
-const postSchema = z.object({
-  bolag: z.string(),
-  period: z.string(),
-  transaction_id: z.string().min(1),
-  datum: z.string(),
-  belopp: z.number(),
-  valuta: z.string(),
-  motpart: z.string(),
-  konto_identitet: z.string(),
-  typ: z.string(),
-  saldo: z.number().nullable(),
-  kategori: z.enum(POST_KATEGORIER),
-  // The doc shows an object; bertil's exporter writes null when foresla() had nothing.
-  forslag: z
-    .object({
-      kategori: z.string(),
-      varfor: z.string(),
-      bas_konto: z.string().nullable(),
-      momstyp: z.string().nullable(),
-    })
-    .nullable(),
-  kandidater: z.array(kandidatSchema),
-  tvetydiga_alternativ: z.array(kandidatSchema),
-  mottagare: z.string().nullable(),
-})
+const postSchema = z
+  .object({
+    bolag: z.string(),
+    period: z.string(),
+    transaction_id: z.string().min(1),
+    datum: z.string(),
+    belopp: z.number(),
+    valuta: z.string(),
+    motpart: z.string(),
+    konto_identitet: z.string(),
+    typ: z.string(),
+    saldo: z.number().nullable(),
+    kategori: z.enum(POST_KATEGORIER),
+    // The doc shows an object; bertil's exporter writes null when foresla() had nothing.
+    forslag: z
+      .object({
+        kategori: z.string(),
+        varfor: z.string(),
+        bas_konto: z.string().nullable(),
+        momstyp: z.string().nullable(),
+      })
+      .passthrough()
+      .nullable(),
+    kandidater: z.array(kandidatSchema),
+    tvetydiga_alternativ: z.array(kandidatSchema),
+    mottagare: z.string().nullable(),
+  })
+  .passthrough()
 export type Post = z.infer<typeof postSchema>
 
-const sammanfattningSchema = z.object({
-  totalt: z.number(),
-  med_underlag: z.number(),
-  hittad_i_mejl: z.number(),
-  sjalvforklarande: z.number(),
-  inlard_regel: z.number(),
-  behover_mattias: z.number(),
-  tvetydig: z.number(),
-  fel_bolag: z.number(),
-  uppskjuten: z.number(),
-  lost_svar: z.number(),
-})
+const sammanfattningSchema = z
+  .object({
+    totalt: z.number(),
+    med_underlag: z.number(),
+    hittad_i_mejl: z.number(),
+    sjalvforklarande: z.number(),
+    inlard_regel: z.number(),
+    behover_mattias: z.number(),
+    tvetydig: z.number(),
+    fel_bolag: z.number(),
+    uppskjuten: z.number(),
+    lost_svar: z.number(),
+  })
+  .passthrough()
 
-const sammanstallningSchema = z.object({
-  export_version: z.string(),
-  bolag: z.string(),
-  period: z.string(),
-  generated_at: z.string(),
-  sammanfattning: sammanfattningSchema,
-  posts: z.array(postSchema),
-})
+const sammanstallningSchema = z
+  .object({
+    export_version: z.string(),
+    bolag: z.string(),
+    period: z.string(),
+    generated_at: z.string(),
+    sammanfattning: sammanfattningSchema,
+    posts: z.array(postSchema),
+  })
+  .passthrough()
 export type Sammanstallning = z.infer<typeof sammanstallningSchema>
 
-const wrapperSchema = z.object({
-  export_version: z.string(),
-  generated_at: z.string(),
-  sammanstallningar: z.array(sammanstallningSchema),
-})
+const wrapperSchema = z
+  .object({
+    export_version: z.string(),
+    generated_at: z.string(),
+    sammanstallningar: z.array(sammanstallningSchema),
+  })
+  .passthrough()
 
 export interface ParsedExport {
   export_version: string
@@ -140,7 +157,14 @@ function readVersion(raw: unknown): string | null {
 }
 
 function isSupported(version: string | null): boolean {
-  return version !== null && (SUPPORTED_EXPORT_VERSIONS as readonly string[]).includes(version)
+  if (!version) return false
+  const [minMajor, minMinor] = MIN_SUPPORTED_EXPORT_VERSION.split('.').map((x) => parseInt(x, 10))
+  const [maxMajor] = MAX_SUPPORTED_EXPORT_VERSION.split('.').map((x) => parseInt(x, 10))
+  const [vMajor, vMinor] = version.split('.').map((x) => parseInt(x, 10))
+  if (!Number.isFinite(vMajor) || !Number.isFinite(vMinor)) return false
+  if (vMajor < minMajor || vMajor > maxMajor) return false
+  if (vMajor === minMajor && vMinor < minMinor) return false
+  return true
 }
 
 /**
@@ -193,7 +217,7 @@ export function candidatesOf(post: Post): Kandidat[] {
 
 // ── Answers ──────────────────────────────────────────────────
 
-/** One entry in `beslut`, exactly as the 1.1 answer schema lists it. */
+/** One entry in `beslut`, as the answer schema lists it (1.4 includes reglering). */
 export type Beslut =
   | {
       transaction_id: string
@@ -208,12 +232,14 @@ export type Beslut =
       bolag: string | null
       bankkonto: string | null
       belopp: number | null
+      reglering?: Reglering | null
     }
   | {
       transaction_id: string
       svarstyp: 'fel_bolag'
       fel_bolag_mottagare: string
       till_bolag: string | null
+      reglering?: Reglering | null
     }
   | { transaction_id: string; svarstyp: 'osaker' }
 
@@ -266,6 +292,7 @@ export function buildBeslut(post: Post, input: SvarInput): BuildBeslutResult {
   if (input.svarstyp === 'osaker') {
     return { ok: true, beslut: { transaction_id, svarstyp: 'osaker' }, reglering: null }
   }
+  const regleringSvar = input.svarstyp === 'fel_bolag' && input.till_bolag !== null ? input.reglering : null
   if (input.svarstyp === 'fel_bolag') {
     return {
       ok: true,
@@ -274,8 +301,9 @@ export function buildBeslut(post: Post, input: SvarInput): BuildBeslutResult {
         svarstyp: 'fel_bolag',
         fel_bolag_mottagare: input.fel_bolag_mottagare,
         till_bolag: input.till_bolag,
+        ...(regleringSvar !== null ? { reglering: regleringSvar } : {}),
       },
-      reglering: input.till_bolag === null ? null : input.reglering,
+      reglering: regleringSvar,
     }
   }
 
