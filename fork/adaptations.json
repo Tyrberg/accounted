@@ -193,8 +193,8 @@
         {
           "kind": "local-contains",
           "path": "extensions.config.json",
-          "pattern": "\"underlagsjakt\"",
-          "reason": "An upstream merge dropped underlagsjakt from the enabled extensions: the code is still here but nothing loads it."
+          "pattern": "\"underlagsjakt\"|\"extensions\":\\[\\]",
+          "reason": "An upstream merge dropped underlagsjakt from the enabled extensions while other extensions stayed: the code is still here but nothing loads it. (The second branch is core-build.yml's own zero-extensions reset, .github/actions/setup-core, which legitimately empties this file before every checks/build/test job; it clears every extension at once, so it cannot be confused with a real drop of this one.)"
         },
         {
           "kind": "upstream-contains",
@@ -205,26 +205,26 @@
         {
           "kind": "local-contains",
           "path": "lib/extensions/_generated/enabled-extensions.ts",
-          "pattern": "'underlagsjakt'",
-          "reason": "The committed registry no longer lists underlagsjakt: rerun npm run setup:extensions."
+          "pattern": "'underlagsjakt'|new Set\\(\\[\\s*\\]\\)",
+          "reason": "The committed registry no longer lists underlagsjakt while other extensions stayed: rerun npm run setup:extensions. (The second branch is core-build.yml's zero-extensions reset, which regenerates this file from an empty extensions.config.json for every checks/build/test job; that empties every extension at once, so it cannot be confused with a real drop of just this one.)"
         },
         {
           "kind": "local-contains",
           "path": "lib/extensions/_generated/extension-list.ts",
-          "pattern": "underlagsjaktExtension",
-          "reason": "The committed registry no longer imports the extension: rerun npm run setup:extensions."
+          "pattern": "underlagsjaktExtension|FIRST_PARTY_EXTENSIONS: Extension\\[\\] = \\[\\s*\\]",
+          "reason": "The committed registry no longer imports the extension while other extensions stayed: rerun npm run setup:extensions. (The second branch is core-build.yml's zero-extensions reset; see the enabled-extensions.ts check above.)"
         },
         {
           "kind": "local-contains",
           "path": "lib/extensions/_generated/sector-definitions.ts",
-          "pattern": "\"slug\": \"underlagsjakt\"",
-          "reason": "The extension is missing from the extension list: rerun npm run setup:extensions."
+          "pattern": "\"slug\": \"underlagsjakt\"|EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition\\[\\]> = \\{\\s*\\}",
+          "reason": "The extension is missing from the extension list while other extensions stayed: rerun npm run setup:extensions. (The second branch is core-build.yml's zero-extensions reset; see the enabled-extensions.ts check above.)"
         },
         {
           "kind": "local-contains",
           "path": "lib/extensions/_generated/workspace-map.tsx",
-          "pattern": "UnderlagsjaktWorkspace",
-          "reason": "The workspace is no longer mapped, so /e/general/underlagsjakt has no page: rerun npm run setup:extensions."
+          "pattern": "UnderlagsjaktWorkspace|WORKSPACES: Record<string, ComponentType<WorkspaceComponentProps>> = \\{\\s*\\}",
+          "reason": "The workspace is no longer mapped, so /e/general/underlagsjakt has no page, while other extensions stayed: rerun npm run setup:extensions. (The second branch is core-build.yml's zero-extensions reset; see the enabled-extensions.ts check above.)"
         },
         {
           "kind": "local-contains",
