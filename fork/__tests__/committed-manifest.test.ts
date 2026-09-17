@@ -42,6 +42,7 @@ const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
     'lib/import/sie-migration-validation.ts',
     'lib/import/__tests__/sie-migration-validation.test.ts',
   ],
+  'docker-publish-ghcr-namespace': ['.github/workflows/docker-publish.yml'],
   'docker-cron-entrypoint-hardening': [
     'docker/cron.Dockerfile',
     'scripts/__tests__/generate-crontabs.test.ts',
