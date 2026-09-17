@@ -211,6 +211,12 @@ describe('the committed manifest', () => {
     //   under lib/extensions/_generated/ and the pinned count in
     //   lib/extensions/__tests__/sectors.test.ts, and its UI strings must live
     //   in messages/*.json (the message-keys test); each is named on purpose.
+    // - docker-publish-ghcr-namespace: a tier 2 one-line change to
+    //   .github/workflows/docker-publish.yml (Mattias decision 2026-09-17).
+    //   Upstream's GHCR namespace is scoped to an App installation this fork
+    //   does not have, so every publish failed at push-by-digest and the fork
+    //   never produced an image at all. IMAGE_NAME has to name a namespace we
+    //   own; the file is upstream's, so the path is named here on purpose.
     expect(findUnreviewedPaths(manifest.adaptations)).toEqual([])
   })
 
