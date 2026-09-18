@@ -25,7 +25,6 @@ import {
   type Reglering,
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
-import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 import {
   EXTERNAL,
   NONE,
@@ -34,6 +33,7 @@ import {
   PAYER,
   UNKNOWN,
   buildAnswerInput,
+  deriveTillBolag,
   interpretSaveResult,
 } from './shared'
 
@@ -80,17 +80,9 @@ export function PostAnswerPanel({
 
   const basKontoValid = basKonto.trim() === '' || isAccountNumber(basKonto.trim())
 
-  // Derived only for what to render (e.g. whether the "same company" recipient option is
-  // available yet); buildAnswerInput derives its own copy from the same raw choices for
-  // validation, so the missing-field hint can never drift from what's actually rendered.
-  const tillBolag: string | null | undefined =
-    tillBolagChoice === undefined
-      ? undefined
-      : tillBolagChoice === UNKNOWN
-        ? null
-        : tillBolagChoice === EXTERNAL
-          ? externalBolag.trim() || undefined
-          : tillBolagChoice
+  // Same derivation buildAnswerInput uses for validation, so what's rendered (the "same
+  // company" recipient option, the settlement fieldset) can never drift from what's required.
+  const tillBolag = deriveTillBolag(tillBolagChoice, externalBolag)
 
   const otherCompanies = bolagChoices.filter((b) => b.toLowerCase() !== post.bolag.toLowerCase())
 
@@ -125,7 +117,7 @@ export function PostAnswerPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       })
-      const json = (await res.json().catch(() => null)) as { data: SvarRecord } | null
+      const json: unknown = await res.json().catch(() => null)
       const outcome = interpretSaveResult(t, res.ok, json)
       toast(outcome.toast)
       if (outcome.refresh) await onAnswered()

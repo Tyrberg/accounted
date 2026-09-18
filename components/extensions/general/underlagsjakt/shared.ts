@@ -72,6 +72,23 @@ export const OTHER = '__other__'
 export const OTHER_COMPANY = '__other_company__'
 export const PAYER = '__payer__'
 
+/**
+ * Resolves the raw "which company" radio choice to the value the answer actually carries:
+ * undefined (nothing picked yet), null (unknown company), the typed external name (once
+ * non-empty), or the picked company. The single definition, so the panel's render decisions
+ * (which recipient option to show, whether the settlement fieldset is enabled) and
+ * `buildAnswerInput`'s validation read the same fact instead of two copies that could drift.
+ */
+export function deriveTillBolag(tillBolagChoice: string | undefined, externalBolag: string): string | null | undefined {
+  return tillBolagChoice === undefined
+    ? undefined
+    : tillBolagChoice === UNKNOWN
+      ? null
+      : tillBolagChoice === EXTERNAL
+        ? externalBolag.trim() || undefined
+        : tillBolagChoice
+}
+
 export interface AnswerFormState {
   mode: 'val_kandidat' | 'fel_bolag' | 'osaker'
   transactionId: string
@@ -110,14 +127,7 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
   if (state.mode === 'osaker') return { input: { svarstyp: 'osaker', transaction_id } }
 
   if (state.mode === 'fel_bolag') {
-    const tillBolag: string | null | undefined =
-      state.tillBolagChoice === undefined
-        ? undefined
-        : state.tillBolagChoice === UNKNOWN
-          ? null
-          : state.tillBolagChoice === EXTERNAL
-            ? (state.externalBolag ?? '').trim() || undefined
-            : state.tillBolagChoice
+    const tillBolag = deriveTillBolag(state.tillBolagChoice, state.externalBolag ?? '')
 
     const mottagare =
       state.mottagareChoice === OTHER
@@ -194,12 +204,13 @@ export interface SaveOutcome {
  * fetch call so it can be tested without a DOM: success and failure must
  * produce different outcomes, and only success refreshes the list.
  */
-export function interpretSaveResult(t: T, ok: boolean, body: { data: SvarRecord } | null): SaveOutcome {
+export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutcome {
   if (!ok) {
     return { toast: { title: t('save_failed'), description: errorText(t, body), variant: 'destructive' }, refresh: false }
   }
+  const data = (body as { data?: SvarRecord } | null)?.data
   return {
-    toast: { title: t('save_success'), description: body?.data ? answerSummary(t, body.data) : undefined },
+    toast: { title: t('save_success'), description: data ? answerSummary(t, data) : undefined },
     refresh: true,
   }
 }

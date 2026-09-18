@@ -9,6 +9,7 @@ import {
   UNKNOWN,
   answerSummary,
   buildAnswerInput,
+  deriveTillBolag,
   interpretSaveResult,
 } from '../shared'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
@@ -150,6 +151,28 @@ describe('buildAnswerInput: fel_bolag', () => {
   })
 })
 
+describe('deriveTillBolag', () => {
+  it('is undefined when nothing is chosen yet', () => {
+    expect(deriveTillBolag(undefined, '')).toBeUndefined()
+  })
+
+  it('is null for the unknown-company choice', () => {
+    expect(deriveTillBolag(UNKNOWN, '')).toBeNull()
+  })
+
+  it('is undefined for external once picked but not yet named', () => {
+    expect(deriveTillBolag(EXTERNAL, '   ')).toBeUndefined()
+  })
+
+  it('is the trimmed name once external is named', () => {
+    expect(deriveTillBolag(EXTERNAL, ' Externt AB ')).toBe('Externt AB')
+  })
+
+  it('is the picked company name for a direct choice', () => {
+    expect(deriveTillBolag('Annat AB', '')).toBe('Annat AB')
+  })
+})
+
 describe('buildAnswerInput: osaker', () => {
   it('never blocks', () => {
     const result = buildAnswerInput({ ...BASE_VAL_KANDIDAT, mode: 'osaker' })
@@ -215,6 +238,16 @@ describe('interpretSaveResult', () => {
     expect(outcome.toast.title).toBe('save_failed:{}')
     expect(outcome.toast.variant).toBe('destructive')
   })
+
+  it('maps a structured error code from the response body to its translated sentence on failure', () => {
+    const outcome = interpretSaveResult(t, false, { error: { code: 'ALREADY_DELIVERED' } })
+    expect(outcome.toast.description).toBe('error_ALREADY_DELIVERED:{}')
+  })
+
+  it('falls back to the generic error sentence for an unrecognized body shape', () => {
+    const outcome = interpretSaveResult(t, false, { unexpected: true })
+    expect(outcome.toast.description).toBe('error_generic:{}')
+  })
 })
 
 describe('PostAnswerPanel wiring', () => {
@@ -223,6 +256,10 @@ describe('PostAnswerPanel wiring', () => {
   it('routes the fetch response through interpretSaveResult and shows the returned hint whenever save is disabled', () => {
     expect(SRC).toMatch(/interpretSaveResult\(t,\s*res\.ok,\s*json\)/)
     expect(SRC).toContain("t('save_disabled_reason'")
+  })
+
+  it('shows the missing-field hint whenever the save is disabled, without a redundant second condition', () => {
+    expect(SRC).toMatch(/\{!input && !saving && \(/)
   })
 
   it('reloads the list only when interpretSaveResult says so, so an answered post leaves "Att besvara" without a page reload', () => {
