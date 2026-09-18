@@ -172,8 +172,9 @@ A supporting document (email, invoice, receipt).
 ## Version History
 
 ### 1.4
-- Added `leverantor_sokord` field on posts for supplier search hints.
-- Answer file now includes `reglering` in `fel_bolag` and `val_kandidat` beslut.
+- Added `leverantor_sokord` field on posts for supplier search hints (ignored by Accounted; reserved for future use).
+- Answer file now includes `reglering` in `fel_bolag` beslut (settlement is sent to bertil when a company is selected and settled).
+- `reglering` is not included in `val_kandidat` beslut (candidate selection answers).
 - Existing clients ignore unknown fields per JSON schema forward compatibility.
 
 ### 1.3

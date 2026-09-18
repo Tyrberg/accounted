@@ -89,11 +89,24 @@ describe('parseExport', () => {
     expect(parsed.export.sammanstallningar[0].posts).toHaveLength(3)
   })
 
-  it('ignores unknown fields in 1.4 posts (leverantor_sokord, reglering)', () => {
+  it('accepts export with unknown fields (leverantor_sokord on posts)', () => {
     const moankPost = post('tx-moank-20260821', fixture14)
     const googlePost = post('tx-google-20260803', fixture14)
     expect(moankPost.transaction_id).toBe('tx-moank-20260821')
     expect(googlePost.transaction_id).toBe('tx-google-20260803')
+    // leverantor_sokord is in the fixture but not destructured into the Post type;
+    // the fixture parses successfully despite the unknown field
+  })
+
+  it('rejects export with structural errors even if it has version 1.4', () => {
+    const raw = clone(fixture14) as unknown as {
+      sammanstallningar: { posts: { transaction_id: unknown }[] }[]
+    }
+    raw.sammanstallningar[0].posts[0].transaction_id = null
+    const parsed = parseExport(raw)
+    expect(parsed.ok).toBe(false)
+    if (parsed.ok) return
+    expect(parsed.code).toBe('INVALID_EXPORT')
   })
 })
 

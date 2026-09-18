@@ -5670,7 +5670,7 @@
     "fel_bolag_invoice_to_name": "Name on the invoice",
     "fel_bolag_settlement": "How should it be settled?",
     "fel_bolag_settlement_needs_company": "Choose a company first. Without a company the answer is saved without a settlement.",
-    "fel_bolag_settlement_not_in_contract": "The settlement is kept here. Contract version 1.1 has no field for it, so bertil only receives it once the contract version is raised.",
+    "fel_bolag_settlement_not_in_contract": "The settlement is saved here and sent to bertil.",
     "fel_bolag_not_booked": "Nothing is booked. The answer records the decision and passes it on.",
     "reglering_vidarefakturera": "Re-invoice",
     "reglering_mellanhavande": "Add to the balance between the companies",

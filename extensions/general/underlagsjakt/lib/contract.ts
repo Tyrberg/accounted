@@ -26,7 +26,7 @@ export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
 export const MAX_SUPPORTED_EXPORT_VERSION = '1.4'
 /** Export versions this extension has been built and tested against, for error messages. */
 export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
-/** Answer version this extension writes. 1.4 adds reglering to fel_bolag and val_kandidat beslut. */
+/** Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only. */
 export const ANSWER_VERSION = '1.4'
 
 /** `SVARSKATEGORIER` in bertil. */
@@ -217,7 +217,7 @@ export function candidatesOf(post: Post): Kandidat[] {
 
 // ── Answers ──────────────────────────────────────────────────
 
-/** One entry in `beslut`, as the answer schema lists it (1.4 includes reglering). */
+/** One entry in `beslut`, as the answer schema lists it (1.4 includes reglering in fel_bolag only). */
 export type Beslut =
   | {
       transaction_id: string
@@ -232,7 +232,6 @@ export type Beslut =
       bolag: string | null
       bankkonto: string | null
       belopp: number | null
-      reglering?: Reglering | null
     }
   | {
       transaction_id: string
