@@ -26,17 +26,18 @@ import {
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
-import { answerSummary, buildAnswerInput, errorText } from './shared'
+import {
+  EXTERNAL,
+  NONE,
+  OTHER,
+  OTHER_COMPANY,
+  PAYER,
+  UNKNOWN,
+  buildAnswerInput,
+  interpretSaveResult,
+} from './shared'
 
 type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
-
-/** Sentinel for "none of the candidates": a chosen state, unlike `undefined` (nothing chosen yet). */
-const NONE = 'none'
-const EXTERNAL = '__external__'
-const UNKNOWN = '__unknown__'
-const OTHER = '__other__'
-const OTHER_COMPANY = '__other_company__'
-const PAYER = '__payer__'
 
 const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
 
@@ -79,6 +80,9 @@ export function PostAnswerPanel({
 
   const basKontoValid = basKonto.trim() === '' || isAccountNumber(basKonto.trim())
 
+  // Derived only for what to render (e.g. whether the "same company" recipient option is
+  // available yet); buildAnswerInput derives its own copy from the same raw choices for
+  // validation, so the missing-field hint can never drift from what's actually rendered.
   const tillBolag: string | null | undefined =
     tillBolagChoice === undefined
       ? undefined
@@ -87,14 +91,6 @@ export function PostAnswerPanel({
         : tillBolagChoice === EXTERNAL
           ? externalBolag.trim() || undefined
           : tillBolagChoice
-  const mottagare =
-    mottagareChoice === OTHER
-      ? otherMottagare.trim() || undefined
-      : mottagareChoice === PAYER
-        ? post.bolag
-        : mottagareChoice === OTHER_COMPANY && typeof tillBolag === 'string'
-          ? tillBolag
-          : undefined
 
   const otherCompanies = bolagChoices.filter((b) => b.toLowerCase() !== post.bolag.toLowerCase())
 
@@ -110,8 +106,11 @@ export function PostAnswerPanel({
     momstyp,
     begransaBolag,
     begransaBelopp,
-    tillBolag,
-    mottagare,
+    tillBolagChoice,
+    externalBolag,
+    mottagareChoice,
+    otherMottagare,
+    payerBolag: post.bolag,
     reglering,
   })
   const input = answerResult.input ?? null
@@ -127,15 +126,9 @@ export function PostAnswerPanel({
         body: JSON.stringify(input),
       })
       const json = (await res.json().catch(() => null)) as { data: SvarRecord } | null
-      if (!res.ok) {
-        toast({ title: t('save_failed'), description: errorText(t, json), variant: 'destructive' })
-        return
-      }
-      toast({
-        title: t('save_success'),
-        description: json?.data ? answerSummary(t, json.data) : undefined,
-      })
-      await onAnswered()
+      const outcome = interpretSaveResult(t, res.ok, json)
+      toast(outcome.toast)
+      if (outcome.refresh) await onAnswered()
     } finally {
       setSaving(false)
     }

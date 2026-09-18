@@ -1,22 +1,35 @@
 import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
-import { answerSummary, buildAnswerInput } from '../shared'
+import {
+  EXTERNAL,
+  OTHER,
+  OTHER_COMPANY,
+  PAYER,
+  UNKNOWN,
+  answerSummary,
+  buildAnswerInput,
+  interpretSaveResult,
+} from '../shared'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
 /**
  * Regression coverage for two PostAnswerPanel bugs (task: "Spara svar-knappen
  * ar slackt utan forklaring, och ingen bekraftelse nar svaret sparats"):
  *
- * 1. The Save button used to go grey with no indication of which of the four
- *    required fields (candidate, kategori, motpart, valid BAS account /
- *    till_bolag, mottagare, reglering for fel_bolag) was still missing.
+ * 1. The Save button used to go grey with no indication of which required
+ *    field (candidate, kategori, motpart, valid BAS account; or, for
+ *    fel_bolag, which company / who's on the invoice / how it settles) was
+ *    still missing.
  * 2. Nothing confirmed a save actually happened.
  *
  * `buildAnswerInput` is the single source for both the submitted payload and
- * the missing-field list: it returns exactly one of `{ input }` or
- * `{ missing }`, so the two cannot drift apart (a bug already reported once,
- * see PostAnswerPanel.tsx history).
+ * the missing-field list, from the *raw* radio/text state (not a pre-derived
+ * value): a choice that has been made but not yet filled in (e.g. "external
+ * company" picked with an empty name field) must not be reported as "nothing
+ * chosen". `interpretSaveResult` is the single source for what happens after
+ * a save attempt, so the confirmation and the failure path cannot be
+ * conflated.
  */
 
 const BASE_VAL_KANDIDAT = {
@@ -33,8 +46,16 @@ const BASE_VAL_KANDIDAT = {
   begransaBelopp: false,
 }
 
-describe('buildAnswerInput', () => {
-  it('lists every unset field for val_kandidat', () => {
+const BASE_FEL_BOLAG = {
+  ...BASE_VAL_KANDIDAT,
+  mode: 'fel_bolag' as const,
+  externalBolag: '',
+  otherMottagare: '',
+  payerBolag: 'Acme AB',
+}
+
+describe('buildAnswerInput: val_kandidat', () => {
+  it('lists every unset field', () => {
     const result = buildAnswerInput({
       ...BASE_VAL_KANDIDAT,
       hasCandidate: false,
@@ -52,35 +73,85 @@ describe('buildAnswerInput', () => {
     expect(result).toEqual({ missing: ['missing_kategori'] })
   })
 
-  it('returns an input once val_kandidat is complete, never both input and missing', () => {
+  it('returns an input once complete, never both input and missing', () => {
     const result = buildAnswerInput(BASE_VAL_KANDIDAT)
     expect(result.missing).toBeUndefined()
     expect(result.input).toMatchObject({ svarstyp: 'val_kandidat', kategori: 'bankavgift', motpart: 'Banken' })
   })
+})
 
-  it('requires reglering for fel_bolag only once a company is chosen', () => {
+describe('buildAnswerInput: fel_bolag', () => {
+  it('flags nothing chosen yet as missing_till_bolag / missing_mottagare', () => {
+    const result = buildAnswerInput({ ...BASE_FEL_BOLAG, tillBolagChoice: undefined, mottagareChoice: undefined })
+    expect(result).toEqual({ missing: ['missing_till_bolag', 'missing_mottagare'] })
+  })
+
+  it('reports the empty name field, not "nothing chosen", once external company is picked but unnamed', () => {
+    const result = buildAnswerInput({
+      ...BASE_FEL_BOLAG,
+      tillBolagChoice: EXTERNAL,
+      externalBolag: '   ',
+      mottagareChoice: PAYER,
+    })
+    expect(result).toEqual({ missing: ['missing_external_bolag_namn'] })
+  })
+
+  it('accepts external company once named', () => {
+    const result = buildAnswerInput({
+      ...BASE_FEL_BOLAG,
+      tillBolagChoice: EXTERNAL,
+      externalBolag: 'Externt AB',
+      mottagareChoice: PAYER,
+      reglering: 'mellanhavande',
+    })
+    expect(result.missing).toBeUndefined()
+    expect(result.input).toMatchObject({ svarstyp: 'fel_bolag', till_bolag: 'Externt AB' })
+  })
+
+  it('reports the empty name field, not "nothing chosen", once "someone else" is picked as recipient but unnamed', () => {
+    const result = buildAnswerInput({
+      ...BASE_FEL_BOLAG,
+      tillBolagChoice: UNKNOWN,
+      mottagareChoice: OTHER,
+      otherMottagare: '  ',
+    })
+    expect(result).toEqual({ missing: ['missing_mottagare_namn'] })
+  })
+
+  it('resolves "other company" as recipient to the chosen company', () => {
+    const result = buildAnswerInput({
+      ...BASE_FEL_BOLAG,
+      tillBolagChoice: 'Annat AB',
+      mottagareChoice: OTHER_COMPANY,
+      reglering: 'mellanhavande',
+    })
+    expect(result.missing).toBeUndefined()
+    expect(result.input).toMatchObject({ till_bolag: 'Annat AB', fel_bolag_mottagare: 'Annat AB' })
+  })
+
+  it('requires reglering only once a company is chosen (unknown company needs no settlement)', () => {
     expect(
       buildAnswerInput({
-        ...BASE_VAL_KANDIDAT,
-        mode: 'fel_bolag',
-        tillBolag: 'Annat AB',
-        mottagare: 'Annat AB',
+        ...BASE_FEL_BOLAG,
+        tillBolagChoice: 'Annat AB',
+        mottagareChoice: PAYER,
         reglering: undefined,
       }),
     ).toEqual({ missing: ['missing_reglering'] })
 
     const result = buildAnswerInput({
-      ...BASE_VAL_KANDIDAT,
-      mode: 'fel_bolag',
-      tillBolag: null,
-      mottagare: 'Annat AB',
+      ...BASE_FEL_BOLAG,
+      tillBolagChoice: UNKNOWN,
+      mottagareChoice: PAYER,
       reglering: undefined,
     })
     expect(result.missing).toBeUndefined()
     expect(result.input).toMatchObject({ svarstyp: 'fel_bolag', till_bolag: null, reglering: null })
   })
+})
 
-  it('never blocks osaker', () => {
+describe('buildAnswerInput: osaker', () => {
+  it('never blocks', () => {
     const result = buildAnswerInput({ ...BASE_VAL_KANDIDAT, mode: 'osaker' })
     expect(result.missing).toBeUndefined()
     expect(result.input).toEqual({ svarstyp: 'osaker', transaction_id: 't1' })
@@ -104,44 +175,58 @@ const SVAR_RECORD_BASE = {
   levererad_at: null,
 }
 
+const SVAR_RECORD: SvarRecord = {
+  ...SVAR_RECORD_BASE,
+  beslut: {
+    transaction_id: 't1',
+    svarstyp: 'val_kandidat',
+    vald_kandidat: null,
+    motpart: 'Banken',
+    kategori: 'bankavgift',
+    bas_konto: null,
+    momstyp: null,
+    bolag: null,
+    bankkonto: null,
+    belopp: null,
+  },
+}
+
+const t = (key: string, values?: Record<string, string | number>) =>
+  key === 'kategori_bankavgift' ? 'Bankavgift' : `${key}:${JSON.stringify(values ?? {})}`
+
 describe('answerSummary', () => {
   it('describes a val_kandidat save without a chosen document', () => {
-    const rec: SvarRecord = {
-      ...SVAR_RECORD_BASE,
-      beslut: {
-        transaction_id: 't1',
-        svarstyp: 'val_kandidat',
-        vald_kandidat: null,
-        motpart: 'Banken',
-        kategori: 'bankavgift',
-        bas_konto: null,
-        momstyp: null,
-        bolag: null,
-        bankkonto: null,
-        belopp: null,
-      },
-    }
-    const t = (key: string, values?: Record<string, string | number>) =>
-      key === 'kategori_bankavgift' ? 'Bankavgift' : `${key}:${JSON.stringify(values)}`
-    expect(answerSummary(t, rec)).toContain('Banken')
+    expect(answerSummary(t, SVAR_RECORD)).toContain('Banken')
   })
 })
 
-describe('PostAnswerPanel save confirmation', () => {
+describe('interpretSaveResult', () => {
+  it('confirms and refreshes the list on success, summarizing the stored answer', () => {
+    const outcome = interpretSaveResult(t, true, { data: SVAR_RECORD })
+    expect(outcome.refresh).toBe(true)
+    expect(outcome.toast.title).toBe('save_success:{}')
+    expect(outcome.toast.description).toContain('Banken')
+    expect(outcome.toast.variant).toBeUndefined()
+  })
+
+  it('does not refresh the list on failure, and marks the toast destructive', () => {
+    const outcome = interpretSaveResult(t, false, null)
+    expect(outcome.refresh).toBe(false)
+    expect(outcome.toast.title).toBe('save_failed:{}')
+    expect(outcome.toast.variant).toBe('destructive')
+  })
+})
+
+describe('PostAnswerPanel wiring', () => {
   const SRC = fs.readFileSync(path.resolve(__dirname, '../PostAnswerPanel.tsx'), 'utf8')
 
-  it('shows a toast confirmation after a successful save, built from the stored answer the server returns', () => {
-    expect(SRC).toMatch(/toast\(\{\s*title:\s*t\('save_success'\)/)
-    expect(SRC).toMatch(/answerSummary\(t,\s*json\.data\)/)
-  })
-
-  it('shows the missing-field hint whenever the save is disabled, without a redundant second condition', () => {
+  it('routes the fetch response through interpretSaveResult and shows the returned hint whenever save is disabled', () => {
+    expect(SRC).toMatch(/interpretSaveResult\(t,\s*res\.ok,\s*json\)/)
     expect(SRC).toContain("t('save_disabled_reason'")
-    expect(SRC).toMatch(/\{!input && !saving && \(/)
   })
 
-  it('reloads the list on save so the post leaves "Att besvara" without a page reload', () => {
-    expect(SRC).toMatch(/await onAnswered\(\)/)
+  it('reloads the list only when interpretSaveResult says so, so an answered post leaves "Att besvara" without a page reload', () => {
+    expect(SRC).toMatch(/if\s*\(outcome\.refresh\)\s*await onAnswered\(\)/)
   })
 })
 
@@ -158,7 +243,9 @@ describe('translations for the new copy exist in both locales', () => {
     'missing_motpart',
     'missing_bas_konto',
     'missing_till_bolag',
+    'missing_external_bolag_namn',
     'missing_mottagare',
+    'missing_mottagare_namn',
     'missing_reglering',
   ]
 
