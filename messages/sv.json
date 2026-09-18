@@ -5641,6 +5641,7 @@
     "field_kategori": "Kategori",
     "field_kategori_choose": "Välj kategori",
     "suggested_account": "Föreslaget konto: {account}",
+    "chosen_account": "Konto: {account}",
     "current_momstyp": "Moms: {momstyp}",
     "advanced_toggle": "BAS-konto och moms (valfritt)",
     "field_bas_konto": "BAS-konto (valfritt)",

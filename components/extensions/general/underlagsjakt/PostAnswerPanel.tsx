@@ -3,6 +3,7 @@
 import { useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { ChevronDown, ChevronUp, Eye, Loader2 } from 'lucide-react'
+import { AttnLine } from '@/components/ui/attn-line'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -238,9 +239,7 @@ export function PostAnswerPanel({
                 onChange={(e) => setMotpart(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">{t('field_motpart_hint')}</p>
-              {motpartLooksLikeReference && (
-                <p className="text-[12.5px] text-attn">{t('motpart_reference_number_warning')}</p>
-              )}
+              {motpartLooksLikeReference && <AttnLine>{t('motpart_reference_number_warning')}</AttnLine>}
             </div>
             <div className="space-y-2">
               <Label>{t('field_kategori')}</Label>
@@ -259,9 +258,11 @@ export function PostAnswerPanel({
                   ))}
                 </SelectContent>
               </Select>
-              {kategori && suggestedBasKonto && (
+              {kategori && basKontoValid && basKonto.trim() && (
                 <p className="text-xs text-muted-foreground">
-                  {t('suggested_account', { account: formatAccountWithName(suggestedBasKonto) })}
+                  {t(basKontoOverride === null ? 'suggested_account' : 'chosen_account', {
+                    account: formatAccountWithName(basKonto.trim()),
+                  })}
                 </p>
               )}
               {momstyp && (

@@ -5641,6 +5641,7 @@
     "field_kategori": "Category",
     "field_kategori_choose": "Choose category",
     "suggested_account": "Suggested account: {account}",
+    "chosen_account": "Account: {account}",
     "current_momstyp": "VAT: {momstyp}",
     "advanced_toggle": "BAS account and VAT (optional)",
     "field_bas_konto": "BAS account (optional)",
