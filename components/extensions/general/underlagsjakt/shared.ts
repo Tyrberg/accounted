@@ -1,4 +1,4 @@
-import type { Post } from '@/extensions/general/underlagsjakt/lib/contract'
+import type { Kategori, Momstyp, Post, Reglering, SvarInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
@@ -62,6 +62,75 @@ export function errorText(t: T, body: unknown): string {
   }
   if (typeof err === 'string') return err
   return t('error_generic')
+}
+
+export interface AnswerFormState {
+  mode: 'val_kandidat' | 'fel_bolag' | 'osaker'
+  transactionId: string
+  hasCandidate: boolean
+  sha256: string | null
+  kategori?: Kategori
+  motpart: string
+  basKonto: string
+  basKontoValid: boolean
+  momstyp: Momstyp | null
+  begransaBolag: boolean
+  begransaBelopp: boolean
+  tillBolag?: string | null
+  mottagare?: string
+  reglering?: Reglering
+}
+
+export type AnswerFormResult = { input: SvarInput; missing?: undefined } | { input?: undefined; missing: string[] }
+
+/**
+ * Single source for both what "Spara svar" submits and why it's disabled:
+ * building the input and detecting missing fields happen in the same pass,
+ * as one exhaustive result, so the button state and the "why disabled" hint
+ * cannot drift into disagreement.
+ */
+export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
+  const transaction_id = state.transactionId
+  if (state.mode === 'osaker') return { input: { svarstyp: 'osaker', transaction_id } }
+
+  if (state.mode === 'fel_bolag') {
+    const missing: string[] = []
+    if (state.tillBolag === undefined) missing.push('missing_till_bolag')
+    if (!state.mottagare) missing.push('missing_mottagare')
+    if (state.tillBolag !== null && state.tillBolag !== undefined && !state.reglering) {
+      missing.push('missing_reglering')
+    }
+    if (missing.length > 0) return { missing }
+    return {
+      input: {
+        svarstyp: 'fel_bolag',
+        transaction_id,
+        till_bolag: state.tillBolag ?? null,
+        fel_bolag_mottagare: state.mottagare!,
+        reglering: state.tillBolag === null ? null : (state.reglering ?? null),
+      },
+    }
+  }
+
+  const missing: string[] = []
+  if (!state.hasCandidate) missing.push('missing_candidate')
+  if (!state.kategori) missing.push('missing_kategori')
+  if (!state.motpart.trim()) missing.push('missing_motpart')
+  if (!state.basKontoValid) missing.push('missing_bas_konto')
+  if (missing.length > 0) return { missing }
+  return {
+    input: {
+      svarstyp: 'val_kandidat',
+      transaction_id,
+      sha256: state.sha256,
+      motpart: state.motpart.trim(),
+      kategori: state.kategori!,
+      bas_konto: state.basKonto.trim() || null,
+      momstyp: state.momstyp,
+      begransa_bolag: state.begransaBolag,
+      begransa_belopp: state.begransaBelopp,
+    },
+  }
 }
 
 export function answerSummary(t: T, rec: SvarRecord): string {
