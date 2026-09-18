@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
+import type { Kategori } from '../lib/contract'
 import { looksLikeReferenceNumber, suggestBasKonto } from '../lib/account-suggestion'
 
 describe('suggestBasKonto', () => {
@@ -58,6 +60,29 @@ describe('suggestBasKonto', () => {
     expect(suggestBasKonto('leverantor', '100004305786', -500)).toBeNull()
     expect(suggestBasKonto('utlagg', '', -500)).toBeNull()
     expect(suggestBasKonto('intern_overforing', 'Överföring mellan egna konton', -1000)).toBeNull()
+  })
+})
+
+describe('display names for kategori-template suggestions', () => {
+  it('has a display name for every account the kategori-template suggester path can reach', () => {
+    // account-suggestion.ts's KATEGORI_TEMPLATE_IDS path (bankavgift/ranta/lan/skatt) skips
+    // the AB-override and 1930 checks the keyword path applies, so it is exercised directly
+    // here via suggestBasKonto rather than re-derived, to actually cover that branch.
+    const kategorier: Array<[Kategori, number]> = [
+      ['bankavgift', -100],
+      ['bankavgift', 100],
+      ['ranta', -100],
+      ['ranta', 100],
+      ['lan', -100],
+      ['lan', 100],
+      ['skatt', -100],
+      ['skatt', 100],
+    ]
+    const unnamed = kategorier
+      .map(([kategori, belopp]) => suggestBasKonto(kategori, 'test', belopp))
+      .filter((account): account is string => account !== null)
+      .filter((account) => formatAccountWithName(account) === account)
+    expect(unnamed).toEqual([])
   })
 })
 

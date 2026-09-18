@@ -1,15 +1,93 @@
 import { describe, it, expect } from 'vitest'
 import { BOOKING_TEMPLATES } from '@/lib/bookkeeping/booking-templates'
-import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
+import { ACCOUNT_NAMES, formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
+import { BAS_ACCOUNT_NUMBERS } from '@/lib/bookkeeping/bas-account-numbers'
+import { BAS_REFERENCE } from '@/lib/bookkeeping/bas-data'
 
-describe('formatAccountWithName', () => {
+const BAS_NAME_BY_ACCOUNT = new Map(BAS_REFERENCE.map((a) => [a.account_number, a.account_name]))
+
+/**
+ * Deliberate shortenings of the canonical BAS 2026 name (dropped "(gruppkonto)"
+ * suffixes, plain-language paraphrases): approved case-by-case against
+ * bas-data, not just against what a template happens to call the account.
+ */
+const NAME_ALLOWLIST: Record<string, string> = {
+  '1250': 'Inventarier',
+  '1630': 'Skattekonto',
+  '2018': 'Egna insättningar',
+  '2350': 'Långfristiga skulder',
+  '2611': 'Utg. moms 25%',
+  '2621': 'Utg. moms 12%',
+  '2631': 'Utg. moms 6%',
+  '2614': 'Utg. moms omvänd 25%',
+  '2624': 'Utg. moms omvänd 12%',
+  '2634': 'Utg. moms omvänd 6%',
+  '2641': 'Ing. moms',
+  '2645': 'Beräknad ing. moms förvärv utlandet',
+  '2647': 'Beräknad ing. moms omvänd i Sverige',
+  '2731': 'Arbetsgivaravgifter',
+  '2893': 'Skuld till ägare',
+  '3001': 'Försäljning 25%',
+  '3002': 'Försäljning 12%',
+  '3003': 'Försäljning 6%',
+  '3004': 'Momsfri försäljning',
+  '3305': 'Exportförsäljning',
+  '3308': 'EU-tjänster',
+  '3900': 'Övriga rörelseintäkter',
+  '3960': 'Valutakursvinster',
+  '4010': 'Varuinköp',
+  '4060': 'Varuinköp omvänd moms',
+  '4070': 'Varuinköp EU',
+  '4500': 'Övriga inköpskostnader',
+  '4531': 'Import-/tullkostnader',
+  '4600': 'Subentreprenader',
+  '5020': 'El & uppvärmning',
+  '5460': 'Förbrukningsvaror',
+  '5611': 'Drivmedel bil',
+  '5613': 'Reparation fordon',
+  '5615': 'Leasing fordon',
+  '5619': 'Övriga kostnader för personbilar och mc',
+  '5800': 'Resekostnader',
+  '5810': 'Biljetter & transport',
+  '6071': 'Representation',
+  '6110': 'Kontorsförbrukning',
+  '6200': 'Telefon & internet',
+  '6230': 'Internet',
+  '6310': 'Företagsförsäkring',
+  '6550': 'Konsulttjänster',
+  '6570': 'Bankavgifter',
+  '6980': 'Medlemsavgifter',
+  '6991': 'Övriga kostnader',
+  '7210': 'Löner tjänstemän',
+  '7410': 'Pensionsförsäkring',
+  '7960': 'Valutakursförluster',
+  '8310': 'Ränteintäkter',
+  '8410': 'Räntekostnader',
+}
+
+describe('ACCOUNT_NAMES', () => {
+  it('only names accounts that exist in the BAS 2026 chart', () => {
+    const bogus = Object.keys(ACCOUNT_NAMES).filter((account) => !BAS_ACCOUNT_NUMBERS.includes(account))
+    expect(bogus).toEqual([])
+  })
+
+  it('names every account with its canonical BAS 2026 name, or an approved abbreviation of it', () => {
+    // An owner who by design cannot read the BAS number judges the account purely
+    // by this name (task 1450): a wrong name is worse than the bare number it
+    // replaces, so it must match the real chart, not just look plausible.
+    const mismatches = Object.entries(ACCOUNT_NAMES)
+      .filter(([account, name]) => {
+        const official = BAS_NAME_BY_ACCOUNT.get(account)
+        return name !== official && name !== NAME_ALLOWLIST[account]
+      })
+      .map(([account, name]) => `${account}: map="${name}" official="${BAS_NAME_BY_ACCOUNT.get(account)}"`)
+    expect(mismatches).toEqual([])
+  })
+
   it('has a display name for every account the underlagsjakt keyword-fallback suggester can reach', () => {
     // Mirrors the reachability rule in extensions/general/underlagsjakt/lib/account-suggestion.ts:
     // entity_applicability 'all', the leg for this amount direction has no AB-specific
     // override, and the account isn't the bank account itself (1930, carries no information).
-    // A bare account number shown to an owner who by design doesn't know BAS is a
-    // regression (task 1450): this guards against a template account changing without
-    // the client-side name map following it.
     const reachable = new Set<string>()
     for (const t of BOOKING_TEMPLATES) {
       if (t.entity_applicability !== 'all') continue

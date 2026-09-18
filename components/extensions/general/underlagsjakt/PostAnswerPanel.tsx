@@ -278,8 +278,9 @@ export function PostAnswerPanel({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-8 justify-start gap-1.5 px-0 text-xs text-muted-foreground hover:bg-transparent"
+              className="h-8 justify-start gap-1.5 px-0 text-xs text-muted-foreground hover:bg-transparent disabled:opacity-100"
               onClick={() => setShowAdvanced((v) => !v)}
+              disabled={!basKontoValid}
             >
               {advancedOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
               {t('advanced_toggle')}
