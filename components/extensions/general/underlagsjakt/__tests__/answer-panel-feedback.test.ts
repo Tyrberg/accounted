@@ -265,6 +265,12 @@ describe('PostAnswerPanel wiring', () => {
   it('reloads the list only when interpretSaveResult says so, so an answered post leaves "Att besvara" without a page reload', () => {
     expect(SRC).toMatch(/if\s*\(outcome\.refresh\)\s*await onAnswered\(\)/)
   })
+
+  it('catches a rejected fetch (offline, connection reset) or malformed response and still shows the failure toast', () => {
+    const submitBody = SRC.slice(SRC.indexOf('const submit = async'), SRC.indexOf('return (', SRC.indexOf('const submit = async')))
+    expect(submitBody).toMatch(/catch\s*\{/)
+    expect(submitBody).toMatch(/toast\(interpretSaveResult\(t,\s*false,\s*null\)\.toast\)/)
+  })
 })
 
 describe('translations for the new copy exist in both locales', () => {
