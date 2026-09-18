@@ -5670,7 +5670,7 @@
     "fel_bolag_invoice_to_name": "Namnet på fakturan",
     "fel_bolag_settlement": "Hur ska det regleras?",
     "fel_bolag_settlement_needs_company": "Välj bolag först. Utan bolag sparas svaret utan reglering.",
-    "fel_bolag_settlement_not_in_contract": "Regleringssättet sparas här. Kontraktsversion 1.1 har inget fält för det, så bertil får det först när kontraktet höjs.",
+    "fel_bolag_settlement_not_in_contract": "Regleringssättet sparas här och skickas till bertil.",
     "fel_bolag_not_booked": "Ingenting bokförs. Svaret samlar in beslutet och lämnar det vidare.",
     "reglering_vidarefakturera": "Vidarefakturera",
     "reglering_mellanhavande": "Lägg till mellanhavandet mellan bolagen",
