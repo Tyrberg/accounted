@@ -5577,6 +5577,7 @@
     "save_failed": "Svaret kunde inte sparas",
     "save_success": "Svaret sparat",
     "save_disabled_reason": "Fattas för att spara: {fields}",
+    "save_ready": "Redo att spara.",
     "missing_candidate": "dokument",
     "missing_kategori": "kategori",
     "missing_motpart": "motpart",

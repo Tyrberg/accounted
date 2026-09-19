@@ -107,6 +107,12 @@ export function PostAnswerPanel({
   })
   const input = answerResult.input ?? null
   const missingReasons = answerResult.missing ?? []
+  // Same rule as BookDirectlyDialog's disabledReason/canSubmit split (components/extensions/general/BookDirectlyDialog.tsx):
+  // null while a save is in flight, so the line reads "ready" instead of flashing a stale reason.
+  const disabledReason =
+    saving || missingReasons.length === 0
+      ? null
+      : t('save_disabled_reason', { fields: missingReasons.map((key) => t(key)).join(', ') })
 
   const submit = async () => {
     if (!input) return
@@ -364,12 +370,10 @@ export function PostAnswerPanel({
       {mode === 'osaker' && <p className="text-[13px] text-muted-foreground">{t('osaker_description')}</p>}
 
       <div className="flex flex-col items-end gap-2">
-        {!input && !saving && (
-          <p className="text-xs text-muted-foreground">
-            {t('save_disabled_reason', { fields: missingReasons.map((key) => t(key)).join(', ') })}
-          </p>
-        )}
-        <Button onClick={() => void submit()} disabled={!input || saving}>
+        <p className={cn('text-xs', disabledReason ? 'text-attn' : 'text-muted-foreground')} aria-live="polite">
+          {disabledReason ?? t('save_ready')}
+        </p>
+        <Button onClick={() => void submit()} disabled={!input || saving} title={disabledReason ?? undefined}>
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {mode === 'osaker' ? t('submit_osaker') : t('submit')}
         </Button>

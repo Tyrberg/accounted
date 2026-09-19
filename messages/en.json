@@ -5577,6 +5577,7 @@
     "save_failed": "The answer could not be saved",
     "save_success": "Answer saved",
     "save_disabled_reason": "Missing to save: {fields}",
+    "save_ready": "Ready to save.",
     "missing_candidate": "document",
     "missing_kategori": "category",
     "missing_motpart": "counterparty",
