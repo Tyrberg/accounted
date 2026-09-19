@@ -4,9 +4,11 @@ import type { Kategori } from '../lib/contract'
 import { looksLikeReferenceNumber, suggestBasKonto } from '../lib/account-suggestion'
 
 describe('suggestBasKonto', () => {
-  it('suggests Bankavgifter for bankavgift regardless of what motpart says (the Mattias case)', () => {
+  it('suggests Bankkostnader for bankavgift regardless of what motpart says (the Mattias case)', () => {
     // 2026-08-04, -130 kr, motpart is a reference number, konto SEB Företagskonto, typ Annan.
-    expect(suggestBasKonto('bankavgift', '100004305786', -130)).toBe('6570')
+    const account = suggestBasKonto('bankavgift', '100004305786', -130)
+    expect(account).toBe('6570')
+    expect(formatAccountWithName(account!)).toBe('6570 Bankkostnader')
   })
 
   it('never lets a stray motpart keyword override the kategori-specific account', () => {
