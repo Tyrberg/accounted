@@ -56,6 +56,15 @@ describe('suggestBasKonto', () => {
     expect(suggestBasKonto('leverantor', 'GOOGLE*WORKSPACE', -299)).toBe('5420')
   })
 
+  it('never suggests a revenue account for a positive belopp under leverantor/utlagg/intern_overforing (F1): a refund or repayment on an expense-shaped category is not sales income', () => {
+    // "taxi" collides with revenue_reduced_6's keywords; a positive amount
+    // under utlagg is a reimbursement, not ticket sales income.
+    expect(suggestBasKonto('utlagg', 'Taxi Stockholm', 450)).toBeNull()
+    // "faktura" collides with revenue_standard_25's keywords.
+    expect(suggestBasKonto('leverantor', 'Faktura 4456', 4456)).toBeNull()
+    expect(suggestBasKonto('intern_overforing', 'Konsultfaktura', 1000)).toBeNull()
+  })
+
   it('returns null when nothing matches', () => {
     expect(suggestBasKonto('leverantor', '100004305786', -500)).toBeNull()
     expect(suggestBasKonto('utlagg', '', -500)).toBeNull()

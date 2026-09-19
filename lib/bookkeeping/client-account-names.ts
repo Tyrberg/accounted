@@ -48,13 +48,13 @@ export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
   '4010': 'Varuinköp',
   '4060': 'Varuinköp omvänd moms',
   '4070': 'Varuinköp EU',
-  '4500': 'Övriga inköpskostnader',
-  '4531': 'Import-/tullkostnader',
+  '4500': 'Inköp från utlandet (gruppkonto)',
+  '4531': 'Inköp av tjänster från ett land utanför EU, 25 % moms',
   '4600': 'Subentreprenader',
 
   // External expenses (5xxx)
   '5010': 'Lokalhyra',
-  '5020': 'El & uppvärmning',
+  '5020': 'El',
   '5410': 'Förbrukningsinventarier',
   '5420': 'Programvaror',
   '5460': 'Förbrukningsvaror',
@@ -81,7 +81,7 @@ export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
   '6530': 'Redovisningstjänster',
   '6550': 'Konsulttjänster',
   '6570': 'Bankavgifter',
-  '6980': 'Medlemsavgifter',
+  '6980': 'Föreningsavgifter',
   '6991': 'Övriga kostnader',
 
   // Personnel & financial (7xxx / 8xxx)

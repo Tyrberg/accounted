@@ -75,6 +75,13 @@ export function suggestBasKonto(kategori: Kategori, motpart: string, belopp: num
   if (!searchText) return null
 
   const keywordMatch = BOOKING_TEMPLATES.find((t) => {
+    // leverantor, utlagg and intern_overforing are never sales revenue: a
+    // positive amount here is a refund or repayment, not income. Without
+    // this, a positive belopp searches 'income' templates by keyword and a
+    // stray match (e.g. "taxi" in the reduced-VAT sales template, "faktura"
+    // in the standard-VAT one) suggests a revenue account like 3001/3003 for
+    // an expense-shaped post, which then gets learned as a rule in bertil.
+    if (t.direction === 'income') return false
     if (t.direction !== direction && t.direction !== 'transfer') return false
     // No signal here for which legal form `post.bolag` is, so an EF-only or
     // AB-only template (e.g. private_withdrawal_ef, shareholder_loan_received)

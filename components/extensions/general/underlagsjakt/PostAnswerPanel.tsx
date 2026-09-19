@@ -274,17 +274,25 @@ export function PostAnswerPanel({
           </div>
 
           <div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-8 justify-start gap-1.5 px-0 text-xs text-muted-foreground hover:bg-transparent disabled:opacity-100"
-              onClick={() => setShowAdvanced((v) => !v)}
-              disabled={!basKontoValid}
-            >
-              {advancedOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-              {t('advanced_toggle')}
-            </Button>
+            {basKontoValid ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 justify-start gap-1.5 px-0 text-xs text-muted-foreground hover:bg-transparent"
+                onClick={() => setShowAdvanced((v) => !v)}
+              >
+                {advancedOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {t('advanced_toggle')}
+              </Button>
+            ) : (
+              // Forced open by the invalid BAS account below: nothing left for a toggle to do,
+              // so it renders as a static label instead of a control with no click path.
+              <p className="flex h-8 items-center gap-1.5 text-xs text-muted-foreground">
+                <ChevronUp className="h-3.5 w-3.5" />
+                {t('advanced_toggle')}
+              </p>
+            )}
             {advancedOpen && (
               <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
