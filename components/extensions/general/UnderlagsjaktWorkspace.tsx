@@ -58,7 +58,9 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
         toast({ title: t('import_failed'), description: t('error_INVALID_JSON'), variant: 'destructive' })
         return
       }
-      const res = await fetch(`${API}/export`, {
+      // /export is bertil's delivery endpoint (machine token, no session);
+      // the file picker posts the same body to the session route.
+      const res = await fetch(`${API}/export/fil`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -153,7 +155,9 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
         <EmptyState
           icon={FileSearch}
           title={t('empty_title')}
-          description={t('empty_description', { versions: data.supported_export_versions.join(', ') })}
+          description={t(data.leverans.till_detta_bolag ? 'empty_description_leverans' : 'empty_description', {
+            versions: data.supported_export_versions.join(', '),
+          })}
           actionLabel={t('import_export')}
           onAction={() => fileInputRef.current?.click()}
         />
@@ -191,6 +195,11 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
       </div>
 
       <div className="space-y-1 text-[12.5px] text-muted-foreground">
+        <p>
+          {data.leverans.till_detta_bolag
+            ? t(data.export.imported_via === 'leverans' ? 'leverans_active_delivered' : 'leverans_active_file')
+            : t('leverans_off')}
+        </p>
         <p>
           {t('export_meta', {
             version: data.export.export_version,

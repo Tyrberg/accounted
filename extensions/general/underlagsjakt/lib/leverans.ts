@@ -1,0 +1,285 @@
+/**
+ * The machine path: how bertil delivers an export and collects answers
+ * without a logged-in human.
+ *
+ * Every other route in this extension is dispatched behind
+ * `lib/auth/require-auth.ts`, which wants a Supabase cookie session and
+ * clears an MFA gate. bertil has neither, so the delivery could only ever
+ * answer 401 (verified 2026-09-20). This module is the one way in for a
+ * machine, and it is deliberately the narrowest thing that works:
+ *
+ *   - It covers exactly two routes: POST /export (lay an export down) and
+ *     GET /svar (pick the answers up). Nothing else in Accounted is
+ *     reachable with this credential, by construction: no other route calls
+ *     `authenticateLeverans`.
+ *   - The credential carries company affiliation. Which company an export
+ *     lands in is decided HERE, from `UNDERLAGSJAKT_LEVERANS_ORGNR`, never
+ *     from the request: a caller holding the token cannot name a company,
+ *     so it cannot write to the wrong one. An org number that matches more
+ *     than one company is refused rather than guessed.
+ *   - It fails closed. Both env vars unset (the default, and what every
+ *     hosted deployment of upstream has) means the machine path answers 503
+ *     and no token exists to guess.
+ *
+ * Why not an Accounted API key (`gnubok_sk_`, lib/auth/api-keys.ts), which
+ * already does company binding, scopes, revocation and rate limiting: a key
+ * cannot be narrowed to one extension. Scopes live in the core catalogue
+ * (lib/auth/scope-catalog.ts), and a key minted without an explicit scope
+ * falls back to DEFAULT_SCOPES, i.e. read access to transactions, invoices,
+ * customers, suppliers and every report through MCP and /api/v1. Handing
+ * bertil the ledger to deliver a JSON file is the opposite of requirement 3
+ * ("lay an export and read answers, nothing else"), and narrowing it would
+ * mean adding an `underlagsjakt:*` scope to an upstream-owned file that this
+ * fork has to merge forever (fork/README.md section 4). The trade is
+ * recorded in fork/DECISIONS.md.
+ *
+ * The secret itself is never in the repository: it is an environment
+ * variable on the box, the same place the rest of the deployment's secrets
+ * live, and the same value goes into bertil's own .env as GNUBOK_API_KEY.
+ */
+import crypto from 'crypto'
+import { NextResponse } from 'next/server'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
+import { createExtensionContext } from '@/lib/extensions/context-factory'
+import { formatOrgNumberDisplay, normalizeOrgNumber } from '@/lib/invariants/org-number'
+import type { ExtensionContext } from '@/lib/extensions/types'
+
+const EXTENSION_ID = 'underlagsjakt'
+
+/** Shared secret between this deployment and bertil. Set on the box, never committed. */
+export const TOKEN_ENV = 'UNDERLAGSJAKT_LEVERANS_TOKEN'
+/** The one company the delivery may write to, as an organisationsnummer. */
+export const ORGNR_ENV = 'UNDERLAGSJAKT_LEVERANS_ORGNR'
+
+/**
+ * A token shorter than this is refused at read time rather than trusted.
+ * 32 characters is what `openssl rand -base64 24` produces, which is what
+ * the setup instructions tell the operator to run; anything materially
+ * shorter is a word someone typed by hand, and a typed word that silently
+ * works is how a machine path stops being a secret.
+ */
+const MIN_TOKEN_LENGTH = 32
+
+export type Env = Record<string, string | undefined>
+
+export interface LeveransConfig {
+  token: string
+  /** Canonical 10-digit form, as companies.org_number stores it. */
+  orgnr: string
+}
+
+/** Config for the machine path, or null when the deployment has not enabled it. */
+export function readLeveransConfig(env: Env = process.env): LeveransConfig | null {
+  const token = env[TOKEN_ENV]?.trim()
+  const orgnr = normalizeOrgNumber(env[ORGNR_ENV])
+  if (!token || token.length < MIN_TOKEN_LENGTH || !orgnr) return null
+  return { token, orgnr }
+}
+
+/**
+ * Whether bertil's delivery lands in THIS company.
+ *
+ * The workspace is per company, the delivery is bound to exactly one, and a
+ * box can hold several. "The token is set" is therefore not an answer the
+ * workspace can use: on a box with two companies it would promise the other
+ * company's user that exports arrive by themselves, and that user would wait
+ * for a delivery that is, by construction, going somewhere else. So the
+ * question asked here is the one the user actually has, and it is answered
+ * through the same resolution the delivery itself runs: configured, org
+ * number resolves to a single active company, and that company is this one.
+ * Anything else is a no, and the workspace says "import the file".
+ */
+export async function leveransTargetsCompany(companyId: string, deps: LeveransDeps = {}): Promise<boolean> {
+  const config = readLeveransConfig(deps.env ?? process.env)
+  if (!config) return false
+  try {
+    const supabase = deps.client ?? createServiceClientNoCookies()
+    const resolved = await resolveLeveransCompany(supabase, config)
+    return resolved.ok && resolved.companyId === companyId
+  } catch {
+    // This runs on every workspace load. A box that cannot build a
+    // service-role client cannot receive a delivery either, so the honest
+    // answer is no; it must never be a broken workspace.
+    return false
+  }
+}
+
+/**
+ * The token as bertil sends it: `Authorization: Bearer <token>`.
+ *
+ * The `apikey` header is accepted as well because bertil's client
+ * (underlagsjakt_export_client.py, bertil#183) sets both, and a delivery
+ * that fails because one of two identical headers was read would be a
+ * needlessly obscure outage.
+ */
+export function extractLeveransToken(request: Request): string | null {
+  const authorization = request.headers.get('authorization')
+  if (authorization?.toLowerCase().startsWith('bearer ')) {
+    const value = authorization.slice(7).trim()
+    if (value) return value
+  }
+  const apikey = request.headers.get('apikey')?.trim()
+  return apikey || null
+}
+
+/** Constant-time comparison over digests, so inputs of different length are still safe to compare. */
+function tokenMatches(presented: string, expected: string): boolean {
+  const a = crypto.createHash('sha256').update(presented).digest()
+  const b = crypto.createHash('sha256').update(expected).digest()
+  return crypto.timingSafeEqual(a, b)
+}
+
+function fail(status: number, code: string, message: string): NextResponse {
+  return NextResponse.json({ error: { code, message } }, { status })
+}
+
+export type LeveransAuth =
+  | { ok: true; ctx: ExtensionContext; config: LeveransConfig }
+  | { ok: false; response: NextResponse }
+
+type ResolvedCompany =
+  | { ok: true; companyId: string }
+  | { ok: false; code: string; message: string }
+
+/**
+ * The one company the configured org number names, or why it names none.
+ *
+ * Shared by the delivery (which writes there) and the workspace (which tells
+ * the user whether a delivery is coming), so the two can never disagree about
+ * where an export lands.
+ */
+async function resolveLeveransCompany(
+  supabase: SupabaseClient,
+  config: LeveransConfig,
+): Promise<ResolvedCompany> {
+  // Both storage shapes: the canonical 10 digits and the hyphenated form a
+  // company created before normalizeOrgNumber may still carry.
+  const { data: companies, error } = await supabase
+    .from('companies')
+    .select('id')
+    .in('org_number', [config.orgnr, formatOrgNumberDisplay(config.orgnr)])
+    .is('archived_at', null)
+
+  if (error) {
+    return {
+      ok: false,
+      code: 'LEVERANS_COMPANY_LOOKUP_FAILED',
+      message: 'Bolaget för leveransen kunde inte slås upp.',
+    }
+  }
+  const rows = (companies ?? []) as { id: string }[]
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      code: 'LEVERANS_COMPANY_NOT_FOUND',
+      message: `Inget aktivt bolag har organisationsnummer ${formatOrgNumberDisplay(config.orgnr)}. Kontrollera ${ORGNR_ENV}.`,
+    }
+  }
+  if (rows.length > 1) {
+    // Never guess which one: the whole point of binding the company outside
+    // the request is that an export cannot land in the wrong bolag.
+    return {
+      ok: false,
+      code: 'LEVERANS_COMPANY_AMBIGUOUS',
+      message: `Flera bolag har organisationsnummer ${formatOrgNumberDisplay(config.orgnr)}. Leveransen stoppas hellre än gissar.`,
+    }
+  }
+  return { ok: true, companyId: rows[0].id }
+}
+
+export interface LeveransDeps {
+  env?: Env
+  /** Service-role client; injected in tests. */
+  client?: SupabaseClient
+}
+
+export type LeveransContext =
+  | { ok: true; ctx: ExtensionContext }
+  | { ok: false; code: string; message: string }
+
+/**
+ * The company the configuration names, and the service-role context that
+ * writes there.
+ *
+ * Shared by the delivery itself and by leverans-status.ts, so the operator's
+ * switch-on check resolves the company through exactly the same code a real
+ * delivery runs: a check that resolves it its own way can pass while the
+ * delivery fails.
+ */
+export async function openLeveransContext(
+  supabase: SupabaseClient,
+  config: LeveransConfig,
+): Promise<LeveransContext> {
+  const resolved = await resolveLeveransCompany(supabase, config)
+  if (!resolved.ok) return resolved
+  const companyId = resolved.companyId
+
+  // extension_data.user_id is NOT NULL, and a delivery has no human behind
+  // it, so the write is attributed to the company's owner: the person who
+  // answers the questions in the workspace anyway.
+  const { data: owner, error: ownerError } = await supabase
+    .from('company_members')
+    .select('user_id')
+    .eq('company_id', companyId)
+    .eq('role', 'owner')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle()
+
+  if (ownerError || !owner) {
+    return {
+      ok: false,
+      code: 'LEVERANS_OWNER_NOT_FOUND',
+      message: 'Bolaget saknar ägare att bokföra leveransen på.',
+    }
+  }
+
+  return {
+    ok: true,
+    ctx: createExtensionContext(supabase, (owner as { user_id: string }).user_id, companyId, EXTENSION_ID),
+  }
+}
+
+/**
+ * Authenticate a delivery call and build the context it may write through.
+ *
+ * The context is service-role (there is no session to run RLS against), so
+ * the company it is bound to is the whole of the authorisation decision.
+ * `createExtensionContext` scopes every `settings` read and write to that
+ * company id, which is why no route reachable from here takes a company
+ * from the request.
+ */
+export async function authenticateLeverans(
+  request: Request,
+  deps: LeveransDeps = {},
+): Promise<LeveransAuth> {
+  const config = readLeveransConfig(deps.env ?? process.env)
+  if (!config) {
+    return {
+      ok: false,
+      response: fail(
+        503,
+        'LEVERANS_NOT_CONFIGURED',
+        `Automatisk leverans är inte påslagen. Sätt ${TOKEN_ENV} och ${ORGNR_ENV} på servern.`,
+      ),
+    }
+  }
+
+  const presented = extractLeveransToken(request)
+  if (!presented) {
+    return { ok: false, response: fail(401, 'LEVERANS_TOKEN_MISSING', 'Leveransnyckel saknas.') }
+  }
+  if (!tokenMatches(presented, config.token)) {
+    return { ok: false, response: fail(401, 'LEVERANS_TOKEN_INVALID', 'Leveransnyckeln stämmer inte.') }
+  }
+
+  const supabase = deps.client ?? createServiceClientNoCookies()
+
+  const opened = await openLeveransContext(supabase, config)
+  if (!opened.ok) {
+    return { ok: false, response: fail(503, opened.code, opened.message) }
+  }
+
+  return { ok: true, config, ctx: opened.ctx }
+}

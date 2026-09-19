@@ -5,10 +5,13 @@ import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt
 export interface WorkspaceData {
   supported_export_versions: string[]
   answer_version: string
+  /** Whether bertil's delivery lands in the company being viewed, not merely somewhere on this box. */
+  leverans: { till_detta_bolag: boolean }
   export: {
     export_version: string
     generated_at: string
     imported_at: string
+    imported_via: 'leverans' | 'fil'
     sammanstallningar: {
       bolag: string
       period: string

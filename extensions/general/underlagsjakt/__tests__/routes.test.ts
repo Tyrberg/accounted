@@ -52,7 +52,7 @@ const post = (path: string, body?: unknown) => createMockRequest(path, { method:
 const get = (path: string) => createMockRequest(path)
 
 async function importFixture(ctx: ExtensionContext) {
-  const res = await route('POST', '/export').handler(post('/export', fixture), ctx)
+  const res = await route('POST', '/export/fil').handler(post('/export/fil', fixture), ctx)
   expect(res.status).toBe(200)
 }
 
@@ -84,7 +84,7 @@ beforeEach(() => {
 describe('auth', () => {
   it.each([
     ['GET', '/'],
-    ['POST', '/export'],
+    ['POST', '/export/fil'],
     ['POST', '/svar'],
     ['DELETE', '/svar/:transactionId'],
     ['GET', '/svarsfil'],
@@ -95,7 +95,7 @@ describe('auth', () => {
   })
 
   it.each([
-    ['POST', '/export'],
+    ['POST', '/export/fil'],
     ['POST', '/svar'],
     ['DELETE', '/svar/:transactionId'],
     ['POST', '/svarsfil/levererad'],
@@ -122,11 +122,11 @@ describe('GET /', () => {
   })
 })
 
-describe('POST /export', () => {
+describe('POST /export/fil', () => {
   it('returns 400 for a body that is not JSON', async () => {
-    const req = new Request('http://localhost/export', { method: 'POST', body: '{nope' })
+    const req = new Request('http://localhost/export/fil', { method: 'POST', body: '{nope' })
     const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
-      await route('POST', '/export').handler(req, buildCtx()),
+      await route('POST', '/export/fil').handler(req, buildCtx()),
     )
     expect(status).toBe(400)
     expect(body.error.code).toBe('INVALID_JSON')
@@ -135,7 +135,7 @@ describe('POST /export', () => {
   it('returns 400 UNSUPPORTED_VERSION and stores nothing for an unknown contract version', async () => {
     const ctx = buildCtx()
     const { status, body } = await parseJsonResponse<{ error: { code: string; version: string; message: string } }>(
-      await route('POST', '/export').handler(post('/export', { ...fixture, export_version: '1.0' }), ctx),
+      await route('POST', '/export/fil').handler(post('/export/fil', { ...fixture, export_version: '1.0' }), ctx),
     )
     expect(status).toBe(400)
     expect(body.error).toMatchObject({ code: 'UNSUPPORTED_VERSION', version: '1.0' })
@@ -146,7 +146,7 @@ describe('POST /export', () => {
 
   it('returns 400 INVALID_EXPORT for a 1.1 file that breaks the schema', async () => {
     const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
-      await route('POST', '/export').handler(post('/export', { export_version: '1.1', posts: 'x' }), buildCtx()),
+      await route('POST', '/export/fil').handler(post('/export/fil', { export_version: '1.1', posts: 'x' }), buildCtx()),
     )
     expect(status).toBe(400)
     expect(body.error.code).toBe('INVALID_EXPORT')
@@ -154,7 +154,7 @@ describe('POST /export', () => {
 
   it('accepts a 1.4 export with new fields (reglering, leverantor_sokord)', async () => {
     const ctx = buildCtx()
-    const res = await route('POST', '/export').handler(post('/export', fixture14), ctx)
+    const res = await route('POST', '/export/fil').handler(post('/export/fil', fixture14), ctx)
     const { status, body: imported } = await parseJsonResponse<{ data: { posts: number; export_version: string } }>(res)
     expect(status).toBe(200)
     expect(imported.data.posts).toBe(3)
@@ -167,7 +167,7 @@ describe('POST /export', () => {
 
   it('stores the export and shows each post with readable account and evidence', async () => {
     const ctx = buildCtx()
-    const res = await route('POST', '/export').handler(post('/export', fixture), ctx)
+    const res = await route('POST', '/export/fil').handler(post('/export/fil', fixture), ctx)
     const { status, body: imported } = await parseJsonResponse<{ data: { posts: number } }>(res)
     expect(status).toBe(200)
     expect(imported.data.posts).toBe(3)

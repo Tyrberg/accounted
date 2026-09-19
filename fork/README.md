@@ -28,6 +28,7 @@ turns out to matter more.
 8. [AGPL-3.0 section 13: what running a modified copy obliges us to do](#8-agpl-30-section-13-what-running-a-modified-copy-obliges-us-to-do)
 9. [The GitLab copy](#9-the-gitlab-copy)
 10. [Not live yet](#10-not-live-yet)
+11. [Switching on the Underlagsjakt delivery](#11-switching-on-the-underlagsjakt-delivery)
 
 ---
 
@@ -546,4 +547,143 @@ it cannot be mistaken for done.
 | Revoke and remove the GitLab `glpat-` token       | Whoever has GitLab admin, per section 9       |
 | Archive the GitLab project as read-only           | Same                                          |
 | Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Mattias, after this fork is deployed to his instance. Until then no real post has been shown there |
+| Underlagsjakt automatic delivery: all four switch-on steps in [section 11](#11-switching-on-the-underlagsjakt-delivery), from minting the token to confirming both directions with real data. Concretely: `UNDERLAGSJAKT_LEVERANS_TOKEN` + `UNDERLAGSJAKT_LEVERANS_ORGNR` in the Accounted box's `.env`; `GNUBOK_API_URL` + `GNUBOK_API_KEY` in bertil's; `/etc/cron.d/underlagsjakt-leverans` installed on bertil's box; one real export and one real answer carried | Whoever administers the two boxes. Three of the four steps happen outside this repository, and nothing in a pull request can reach either machine. Until `npx tsx extensions/general/underlagsjakt/leverans-status.ts` exits 0 on the box, the delivery is code that has never run, and the box says so on every run rather than leaving it to this table |
 | Underlagsjakt: teach the extension bertil's next contract version once bertil#180 (the `reglering` field) is merged; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
+
+---
+
+## 11. Switching on the Underlagsjakt delivery
+
+Section 10 lists this as not live. This section is the whole of what "live"
+takes: four steps across two boxes, no code changes anywhere. Only step 2
+touches this repository's deployment; the rest is bertil's box, which nothing
+here can reach, so none of it can be performed from a pull request.
+
+The endpoints, the contract and the failure codes are documented in
+[`docs/underlagsjakt-export-schema.md`](../docs/underlagsjakt-export-schema.md).
+What follows is the operator order, with the check that has to pass before
+moving on.
+
+### Step 1: mint the secret
+
+On either box, once:
+
+```bash
+openssl rand -base64 24    # 32 characters; the app refuses anything shorter
+```
+
+It goes into two `.env` files and nowhere else: never into this repository,
+never into bertil's, never into a ticket (task 1453 is why).
+
+### Step 2: the Accounted box
+
+Add to the deployment's `.env`, next to the other secrets:
+
+```
+UNDERLAGSJAKT_LEVERANS_TOKEN=<the value from step 1>
+UNDERLAGSJAKT_LEVERANS_ORGNR=<org number of the company the export belongs to>
+```
+
+Then `docker compose up -d app`. No compose edit is needed: `docker-compose.yml`
+hands the whole `.env` to the app through `env_file`.
+
+Confirm it took, on the box, in the clone:
+
+```bash
+npx tsx extensions/general/underlagsjakt/leverans-status.ts
+```
+
+It reads the configuration, resolves the company exactly as a delivery does,
+and reports what the machine path has actually carried. It writes nothing, and
+it never calls `GET /svar`. Its exit code is the whole verdict:
+
+| Exit | What it means |
+| --- | --- |
+| `4` | Nothing to check: the variables are unset, or the org number names no single active company. The lines say which. Fix and rerun before going further. |
+| `2` | Configured and resolving, but nothing has come through yet. **This is the expected answer at this point**, and it stays the answer until step 4 succeeds. |
+| `0` | Both directions have carried real data, recently. Only step 4 can produce this. |
+
+The same command is the standing check afterwards: a delivery that was never
+scheduled and one whose schedule died both look like silence, so it alarms
+(exit 2) once more than two days pass with no contact from bertil.
+
+The token itself can be checked from anywhere that can reach the box. This
+probe writes nothing either: the token check and the company lookup run first,
+and the empty body is then rejected by the contract rules before anything is
+stored.
+
+```bash
+curl -s -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -d '{}' https://bokforing.bohed.com/api/extensions/ext/underlagsjakt/export
+```
+
+| Answer | What it means |
+| --- | --- |
+| `400` (for this body, `UNSUPPORTED_VERSION`) | The pass. Only the contract rules reject with 400, and they run last, so reaching one means the token was accepted and the org number resolved to exactly one active company. |
+| `401` | The token is not the one the box has. |
+| `503` | The box has no delivery configured, or the org number matches no active company or several. The body names which. |
+
+Do **not** probe the other direction by hand. `GET /svar` hands each answer
+over exactly once, so anything fetched with curl is something bertil will
+never see.
+
+### Step 3: bertil's box
+
+In bertil's `.env`:
+
+```
+GNUBOK_API_URL=https://bokforing.bohed.com
+GNUBOK_API_KEY=<the same value from step 1>
+```
+
+Then schedule the client, so the delivery is nobody's daily chore:
+
+```cron
+# /etc/cron.d/underlagsjakt-leverans
+#
+# System crontab format: field 6 is the user to run as, the command stays on
+# one line, and the file must end with a newline or cron ignores the last one.
+PATH=/usr/local/bin:/usr/bin:/bin
+17 6 * * * deploy cd /opt/projects/bertil && python underlagsjakt_export_client.py >> var/leverans.log 2>&1
+```
+
+Replace `deploy` with the user that owns bertil's checkout and reads that
+`.env`, and the invocation with however bertil's repository runs the client
+(venv, `uv run`, `make`). Point the log at a file that user can already write,
+for the reason spelled out in section 5: the shell opens the redirect before
+the command runs, so an unwritable path kills the job silently every morning.
+
+### Step 4: prove both directions, once, with real data
+
+Requirement 5 of the task is this step, and it is the one that cannot be
+skipped: everything above is configuration, and configuration that has never
+carried a real export is not a working delivery.
+
+1. Run the client by hand once: `python underlagsjakt_export_client.py`.
+2. Open `https://bokforing.bohed.com/e/general/underlagsjakt` without touching
+   a file. The line under the summary must read "Automatisk leverans från
+   bertil är påslagen för det här bolaget. Den här exporten kom hit av sig
+   själv." If it says "lästes in som fil", the page is still showing an older
+   hand-uploaded export and the delivery did not land: check the client's log
+   for the status code and look it up in the table in step 2.
+3. Answer one question in that surface.
+4. Let the client run again (or wait for the 06:17 tick) and confirm the
+   answer is in bertil's knowledge base as a learned rule.
+5. If it is not: the answer was handed over and bertil dropped it, so `GET
+   /svar` will not repeat it. bertil's next export asks about that payment
+   again and the question reappears in the surface, which is where to answer
+   it a second time once the ingest is fixed.
+6. Run `npx tsx extensions/general/underlagsjakt/leverans-status.ts` on the
+   Accounted box once more. **Exit 0 is the pass**, and it is the one the row
+   in section 10 comes out for. Anything else names the half that did not
+   happen: an export that only ever arrived as a file, a bertil that never
+   called `GET /svar`, or a collection that has never carried an answer.
+
+The command is the record. It reads what the two directions actually wrote
+(`imported_via` on the stored export, and the journal `GET /svar` writes on
+every call), so "we did this once in September" cannot survive a delivery that
+has since stopped: the same run that proved the chain is the run that keeps
+proving it.
+
+Until it exits 0 on real data, treat the chain as unproven and leave the row in
+section 10 standing.

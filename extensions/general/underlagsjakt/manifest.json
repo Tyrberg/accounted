@@ -5,7 +5,7 @@
   "entryPoint": "@/extensions/general/underlagsjakt",
   "workspace": "@/components/extensions/general/UnderlagsjaktWorkspace",
   "requiredEnvVars": [],
-  "optionalEnvVars": [],
+  "optionalEnvVars": ["UNDERLAGSJAKT_LEVERANS_TOKEN", "UNDERLAGSJAKT_LEVERANS_ORGNR"],
   "npmDependencies": [],
   "definition": {
     "name": "Underlagsjakt",
