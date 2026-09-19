@@ -259,13 +259,15 @@ describe('PostAnswerPanel wiring', () => {
   })
 
   it('always renders the reason line (never unmounted), following the BookDirectlyDialog disabledReason/canSubmit pattern: attn tone plus aria-live while blocked, muted "ready" text otherwise', () => {
-    expect(SRC).toMatch(/const disabledReason =\s*\n\s*saving \|\| missingReasons\.length === 0\s*\n\s*\? null/)
+    expect(SRC).toMatch(/const ready = missingReasons\.length === 0/)
+    expect(SRC).toMatch(/const disabledReason = saving \|\| ready \? null : t\('save_disabled_reason'/)
     expect(SRC).toMatch(/<p className=\{cn\('text-xs', disabledReason \? 'text-attn' : 'text-muted-foreground'\)\} aria-live="polite">/)
     expect(SRC).toMatch(/\{disabledReason \?\? t\('save_ready'\)\}/)
   })
 
-  it('surfaces the same reason as a title on the disabled button, for the hover reflex a greyed-out button invites', () => {
-    expect(SRC).toMatch(/<Button onClick=\{\(\) => void submit\(\)\} disabled=\{!input \|\| saving\} title=\{disabledReason \?\? undefined\}>/)
+  it('derives the button disabled state from the same `ready` flag as the hint line, not a separately-computed `input` check, so the two cannot disagree', () => {
+    expect(SRC).toMatch(/const canSubmit = ready && !saving/)
+    expect(SRC).toMatch(/<Button onClick=\{\(\) => void submit\(\)\} disabled=\{!canSubmit\}>/)
   })
 
   it('reloads the list only when interpretSaveResult says so, so an answered post leaves "Att besvara" without a page reload', () => {
