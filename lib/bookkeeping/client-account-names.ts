@@ -1,22 +1,25 @@
 /**
  * Client-safe account name map for UI display.
- * Covers the ~30 accounts used in transaction categorization.
+ * Covers the accounts used in transaction categorization.
  * No server dependencies: safe for 'use client' components.
+ * lib/bookkeeping/__tests__/client-account-names.test.ts pins every entry
+ * against the canonical BAS 2026 chart (lib/bookkeeping/bas-data): never add
+ * or rename an entry here without a matching account_name there.
  */
 
-const ACCOUNT_NAMES: Record<string, string> = {
+export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
   // Assets (1xxx)
-  '1250': 'Inventarier',
+  '1250': '(Fritt konto för Inventarier, verktyg och installationer)',
   '1510': 'Kundfordringar',
   '1630': 'Skattekonto',
-  '1680': 'Fordringar hos ägare',
+  '1680': 'Andra kortfristiga fordringar',
   '1930': 'Företagskonto',
 
   // Equity & Liabilities (2xxx)
   '2013': 'Övriga egna uttag',
   '2018': 'Egna insättningar',
   '2350': 'Långfristiga skulder',
-  '2393': 'Kortfristig skuld närstående',
+  '2393': 'Lån från närstående personer, långfristig del',
   '2440': 'Leverantörsskulder',
   '2510': 'Skatteskulder',
   '2611': 'Utg. moms 25%',
@@ -45,48 +48,54 @@ const ACCOUNT_NAMES: Record<string, string> = {
   '4010': 'Varuinköp',
   '4060': 'Varuinköp omvänd moms',
   '4070': 'Varuinköp EU',
-  '4100': 'Inköp material/varor',
-  '4500': 'Övriga inköpskostnader',
-  '4531': 'Import-/tullkostnader',
+  '4500': 'Inköp från utlandet (gruppkonto)',
+  '4531': 'Inköp av tjänster från ett land utanför EU, 25 % moms',
   '4600': 'Subentreprenader',
 
   // External expenses (5xxx)
   '5010': 'Lokalhyra',
-  '5020': 'El & uppvärmning',
+  '5020': 'El',
   '5410': 'Förbrukningsinventarier',
   '5420': 'Programvaror',
-  '5421': 'Molntjänster',
   '5460': 'Förbrukningsvaror',
   '5611': 'Drivmedel bil',
   '5613': 'Reparation fordon',
-  '5614': 'Parkering',
   '5615': 'Leasing fordon',
+  '5619': 'Övriga kostnader för personbilar och mc',
   '5800': 'Resekostnader',
-  '5810': 'Biljetter & transport',
-  '5820': 'Hotell',
+  '5810': 'Biljetter',
+  '5820': 'Hyrbilskostnader',
+  '5830': 'Kost och logi',
   '5910': 'Annonsering',
-  '5920': 'Design & grafik',
-  '5990': 'Konferens',
+  '5920': 'Utomhus- och trafikreklam',
+  '5990': 'Övriga kostnader för reklam och PR',
 
   // Other external expenses (6xxx)
   '6071': 'Representation',
-  '6110': 'Kontorsförbrukning',
+  '6110': 'Kontorsmateriel',
   '6200': 'Telefon & internet',
-  '6211': 'Mobiltelefon',
-  '6230': 'Internet',
+  '6211': 'Fast telefoni',
+  '6230': 'Datakommunikation',
   '6250': 'Porto',
   '6310': 'Företagsförsäkring',
   '6530': 'Redovisningstjänster',
   '6550': 'Konsulttjänster',
   '6570': 'Bankavgifter',
-  '6980': 'Medlemsavgifter',
+  '6980': 'Föreningsavgifter',
   '6991': 'Övriga kostnader',
 
   // Personnel & financial (7xxx / 8xxx)
   '7210': 'Löner tjänstemän',
+  '7321': 'Skattefria traktamenten, Sverige',
+  '7322': 'Skattepliktiga traktamenten, Sverige',
+  '7323': 'Skattefria traktamenten, utlandet',
+  '7324': 'Skattepliktiga traktamenten, utlandet',
+  '7331': 'Skattefria bilersättningar',
+  '7332': 'Skattepliktiga bilersättningar',
+  '7333': 'Ersättning för trängselskatt, skattefri',
   '7410': 'Pensionsförsäkring',
   '7610': 'Utbildning',
-  '7622': 'Intern representation',
+  '7622': 'Sjuk- och hälsovård, ej avdragsgill',
   '7960': 'Valutakursförluster',
   '8310': 'Ränteintäkter',
   '8410': 'Räntekostnader',

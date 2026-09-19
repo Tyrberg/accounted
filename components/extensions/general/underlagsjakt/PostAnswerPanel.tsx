@@ -2,7 +2,8 @@
 
 import { useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
-import { Eye, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, Eye, Loader2 } from 'lucide-react'
+import { AttnLine } from '@/components/ui/attn-line'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -12,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { isAccountNumber } from '@/lib/invariants/account-number'
+import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
 import {
   KATEGORIER,
   MOMSTYPER,
@@ -26,6 +28,7 @@ import {
   type SvarInput,
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
+import { looksLikeReferenceNumber, suggestBasKonto } from '@/extensions/general/underlagsjakt/lib/account-suggestion'
 import { errorText } from './shared'
 
 type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
@@ -59,16 +62,18 @@ export function PostAnswerPanel({
   const suggestedKategori = (KATEGORIER as readonly string[]).includes(post.forslag?.kategori ?? '')
     ? (post.forslag!.kategori as Kategori)
     : undefined
-  const suggestedMomstyp = (MOMSTYPER as readonly string[]).includes(post.forslag?.momstyp ?? '')
-    ? (post.forslag!.momstyp as Momstyp)
-    : null
   const [chosen, setChosen] = useState<string | undefined>(undefined)
   const [motpart, setMotpart] = useState(post.motpart)
   const [kategori, setKategori] = useState<Kategori | undefined>(suggestedKategori)
-  const [basKonto, setBasKonto] = useState(post.forslag?.bas_konto ?? '')
-  const [momstyp, setMomstyp] = useState<Momstyp | null>(suggestedMomstyp)
+  // null = follow the live suggestion below as kategori/motpart change; a string means the
+  // owner typed something themselves, so it stops following.
+  const [basKontoOverride, setBasKontoOverride] = useState<string | null>(null)
+  // undefined = follow the live suggestion below as kategori changes; Momstyp | null means the
+  // owner chose explicitly (including "ingen moms"), so it stops following.
+  const [momstypOverride, setMomstypOverride] = useState<Momstyp | null | undefined>(undefined)
   const [begransaBolag, setBegransaBolag] = useState(false)
   const [begransaBelopp, setBegransaBelopp] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   // fel_bolag: nothing preselected; the user must state each of the three facts.
   const [tillBolagChoice, setTillBolagChoice] = useState<string | undefined>(undefined)
@@ -77,7 +82,30 @@ export function PostAnswerPanel({
   const [otherMottagare, setOtherMottagare] = useState('')
   const [reglering, setReglering] = useState<Reglering | undefined>(undefined)
 
+  // bertil's own forslag wins when it was made for the kategori actually chosen; otherwise
+  // fall back to a suggestion derived from the kategori (and motpart) the owner picked, so
+  // they never have to type a BAS account number themselves.
+  const suggestedBasKonto =
+    kategori && post.forslag?.kategori === kategori && post.forslag.bas_konto
+      ? post.forslag.bas_konto
+      : kategori
+        ? suggestBasKonto(kategori, motpart, post.belopp)
+        : null
+  const basKonto = basKontoOverride ?? suggestedBasKonto ?? ''
   const basKontoValid = basKonto.trim() === '' || isAccountNumber(basKonto.trim())
+  const motpartLooksLikeReference = looksLikeReferenceNumber(motpart)
+
+  // Same "follow the forslag only when it was made for this kategori" rule as
+  // suggestedBasKonto: correcting leverantor/svensk_25 to bankavgift (momsfritt)
+  // must not silently keep submitting svensk_25.
+  const suggestedMomstyp =
+    kategori && post.forslag?.kategori === kategori && (MOMSTYPER as readonly string[]).includes(post.forslag?.momstyp ?? '')
+      ? (post.forslag!.momstyp as Momstyp)
+      : null
+  const momstyp = momstypOverride !== undefined ? momstypOverride : suggestedMomstyp
+  // A rejected BAS account (typed or from an unvalidated forslag.bas_konto) must not hide its
+  // own error behind the collapsed disclosure: force it open until the owner fixes it.
+  const advancedOpen = showAdvanced || !basKontoValid
 
   const tillBolag: string | null | undefined =
     tillBolagChoice === undefined
@@ -211,6 +239,7 @@ export function PostAnswerPanel({
                 onChange={(e) => setMotpart(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">{t('field_motpart_hint')}</p>
+              {motpartLooksLikeReference && <AttnLine>{t('motpart_reference_number_warning')}</AttnLine>}
             </div>
             <div className="space-y-2">
               <Label>{t('field_kategori')}</Label>
@@ -221,43 +250,84 @@ export function PostAnswerPanel({
                 <SelectContent>
                   {KATEGORIER.map((k) => (
                     <SelectItem key={k} value={k}>
-                      {t(`kategori_${k}`)}
+                      <span className="flex flex-col py-0.5">
+                        <span>{t(`kategori_${k}`)}</span>
+                        <span className="text-xs text-muted-foreground">{t(`kategori_${k}_example`)}</span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              {kategori && basKontoValid && basKonto.trim() && (
+                <p className="text-xs text-muted-foreground">
+                  {t(basKontoOverride === null ? 'suggested_account' : 'chosen_account', {
+                    account: formatAccountWithName(basKonto.trim()),
+                  })}
+                </p>
+              )}
+              {momstyp && (
+                <p className="text-xs text-muted-foreground">
+                  {t('current_momstyp', { momstyp: t(`momstyp_${momstyp}`) })}
+                </p>
+              )}
             </div>
-            <div className="space-y-2">
-              <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')}</Label>
-              <Input
-                id={`bas-${post.transaction_id}`}
-                inputMode="numeric"
-                maxLength={4}
-                value={basKonto}
-                onChange={(e) => setBasKonto(e.target.value)}
-                aria-invalid={!basKontoValid}
-              />
-              {!basKontoValid && <p className="text-xs text-destructive">{t('field_bas_konto_invalid')}</p>}
-            </div>
-            <div className="space-y-2">
-              <Label>{t('field_momstyp')}</Label>
-              <Select
-                value={momstyp ?? NONE}
-                onValueChange={(v) => setMomstyp(v === NONE ? null : (v as Momstyp))}
+          </div>
+
+          <div>
+            {basKontoValid ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 justify-start gap-1.5 px-0 text-xs text-muted-foreground hover:bg-transparent"
+                onClick={() => setShowAdvanced((v) => !v)}
               >
-                <SelectTrigger aria-label={t('field_momstyp')}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE}>{t('momstyp_none')}</SelectItem>
-                  {MOMSTYPER.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {t(`momstyp_${m}`)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+                {advancedOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {t('advanced_toggle')}
+              </Button>
+            ) : (
+              // Forced open by the invalid BAS account below: nothing left for a toggle to do,
+              // so it renders as a static label instead of a control with no click path.
+              <p className="flex h-8 items-center gap-1.5 text-xs text-muted-foreground">
+                <ChevronUp className="h-3.5 w-3.5" />
+                {t('advanced_toggle')}
+              </p>
+            )}
+            {advancedOpen && (
+              <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')}</Label>
+                  <Input
+                    id={`bas-${post.transaction_id}`}
+                    inputMode="numeric"
+                    maxLength={4}
+                    value={basKonto}
+                    onChange={(e) => setBasKontoOverride(e.target.value)}
+                    aria-invalid={!basKontoValid}
+                  />
+                  {!basKontoValid && <p className="text-xs text-destructive">{t('field_bas_konto_invalid')}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('field_momstyp')}</Label>
+                  <Select
+                    value={momstyp ?? NONE}
+                    onValueChange={(v) => setMomstypOverride(v === NONE ? null : (v as Momstyp))}
+                  >
+                    <SelectTrigger aria-label={t('field_momstyp')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NONE}>{t('momstyp_none')}</SelectItem>
+                      {MOMSTYPER.map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {t(`momstyp_${m}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="space-y-2 text-[13px]">
