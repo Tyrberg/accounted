@@ -9,7 +9,7 @@
 
 export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
   // Assets (1xxx)
-  '1250': 'Inventarier',
+  '1250': '(Fritt konto för Inventarier, verktyg och installationer)',
   '1510': 'Kundfordringar',
   '1630': 'Skattekonto',
   '1680': 'Andra kortfristiga fordringar',
@@ -63,7 +63,7 @@ export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
   '5615': 'Leasing fordon',
   '5619': 'Övriga kostnader för personbilar och mc',
   '5800': 'Resekostnader',
-  '5810': 'Biljetter & transport',
+  '5810': 'Biljetter',
   '5820': 'Hyrbilskostnader',
   '5830': 'Kost och logi',
   '5910': 'Annonsering',
@@ -72,10 +72,10 @@ export const ACCOUNT_NAMES: Readonly<Record<string, string>> = {
 
   // Other external expenses (6xxx)
   '6071': 'Representation',
-  '6110': 'Kontorsförbrukning',
+  '6110': 'Kontorsmateriel',
   '6200': 'Telefon & internet',
   '6211': 'Fast telefoni',
-  '6230': 'Internet',
+  '6230': 'Datakommunikation',
   '6250': 'Porto',
   '6310': 'Företagsförsäkring',
   '6530': 'Redovisningstjänster',
