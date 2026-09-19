@@ -1,4 +1,4 @@
-import type { Post } from '@/extensions/general/underlagsjakt/lib/contract'
+import type { Kategori, Momstyp, Post, Reglering, SvarInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
@@ -64,6 +64,123 @@ export function errorText(t: T, body: unknown): string {
   return t('error_generic')
 }
 
+/** Sentinels for the fel_bolag radio groups: a chosen state distinct from `undefined` (nothing chosen yet). */
+export const NONE = 'none'
+export const EXTERNAL = '__external__'
+export const UNKNOWN = '__unknown__'
+export const OTHER = '__other__'
+export const OTHER_COMPANY = '__other_company__'
+export const PAYER = '__payer__'
+
+/**
+ * Resolves the raw "which company" radio choice to the value the answer actually carries:
+ * undefined (nothing picked yet), null (unknown company), the typed external name (once
+ * non-empty), or the picked company. The single definition, so the panel's render decisions
+ * (which recipient option to show, whether the settlement fieldset is enabled) and
+ * `buildAnswerInput`'s validation read the same fact instead of two copies that could drift.
+ */
+export function deriveTillBolag(tillBolagChoice: string | undefined, externalBolag: string): string | null | undefined {
+  return tillBolagChoice === undefined
+    ? undefined
+    : tillBolagChoice === UNKNOWN
+      ? null
+      : tillBolagChoice === EXTERNAL
+        ? externalBolag.trim() || undefined
+        : tillBolagChoice
+}
+
+export interface AnswerFormState {
+  mode: 'val_kandidat' | 'fel_bolag' | 'osaker'
+  transactionId: string
+  hasCandidate: boolean
+  sha256: string | null
+  kategori?: Kategori
+  motpart: string
+  basKonto: string
+  basKontoValid: boolean
+  momstyp: Momstyp | null
+  begransaBolag: boolean
+  begransaBelopp: boolean
+  /** Raw radio choice for "which company": a company name, EXTERNAL, UNKNOWN, or undefined (nothing picked). Only relevant in fel_bolag mode. */
+  tillBolagChoice?: string
+  externalBolag?: string
+  /** Raw radio choice for "who's on the invoice": OTHER, PAYER, OTHER_COMPANY, or undefined (nothing picked). Only relevant in fel_bolag mode. */
+  mottagareChoice?: string
+  otherMottagare?: string
+  /** The company that paid, used when mottagareChoice === PAYER. Only relevant in fel_bolag mode. */
+  payerBolag?: string
+  reglering?: Reglering
+}
+
+export type AnswerFormResult = { input: SvarInput; missing?: undefined } | { input?: undefined; missing: string[] }
+
+/**
+ * Single source for both what "Spara svar" submits and why it's disabled:
+ * building the input and detecting missing fields happen in the same pass,
+ * from the same raw radio/text state, as one exhaustive result, so the button
+ * state and the "why disabled" hint cannot drift into disagreement, and a
+ * choice made but not yet filled in (e.g. "external company" with an empty
+ * name field) is never mistaken for "nothing chosen".
+ */
+export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
+  const transaction_id = state.transactionId
+  if (state.mode === 'osaker') return { input: { svarstyp: 'osaker', transaction_id } }
+
+  if (state.mode === 'fel_bolag') {
+    const tillBolag = deriveTillBolag(state.tillBolagChoice, state.externalBolag ?? '')
+
+    const mottagare =
+      state.mottagareChoice === OTHER
+        ? (state.otherMottagare ?? '').trim() || undefined
+        : state.mottagareChoice === PAYER
+          ? state.payerBolag
+          : state.mottagareChoice === OTHER_COMPANY && typeof tillBolag === 'string'
+            ? tillBolag
+            : undefined
+
+    const missing: string[] = []
+    if (tillBolag === undefined) {
+      missing.push(state.tillBolagChoice === EXTERNAL ? 'missing_external_bolag_namn' : 'missing_till_bolag')
+    }
+    if (!mottagare) {
+      missing.push(state.mottagareChoice === OTHER ? 'missing_mottagare_namn' : 'missing_mottagare')
+    }
+    if (tillBolag !== null && tillBolag !== undefined && !state.reglering) {
+      missing.push('missing_reglering')
+    }
+    if (missing.length > 0) return { missing }
+    return {
+      input: {
+        svarstyp: 'fel_bolag',
+        transaction_id,
+        till_bolag: tillBolag ?? null,
+        fel_bolag_mottagare: mottagare!,
+        reglering: tillBolag === null ? null : (state.reglering ?? null),
+      },
+    }
+  }
+
+  const missing: string[] = []
+  if (!state.hasCandidate) missing.push('missing_candidate')
+  if (!state.kategori) missing.push('missing_kategori')
+  if (!state.motpart.trim()) missing.push('missing_motpart')
+  if (!state.basKontoValid) missing.push('missing_bas_konto')
+  if (missing.length > 0) return { missing }
+  return {
+    input: {
+      svarstyp: 'val_kandidat',
+      transaction_id,
+      sha256: state.sha256,
+      motpart: state.motpart.trim(),
+      kategori: state.kategori!,
+      bas_konto: state.basKonto.trim() || null,
+      momstyp: state.momstyp,
+      begransa_bolag: state.begransaBolag,
+      begransa_belopp: state.begransaBelopp,
+    },
+  }
+}
+
 export function answerSummary(t: T, rec: SvarRecord): string {
   const b = rec.beslut
   if (b.svarstyp === 'osaker') return t('answer_osaker')
@@ -74,4 +191,26 @@ export function answerSummary(t: T, rec: SvarRecord): string {
   return b.vald_kandidat
     ? t('answer_val_kandidat', { filnamn: b.vald_kandidat, kategori })
     : t('answer_ingen_kandidat', { motpart: b.motpart, kategori })
+}
+
+export interface SaveOutcome {
+  toast: { title: string; description?: string; variant?: 'destructive' }
+  /** Whether the answered list should be reloaded: only on a confirmed save. */
+  refresh: boolean
+}
+
+/**
+ * The decision behind the post-save toast and list refresh, isolated from the
+ * fetch call so it can be tested without a DOM: success and failure must
+ * produce different outcomes, and only success refreshes the list.
+ */
+export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutcome {
+  if (!ok) {
+    return { toast: { title: t('save_failed'), description: errorText(t, body), variant: 'destructive' }, refresh: false }
+  }
+  const data = (body as { data?: SvarRecord } | null)?.data
+  return {
+    toast: { title: t('save_success'), description: data ? answerSummary(t, data) : undefined },
+    refresh: true,
+  }
 }
