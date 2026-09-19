@@ -23,20 +23,21 @@ import {
   type Momstyp,
   type Post,
   type Reglering,
-  type SvarInput,
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
-import { errorText } from './shared'
+import {
+  EXTERNAL,
+  NONE,
+  OTHER,
+  OTHER_COMPANY,
+  PAYER,
+  UNKNOWN,
+  buildAnswerInput,
+  deriveTillBolag,
+  interpretSaveResult,
+} from './shared'
 
 type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
-
-/** Sentinel for "none of the candidates": a chosen state, unlike `undefined` (nothing chosen yet). */
-const NONE = 'none'
-const EXTERNAL = '__external__'
-const UNKNOWN = '__unknown__'
-const OTHER = '__other__'
-const OTHER_COMPANY = '__other_company__'
-const PAYER = '__payer__'
 
 const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
 
@@ -79,54 +80,40 @@ export function PostAnswerPanel({
 
   const basKontoValid = basKonto.trim() === '' || isAccountNumber(basKonto.trim())
 
-  const tillBolag: string | null | undefined =
-    tillBolagChoice === undefined
-      ? undefined
-      : tillBolagChoice === UNKNOWN
-        ? null
-        : tillBolagChoice === EXTERNAL
-          ? externalBolag.trim() || undefined
-          : tillBolagChoice
-  const mottagare =
-    mottagareChoice === OTHER
-      ? otherMottagare.trim() || undefined
-      : mottagareChoice === PAYER
-        ? post.bolag
-        : mottagareChoice === OTHER_COMPANY && typeof tillBolag === 'string'
-          ? tillBolag
-          : undefined
+  // Same derivation buildAnswerInput uses for validation, so what's rendered (the "same
+  // company" recipient option, the settlement fieldset) can never drift from what's required.
+  const tillBolag = deriveTillBolag(tillBolagChoice, externalBolag)
 
   const otherCompanies = bolagChoices.filter((b) => b.toLowerCase() !== post.bolag.toLowerCase())
 
-  const buildInput = (): SvarInput | null => {
-    const transaction_id = post.transaction_id
-    if (mode === 'osaker') return { svarstyp: 'osaker', transaction_id }
-    if (mode === 'fel_bolag') {
-      if (tillBolag === undefined || !mottagare) return null
-      if (tillBolag !== null && !reglering) return null
-      return {
-        svarstyp: 'fel_bolag',
-        transaction_id,
-        till_bolag: tillBolag,
-        fel_bolag_mottagare: mottagare,
-        reglering: tillBolag === null ? null : (reglering ?? null),
-      }
-    }
-    if (chosen === undefined || !kategori || !motpart.trim() || !basKontoValid) return null
-    return {
-      svarstyp: 'val_kandidat',
-      transaction_id,
-      sha256: chosen === NONE ? null : chosen,
-      motpart: motpart.trim(),
-      kategori,
-      bas_konto: basKonto.trim() || null,
-      momstyp,
-      begransa_bolag: begransaBolag,
-      begransa_belopp: begransaBelopp,
-    }
-  }
-
-  const input = buildInput()
+  const answerResult = buildAnswerInput({
+    mode,
+    transactionId: post.transaction_id,
+    hasCandidate: chosen !== undefined,
+    sha256: chosen === NONE ? null : (chosen ?? null),
+    kategori,
+    motpart,
+    basKonto,
+    basKontoValid,
+    momstyp,
+    begransaBolag,
+    begransaBelopp,
+    tillBolagChoice,
+    externalBolag,
+    mottagareChoice,
+    otherMottagare,
+    payerBolag: post.bolag,
+    reglering,
+  })
+  const input = answerResult.input ?? null
+  const missingReasons = answerResult.missing ?? []
+  const ready = missingReasons.length === 0
+  // Same rule as BookDirectlyDialog's disabledReason/canSubmit split (components/extensions/general/BookDirectlyDialog.tsx):
+  // null while a save is in flight, so the line reads "ready" instead of flashing a stale reason.
+  const disabledReason = saving || ready ? null : t('save_disabled_reason', { fields: missingReasons.map((key) => t(key)).join(', ') })
+  // Derived from the same `ready` the line above reads, not from `input`, so the button and the
+  // hint can never disagree even if buildAnswerInput's type ever allowed an empty `missing: []`.
+  const canSubmit = ready && !saving
 
   const submit = async () => {
     if (!input) return
@@ -137,12 +124,15 @@ export function PostAnswerPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       })
-      const json = await res.json().catch(() => null)
-      if (!res.ok) {
-        toast({ title: t('save_failed'), description: errorText(t, json), variant: 'destructive' })
-        return
-      }
-      await onAnswered()
+      const json: unknown = await res.json().catch(() => null)
+      const outcome = interpretSaveResult(t, res.ok, json)
+      toast(outcome.toast)
+      if (outcome.refresh) await onAnswered()
+    } catch {
+      // fetch rejected (offline, connection reset, ...) or the success body was
+      // malformed: no response reached interpretSaveResult, so treat it the same
+      // as a failed save rather than leaving the user without any feedback.
+      toast(interpretSaveResult(t, false, null).toast)
     } finally {
       setSaving(false)
     }
@@ -380,8 +370,11 @@ export function PostAnswerPanel({
 
       {mode === 'osaker' && <p className="text-[13px] text-muted-foreground">{t('osaker_description')}</p>}
 
-      <div className="flex justify-end">
-        <Button onClick={() => void submit()} disabled={!input || saving}>
+      <div className="flex flex-col items-end gap-2">
+        <p className={cn('text-xs', disabledReason ? 'text-attn' : 'text-muted-foreground')} aria-live="polite">
+          {disabledReason ?? t('save_ready')}
+        </p>
+        <Button onClick={() => void submit()} disabled={!canSubmit}>
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {mode === 'osaker' ? t('submit_osaker') : t('submit')}
         </Button>
