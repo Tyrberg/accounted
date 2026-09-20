@@ -169,6 +169,97 @@ A supporting document (email, invoice, receipt).
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
 
+## Transport: the automatic delivery
+
+The export does not have to be uploaded by hand. bertil can deliver it, and
+collect the answers, over two HTTP endpoints. They are the only routes in
+Accounted reachable without a logged-in user, and they are authenticated by a
+shared token, not by a session.
+
+| Call | Endpoint | Body |
+|---|---|---|
+| Deliver an export | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export` | The root wrapper above |
+| Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4", "beslut": [...] }` |
+
+Both calls send the token as `Authorization: Bearer <token>` (the `apikey`
+header is accepted as well, since bertil's client sets both).
+
+`GET /svar` hands each answer over exactly once: what it returns is marked as
+delivered in the same request, so the next call returns only what was answered
+since. If bertil fails to ingest a response, the payment stays unresolved on
+its side, its next export asks about it again, and Accounted puts the question
+back in front of the user. For the same reason it is not a probe: an answer
+fetched by hand is an answer bertil never receives.
+
+To check the configuration without writing anything, post a body the contract
+rejects, e.g. `{}`. Authentication and the company lookup run first and the
+export is stored last, so any `400` means the token was accepted and the org
+number resolved to a single active company, while `401` and `503` mean what
+the error table below says. The full switch-on order is in `fork/README.md`
+section 11.
+
+### What the server needs
+
+Two environment variables on the Accounted box, both unset by default (with
+either missing, the two endpoints answer `503 LEVERANS_NOT_CONFIGURED` and no
+token exists):
+
+| Variable | Meaning |
+|---|---|
+| `UNDERLAGSJAKT_LEVERANS_TOKEN` | The shared secret. At least 32 characters: generate with `openssl rand -base64 24`. |
+| `UNDERLAGSJAKT_LEVERANS_ORGNR` | Organisationsnummer of the one company the delivery writes to. 10 or 12 digits, hyphen optional. |
+
+The org number is the whole of the company binding: the caller cannot name a
+company, so a delivery can never land in another company's data. An org number
+that matches no active company, or more than one, stops the delivery rather
+than guessing.
+
+### What bertil needs
+
+`GNUBOK_API_URL` (e.g. `https://bokforing.bohed.com`) and `GNUBOK_API_KEY` set
+to the same token. The secret belongs in the box's environment, never in either
+repository.
+
+### Scheduling it
+
+The delivery is a push from bertil, so the schedule lives on bertil's box, not
+in Accounted. System crontab format (field 6 is the user), running the export
+client every morning:
+
+```cron
+# /etc/cron.d/underlagsjakt-leverans
+PATH=/usr/local/bin:/usr/bin:/bin
+17 6 * * * deploy cd /opt/projects/bertil && python underlagsjakt_export_client.py >> var/leverans.log 2>&1
+```
+
+(Adjust the invocation to however bertil's repository exposes
+`underlagsjakt_export_client.py`.)
+
+`GNUBOK_API_URL` and `GNUBOK_API_KEY` must be readable by that user (bertil's
+`.env`), and the file has to end with a newline or cron ignores the last line.
+
+### Checking that it runs
+
+On the Accounted box, in the clone:
+
+```bash
+npx tsx extensions/general/underlagsjakt/leverans-status.ts
+```
+
+It reports what the machine path has actually carried in each direction and
+exits `0` only once both have carried real data recently, `2` while a direction
+has never run or has gone quiet for more than two days, and `4` when the box is
+not configured at all. It writes nothing and never calls `GET /svar`.
+
+### Errors
+
+| Status | Code | Meaning |
+|---|---|---|
+| 401 | `LEVERANS_TOKEN_MISSING` / `LEVERANS_TOKEN_INVALID` | No token, or not the configured one. |
+| 503 | `LEVERANS_NOT_CONFIGURED` | The server has no usable delivery configuration. The message names each variable that is unset, too short or malformed, so a token that was typed by hand is not reported as a token that was never set, and an org number with one mistyped digit is reported as a wrong check digit rather than as the wrong number of digits. |
+| 503 | `LEVERANS_COMPANY_NOT_FOUND` / `LEVERANS_COMPANY_AMBIGUOUS` | `UNDERLAGSJAKT_LEVERANS_ORGNR` matches no active company, or several. |
+| 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
+
 ## Version History
 
 ### 1.4

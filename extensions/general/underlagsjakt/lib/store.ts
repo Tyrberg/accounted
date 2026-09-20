@@ -1,9 +1,11 @@
 /**
  * Workspace state for underlagsjakt, kept in `extension_data` (no own tables).
  *
- *   key `export`: the last export read from bertil, as parsed.
- *   key `svar`:   answers by transaction_id, including when they were handed
- *                 back to bertil (`levererad_at`).
+ *   key `export`:   the last export read from bertil, as parsed.
+ *   key `svar`:     answers by transaction_id, including when they were handed
+ *                   back to bertil (`levererad_at`).
+ *   key `leverans`: what the machine path has actually carried; see
+ *                   LeveransJournal.
  *
  * The functions below are pure so the rules can be tested without a database;
  * `loadState` / `saveSvar` / `saveExport` are the only I/O.
@@ -13,9 +15,15 @@ import type { Beslut, ParsedExport, Post, Reglering, Sammanstallning } from './c
 
 export const EXPORT_KEY = 'export'
 export const SVAR_KEY = 'svar'
+export const LEVERANS_KEY = 'leverans'
+
+/** How the stored export got here: bertil delivered it, or a human uploaded the file. */
+export type ImportKalla = 'leverans' | 'fil'
 
 export interface StoredExport extends ParsedExport {
   imported_at: string
+  /** Absent on exports stored before the machine path existed: read as 'fil'. */
+  imported_via?: ImportKalla
 }
 
 export type PostSnapshot = Pick<
@@ -38,6 +46,43 @@ export type SvarMap = Record<string, SvarRecord>
 export interface State {
   export: StoredExport | null
   svar: SvarMap
+}
+
+/**
+ * What the machine path has carried, written by `GET /svar` on every call.
+ *
+ * The stored export already records the delivery direction (`imported_via`,
+ * `imported_at`); this is the other one. Without it, "bertil collected the
+ * answers" and "I downloaded the file and ticked the dialog" leave the same
+ * `levererad_at`, so nothing on the box can tell a running delivery from a
+ * configured one that has never been called. A poll carrying nothing still
+ * counts as a call: that is what makes a delivery that stopped (or that was
+ * never scheduled on bertil's side) visible as silence rather than as
+ * "nothing to report".
+ */
+export interface LeveransJournal {
+  /** When bertil last called `GET /svar`, whether or not anything was waiting. */
+  senast_hamtad_at: string
+  /** How many answers that call carried. */
+  senast_antal: number
+  /** How many answers have gone to bertil over the machine path, ever. */
+  totalt_antal: number
+}
+
+export function recordSvarHandover(
+  journal: LeveransJournal | null,
+  count: number,
+  now: string,
+): LeveransJournal {
+  return {
+    senast_hamtad_at: now,
+    senast_antal: count,
+    totalt_antal: (journal?.totalt_antal ?? 0) + count,
+  }
+}
+
+export async function loadLeveransJournal(settings: ExtensionSettings): Promise<LeveransJournal | null> {
+  return (await settings.get<LeveransJournal>(LEVERANS_KEY)) ?? null
 }
 
 export async function loadState(settings: ExtensionSettings): Promise<State> {

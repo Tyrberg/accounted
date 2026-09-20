@@ -28,6 +28,7 @@ turns out to matter more.
 8. [AGPL-3.0 section 13: what running a modified copy obliges us to do](#8-agpl-30-section-13-what-running-a-modified-copy-obliges-us-to-do)
 9. [The GitLab copy](#9-the-gitlab-copy)
 10. [Not live yet](#10-not-live-yet)
+11. [Switching on the Underlagsjakt delivery](#11-switching-on-the-underlagsjakt-delivery)
 
 ---
 
@@ -546,4 +547,212 @@ it cannot be mistaken for done.
 | Revoke and remove the GitLab `glpat-` token       | Whoever has GitLab admin, per section 9       |
 | Archive the GitLab project as read-only           | Same                                          |
 | Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Mattias, after this fork is deployed to his instance. Until then no real post has been shown there |
+| Underlagsjakt automatic delivery: all five switch-on steps in [section 11](#11-switching-on-the-underlagsjakt-delivery), from minting the token to scheduling the standing check. Concretely: `UNDERLAGSJAKT_LEVERANS_TOKEN` + `UNDERLAGSJAKT_LEVERANS_ORGNR` in the Accounted box's `.env`; `GNUBOK_API_URL` + `GNUBOK_API_KEY` in bertil's; `/etc/cron.d/underlagsjakt-leverans` installed on bertil's box; one real export and one real answer carried; then `/etc/cron.d/underlagsjakt-status` plus its own external heartbeat check on the Accounted box | Whoever administers the two boxes. Four of the five steps happen outside this repository, and nothing in a pull request can reach either machine. Until `npx tsx extensions/general/underlagsjakt/leverans-status.ts` exits 0 on the box, the delivery is code that has never run, and the box says so on every run rather than leaving it to this table. Step 5 is what keeps it saying so without anyone remembering to ask |
 | Underlagsjakt: teach the extension bertil's next contract version once bertil#180 (the `reglering` field) is merged; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
+
+---
+
+## 11. Switching on the Underlagsjakt delivery
+
+Section 10 lists this as not live. This section is the whole of what "live"
+takes: five steps across two boxes, no code changes anywhere. Steps 2 and 5
+touch this repository's deployment; the rest is bertil's box, which nothing
+here can reach, so none of it can be performed from a pull request. Step 5
+installs the schedule that keeps checking afterwards, so the delivery going
+quiet is an alarm rather than something someone notices weeks later.
+
+The endpoints, the contract and the failure codes are documented in
+[`docs/underlagsjakt-export-schema.md`](../docs/underlagsjakt-export-schema.md).
+What follows is the operator order, with the check that has to pass before
+moving on.
+
+### Step 1: mint the secret
+
+On either box, once:
+
+```bash
+openssl rand -base64 24    # 32 characters; the app refuses anything shorter
+```
+
+It goes into two `.env` files and nowhere else: never into this repository,
+never into bertil's, never into a ticket (task 1453 is why).
+
+### Step 2: the Accounted box
+
+Add to the deployment's `.env`, next to the other secrets:
+
+```
+UNDERLAGSJAKT_LEVERANS_TOKEN=<the value from step 1>
+UNDERLAGSJAKT_LEVERANS_ORGNR=<org number of the company the export belongs to>
+```
+
+Then `docker compose up -d app`. No compose edit is needed: `docker-compose.yml`
+hands the whole `.env` to the app through `env_file`.
+
+Confirm it took, on the box, in the clone:
+
+```bash
+npm install            # once per clone: the check runs this code, not the image's
+npx tsx extensions/general/underlagsjakt/leverans-status.ts
+```
+
+It reads the deployment's `.env` itself, the same file compose hands the app,
+so nothing has to be exported into the shell first: run it from anywhere in
+the clone. Then it resolves the company exactly as a delivery does and reports
+what the machine path has actually carried. It writes nothing, and it never
+calls `GET /svar`. Its first line names the file it read, so a wrong answer
+can be told from a wrong place to look. Its exit code is the whole verdict:
+
+| Exit | What it means |
+| --- | --- |
+| `4` | Nothing to check: the variables are unset, one of them is set to something unusable (a hand-typed token, an org number with a mistyped digit), or the org number names no single active company. The configuration headline distinguishes "not switched on", "configured wrong", and "partly missing and partly invalid". The line names each problem and says "Add" for each missing variable and "Correct" for each invalid one, so a mixed configuration gets both actions. Report framing is English; shared API error details remain Swedish. It also says which `.env` was read or that none was found. Fix and rerun before going further. |
+| `2` | Configured and resolving, but nothing has come through yet. **This is the expected answer at this point**, and it stays the answer until step 4 succeeds. |
+| `0` | Both directions have carried real data, recently. Only step 4 can produce this. |
+
+The same command is the standing check afterwards: a delivery that was never
+scheduled and one whose schedule died both look like silence, so it alarms
+(exit 2) once **either** direction goes more than two days without being used.
+Each half is dated on its own, because they stop independently: a client whose
+export call started failing keeps collecting answers every morning, and a
+broken collection leaves exports arriving. Only the half that went quiet is
+named in the line. That alarm
+is only worth anything if something runs the command without being asked, so
+[step 5](#step-5-schedule-the-standing-check-on-the-accounted-box) puts it in
+`/etc/cron.d` on this box, the same way section 5 schedules the sync.
+
+The token itself can be checked from anywhere that can reach the box. This
+probe writes nothing either: the token check and the company lookup run first,
+and the empty body is then rejected by the contract rules before anything is
+stored.
+
+```bash
+curl -s -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -d '{}' https://bokforing.bohed.com/api/extensions/ext/underlagsjakt/export
+```
+
+| Answer | What it means |
+| --- | --- |
+| `400` (for this body, `UNSUPPORTED_VERSION`) | The pass. Only the contract rules reject with 400, and they run last, so reaching one means the token was accepted and the org number resolved to exactly one active company. |
+| `401` | The token is not the one the box has. |
+| `503` | The box has no delivery configured, or the org number matches no active company or several. The body names which. |
+
+Do **not** probe the other direction by hand. `GET /svar` hands each answer
+over exactly once, so anything fetched with curl is something bertil will
+never see.
+
+### Step 3: bertil's box
+
+In bertil's `.env`:
+
+```
+GNUBOK_API_URL=https://bokforing.bohed.com
+GNUBOK_API_KEY=<the same value from step 1>
+```
+
+Then schedule the client, so the delivery is nobody's daily chore:
+
+```cron
+# /etc/cron.d/underlagsjakt-leverans
+#
+# System crontab format: field 6 is the user to run as, the command stays on
+# one line, and the file must end with a newline or cron ignores the last one.
+PATH=/usr/local/bin:/usr/bin:/bin
+17 6 * * * deploy cd /opt/projects/bertil && python underlagsjakt_export_client.py >> var/leverans.log 2>&1
+```
+
+Replace `deploy` with the user that owns bertil's checkout and reads that
+`.env`, and the invocation with however bertil's repository runs the client
+(venv, `uv run`, `make`). Point the log at a file that user can already write,
+for the reason spelled out in section 5: the shell opens the redirect before
+the command runs, so an unwritable path kills the job silently every morning.
+
+### Step 4: prove both directions, once, with real data
+
+Requirement 5 of the task is this step, and it is the one that cannot be
+skipped: everything above is configuration, and configuration that has never
+carried a real export is not a working delivery.
+
+1. Run the client by hand once: `python underlagsjakt_export_client.py`.
+2. Open `https://bokforing.bohed.com/e/general/underlagsjakt` without touching
+   a file. The line under the summary must read "Automatisk leverans från
+   bertil är påslagen för det här bolaget. Den här exporten kom hit av sig
+   själv." If it says "lästes in som fil", the page is still showing an older
+   hand-uploaded export and the delivery did not land: check the client's log
+   for the status code and look it up in the table in step 2.
+3. Answer one question in that surface.
+4. Let the client run again (or wait for the 06:17 tick) and confirm the
+   answer is in bertil's knowledge base as a learned rule.
+5. If it is not: the answer was handed over and bertil dropped it, so `GET
+   /svar` will not repeat it. bertil's next export asks about that payment
+   again and the question reappears in the surface, which is where to answer
+   it a second time once the ingest is fixed.
+6. Run `npx tsx extensions/general/underlagsjakt/leverans-status.ts` on the
+   Accounted box once more. **Exit 0 is the pass**, and it is the one the row
+   in section 10 comes out for. Anything else names the half that did not
+   happen: an export that only ever arrived as a file, a bertil that never
+   called `GET /svar`, or a collection that has never carried an answer.
+
+The command is the record. It reads what the two directions actually wrote
+(`imported_via` on the stored export, and the journal `GET /svar` writes on
+every call), so "we did this once in September" cannot survive a delivery that
+has since stopped: the same run that proved the chain is the run that keeps
+proving it.
+
+Until it exits 0 on real data, treat the chain as unproven and leave the row in
+section 10 standing. The first exit 0 is what unlocks step 5, and the row comes
+out when that schedule is installed: a chain proved once is not a chain anyone
+is still watching.
+
+### Step 5: schedule the standing check on the Accounted box
+
+Do this once step 4 has produced an exit 0, and not before: until then the
+check answers 2 by design, and a schedule installed early would alarm every
+morning about a switch-on that is simply still in progress.
+
+The check keeps proving the chain only if something runs it. A human who has
+to remember a command is the same failure the check exists to catch, one step
+further out: the delivery dies, nobody runs the check, and the surface goes
+back to saying "import the file" with nobody the wiser. So the check gets a
+schedule of its own on this box, next to the sync in section 5:
+
+```cron
+# /etc/cron.d/underlagsjakt-status
+#
+# System crontab format: field 6 is the user to run as, the command stays on
+# one line, and the file must end with a newline or cron ignores the last one.
+# Daily at 07:13, which is after bertil's 06:17 delivery has had time to land.
+# Needs devDependencies installed in the clone (npm install), the same as the
+# by-hand run in step 2.
+PATH=/usr/local/bin:/usr/bin:/bin
+UNDERLAGSJAKT_STATUS_HEARTBEAT_URL=https://hc-ping.com/REPLACE-WITH-YOUR-SECOND-CHECK-UUID
+13 7 * * * deploy cd /opt/projects/accounted && npx tsx extensions/general/underlagsjakt/leverans-status.ts >> fork/state/leverans-status.log 2>&1 && curl -fsS --max-time 10 "$UNDERLAGSJAKT_STATUS_HEARTBEAT_URL" >/dev/null
+```
+
+Replace `deploy` with the user that owns the clone, use a **second** external
+check (not the sync's: a shared one cannot tell you which of the two routines
+went quiet), and end the file with a newline. Without a heartbeat check, drop
+the `UNDERLAGSJAKT_STATUS_HEARTBEAT_URL` line and the trailing `&& curl ...`
+rather than leaving the variable empty, which would make every healthy run end
+in a failed `curl`.
+
+The `&&` is the whole alarm: the ping only happens on exit 0, so every way the
+delivery can stop reaches you from outside the box. Exit 2 (an export that
+stopped arriving, a bertil that stopped collecting, either half quiet for two
+days), exit 4 (someone cleared the `.env` on a redeploy), a clone whose
+`npm install` was wiped, and a box that is off all look the same to the
+external check: no ping. Exit 0 needs both halves to have carried data and
+**each** of them to have done so recently, so one working direction cannot keep
+the morning ping green over a dead one.
+That is the one failure mode nothing running on the box can report about
+itself, which is why section 5 uses the same dead-man's switch.
+
+The log goes to `fork/state/leverans-status.log` inside the clone, for the
+reason spelled out in section 5: the shell opens the redirect as the cron user
+before the command runs, so a `/var/log/...` target that user cannot create
+kills the job there every morning without ever running the check. `fork/state/`
+is owned by the clone owner and already gitignored. When a ping goes missing,
+that log holds the report: it names which of the two directions stopped.
+
+This cron only watches. Nothing on this box can deliver anything, because
+bertil serves nothing to pull; the schedule in step 3, on bertil's box, is the
+one that carries the export.

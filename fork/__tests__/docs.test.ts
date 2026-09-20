@@ -87,38 +87,58 @@ describe('the compose override template', () => {
   })
 })
 
-describe('the /etc/cron.d entry in fork/README.md', () => {
-  const readme = read('fork/README.md')
-  const block = readme.match(/```cron\n([\s\S]*?)```/)
+const isComment = (line: string) => line.trim().startsWith('#')
+const isBlank = (line: string) => line.trim() === ''
+const isAssignment = (line: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(line)
 
-  const lines = (block?.[1] ?? '').split('\n')
-  const isComment = (line: string) => line.trim().startsWith('#')
-  const isBlank = (line: string) => line.trim() === ''
-  const isAssignment = (line: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(line)
-  const scheduleLines = lines.filter((line) => !isComment(line) && !isBlank(line) && !isAssignment(line))
+interface CronBlock {
+  where: string
+  lines: string[]
+  scheduleLines: string[]
+}
 
-  it('is present and holds exactly one schedule line', () => {
-    expect(block).not.toBeNull()
-    expect(scheduleLines.length).toBe(1)
+/** Every ```cron fence in a document, in order. */
+function cronBlocks(path: string): CronBlock[] {
+  const source = read(path)
+  return [...source.matchAll(/```cron\n([\s\S]*?)```/g)].map((match, index) => {
+    const lines = match[1].split('\n')
+    return {
+      where: `${path} block ${index + 1}`,
+      lines,
+      scheduleLines: lines.filter((line) => !isComment(line) && !isBlank(line) && !isAssignment(line)),
+    }
+  })
+}
+
+const readmeCron = cronBlocks('fork/README.md')
+// Every schedule a human installs on a box: the fork sync (section 5),
+// bertil's export delivery and the standing check that watches it (section
+// 11). The delivery one is why the hand-off is nobody's daily chore, so a
+// line cron silently refuses there means the chain quietly goes back to
+// Mattias uploading a file by hand, and the watcher is what makes that
+// noticed.
+const everyCronBlock = [...readmeCron, ...cronBlocks('docs/underlagsjakt-export-schema.md')]
+
+describe.each(everyCronBlock)('the /etc/cron.d entry in $where', (block) => {
+  it('holds exactly one schedule line', () => {
+    expect(block.scheduleLines.length).toBe(1)
   })
 
   it('uses no line continuation, which crontab does not support', () => {
-    expect(lines.filter((line) => line.trimEnd().endsWith('\\'))).toEqual([])
+    expect(block.lines.filter((line) => line.trimEnd().endsWith('\\'))).toEqual([])
   })
 
   it('gives the schedule line a user field, which /etc/cron.d requires', () => {
     // Field 6 is the user. Get it wrong and cron reads the first word of the
     // command as the username, refuses the line, and the routine never fires:
     // a failure that looks exactly like "nothing to report".
-    for (const line of scheduleLines) {
+    for (const line of block.scheduleLines) {
       const fields = line.trim().split(/\s+/)
       expect(fields.length).toBeGreaterThan(6)
 
       const user = fields[5]
       expect(user).toMatch(/^[a-z_][a-z0-9_-]*$/)
-      expect(['cd', 'npx', 'npm', 'curl', 'sh', 'bash', 'env', 'export']).not.toContain(user)
-
-      expect(fields.slice(6).join(' ')).toContain('fork/cli.ts sync')
+      expect(['cd', 'npx', 'npm', 'curl', 'sh', 'bash', 'env', 'export', 'python', 'python3']).not.toContain(user)
     }
   })
 
@@ -126,19 +146,110 @@ describe('the /etc/cron.d entry in fork/README.md', () => {
     // The shell opens the redirect BEFORE running the command, as the cron
     // user. An absolute path that user cannot create (the classic /var/log
     // entry) kills the job at the redirect every week without ever running the
-    // sync: silent in exactly the way this routine exists to prevent.
-    for (const line of scheduleLines) {
+    // command: silent in exactly the way these routines exist to prevent.
+    for (const line of block.scheduleLines) {
       const target = line.match(/>>\s*(\S+)/)?.[1]
       expect(target).toBeDefined()
       expect(target?.startsWith('/')).toBe(false)
     }
   })
+})
+
+describe('the fork sync crontab in fork/README.md section 5', () => {
+  const block = readmeCron[0]
+
+  it('is present and runs the sync', () => {
+    expect(block).toBeDefined()
+    expect(block.scheduleLines[0]).toContain('fork/cli.ts sync')
+  })
 
   it('passes the alert repo and heartbeat through the crontab environment', () => {
     // Both are documented in section 5 as the way the run makes noise; an
     // example that omits them ships a routine that alarms nowhere.
-    expect(lines.some((line) => line.startsWith('FORK_SYNC_ALERT_REPO='))).toBe(true)
-    expect(lines.some((line) => line.startsWith('FORK_SYNC_HEARTBEAT_URL='))).toBe(true)
+    expect(block.lines.some((line) => line.startsWith('FORK_SYNC_ALERT_REPO='))).toBe(true)
+    expect(block.lines.some((line) => line.startsWith('FORK_SYNC_HEARTBEAT_URL='))).toBe(true)
+  })
+})
+
+describe("the underlagsjakt delivery crontab, which is what makes the delivery automatic", () => {
+  const schedules = everyCronBlock
+    .flatMap((block) => block.scheduleLines)
+    .filter((line) => line.includes('underlagsjakt_export_client.py'))
+
+  it('is documented on both sides of the hand-off', () => {
+    // fork/README.md section 11 is the operator order; the export schema doc
+    // is what bertil's side is built against. Requirement 6 of the task is
+    // this schedule, so a repository that stopped documenting it ships a
+    // delivery nobody starts.
+    expect(schedules.length).toBe(2)
+  })
+
+  it('is the same line in both places, so the two copies cannot drift', () => {
+    expect(new Set(schedules.map((line) => line.trim())).size).toBe(1)
+  })
+
+  it('runs daily, which is what leverans-status.ts calls fresh', () => {
+    // MAX_QUIET_DAYS in extensions/general/underlagsjakt/leverans-status.ts is
+    // 2: a schedule sparser than daily would alarm on every healthy run.
+    const [minute, hour, dayOfMonth, month, dayOfWeek] = schedules[0].trim().split(/\s+/)
+    expect(minute).toMatch(/^\d+$/)
+    expect(hour).toMatch(/^\d+$/)
+    expect([dayOfMonth, month, dayOfWeek]).toEqual(['*', '*', '*'])
+  })
+})
+
+describe('the standing-check crontab in fork/README.md section 11, step 5', () => {
+  // The check in step 2 is what tells the operator whether the delivery is
+  // carrying anything, and section 11 calls it "the standing check
+  // afterwards". A standing check nobody runs is the same silence it exists to
+  // break, one step further out: the delivery dies, nobody remembers the
+  // command, and the surface goes back to "import the file" unnoticed.
+  const block = readmeCron.find((candidate) =>
+    candidate.scheduleLines.some((line) => line.includes('leverans-status.ts')),
+  )
+
+  it('exists, so the alarm does not depend on somebody remembering a command', () => {
+    expect(block).toBeDefined()
+  })
+
+  it('runs at least daily, which is what MAX_QUIET_DAYS assumes', () => {
+    // leverans-status.ts alarms after 2 quiet days. A weekly schedule would
+    // find every outage up to a week late, which is the delay the check was
+    // written to remove.
+    const [minute, hour, dayOfMonth, month, dayOfWeek] = block!.scheduleLines[0].trim().split(/\s+/)
+    expect(minute).toMatch(/^\d+$/)
+    expect(hour).toMatch(/^\d+$/)
+    expect([dayOfMonth, month, dayOfWeek]).toEqual(['*', '*', '*'])
+  })
+
+  it('pings the heartbeat only on a zero exit, so an alarm is a missing ping', () => {
+    // `&&` is the whole dead-man's switch: exits 2 and 4, a wiped clone and a
+    // box that is off must all reach the operator from outside as silence. A
+    // `;` or a `||` there would ping on failure too and report a dead delivery
+    // as healthy, which is worse than no check at all.
+    const line = block!.scheduleLines[0]
+    const check = line.indexOf('leverans-status.ts')
+    const ping = line.indexOf('curl')
+
+    expect(ping).toBeGreaterThan(check)
+    const between = line.slice(check, ping)
+    expect(between).toContain('&&')
+    expect(between).not.toContain('||')
+    expect(between).not.toContain(';')
+  })
+
+  it('carries its own heartbeat variable, not the fork sync\'s', () => {
+    // Section 5 already pings a check for the weekly sync. Sharing one URL
+    // would make either routine's ping cover for the other's silence, so
+    // neither outage is visible.
+    const variables = block!.lines
+      .filter(isAssignment)
+      .map((line) => line.split('=')[0])
+      .filter((name) => /HEARTBEAT/.test(name))
+
+    expect(variables).toHaveLength(1)
+    expect(variables[0]).not.toBe('FORK_SYNC_HEARTBEAT_URL')
+    expect(block!.scheduleLines[0]).toContain(`$${variables[0]}`)
   })
 })
 

@@ -31,19 +31,24 @@ import {
 } from './lib/contract'
 import {
   EXPORT_KEY,
+  LEVERANS_KEY,
   SVAR_KEY,
   bolagChoices,
   felBolagRows,
   findPost,
+  loadLeveransJournal,
   loadState,
   markDelivered,
   openPosts,
   pendingBeslut,
   reconcileWithExport,
   recordAnswer,
+  recordSvarHandover,
   withdrawAnswer,
+  type ImportKalla,
   type StoredExport,
 } from './lib/store'
+import { authenticateLeverans, leveransTargetsCompany } from './lib/leverans'
 
 const EXTENSION_ID = 'underlagsjakt'
 
@@ -91,23 +96,74 @@ async function memberCompanyNames(ctx: ExtensionContext): Promise<string[]> {
     .filter((name): name is string => typeof name === 'string')
 }
 
+/**
+ * Read an export into a company's workspace state.
+ *
+ * Shared by the two ways an export arrives: bertil delivering it over the
+ * machine path (`POST /export`) and a human picking the file (`POST
+ * /export/fil`). One body of rules, so an automatically delivered export is
+ * validated, version-checked and reconciled exactly like an uploaded one.
+ */
+async function importExport(request: Request, ctx: ExtensionContext, via: ImportKalla): Promise<Response> {
+  const json = await readJson(request)
+  if (!json.ok) return fail(400, 'INVALID_JSON', 'Filen är inte giltig JSON.')
+
+  const parsed = parseExport(json.body)
+  if (!parsed.ok) {
+    if (parsed.code === 'UNSUPPORTED_VERSION') {
+      return fail(
+        400,
+        'UNSUPPORTED_VERSION',
+        `Exportversion ${parsed.version ?? 'saknas'} stöds inte. Stödda versioner: ${SUPPORTED_EXPORT_VERSIONS.join(', ')}.`,
+        { version: parsed.version, supported: SUPPORTED_EXPORT_VERSIONS },
+      )
+    }
+    return fail(400, 'INVALID_EXPORT', 'Exporten följer inte kontraktet.', { issues: parsed.issues })
+  }
+
+  const state = await loadState(ctx.settings)
+  const stored: StoredExport = { ...parsed.export, imported_at: nowIso(), imported_via: via }
+  const svar = reconcileWithExport(state.svar, parsed.export)
+  await ctx.settings.set(EXPORT_KEY, stored)
+  await ctx.settings.set(SVAR_KEY, svar)
+  ctx.log.info('underlagsjakt export imported', {
+    version: stored.export_version,
+    via,
+    posts: stored.sammanstallningar.reduce((n, s) => n + s.posts.length, 0),
+  })
+
+  return NextResponse.json({
+    data: { posts: openPosts(stored, svar).length, export_version: stored.export_version },
+  })
+}
+
 export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
   {
     method: 'GET',
     path: '/',
     handler: async (_request, ctx) => {
       if (!ctx) return unauthorized()
-      const [{ export: exp, svar }, members] = await Promise.all([loadState(ctx.settings), memberCompanyNames(ctx)])
+      const [{ export: exp, svar }, members, leveransHit] = await Promise.all([
+        loadState(ctx.settings),
+        memberCompanyNames(ctx),
+        // Per company, not per box: a box can hold several companies and the
+        // delivery is bound to one of them.
+        leveransTargetsCompany(ctx.companyId),
+      ])
       const pending = pendingBeslut(svar)
       return NextResponse.json({
         data: {
           supported_export_versions: SUPPORTED_EXPORT_VERSIONS,
           answer_version: ANSWER_VERSION,
+          leverans: { till_detta_bolag: leveransHit },
           export: exp
             ? {
                 export_version: exp.export_version,
                 generated_at: exp.generated_at,
                 imported_at: exp.imported_at,
+                // Exports stored before the machine path existed carry no
+                // source; they can only have come from a file.
+                imported_via: exp.imported_via ?? 'fil',
                 sammanstallningar: exp.sammanstallningar.map((s) => ({
                   bolag: s.bolag,
                   period: s.period,
@@ -126,43 +182,79 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       })
     },
   },
+  /**
+   * bertil's delivery. `skipAuth` because the dispatcher's auth is a browser
+   * session and bertil has none; the handler authenticates the call itself
+   * with the delivery token and resolves the company from the server's
+   * configuration (see lib/leverans.ts). The URL is the one bertil already
+   * posts to (bertil#183), which is why the human file upload moved to
+   * /export/fil rather than this path keeping both callers.
+   */
   {
     method: 'POST',
     path: '/export',
+    skipAuth: true,
+    handler: async (request) => {
+      const auth = await authenticateLeverans(request)
+      if (!auth.ok) return auth.response
+      return importExport(request, auth.ctx, 'leverans')
+    },
+  },
+  {
+    method: 'POST',
+    path: '/export/fil',
     handler: async (request, ctx) => {
       if (!ctx) return unauthorized()
       const denied = await writeGuard(ctx)
       if (denied) return denied
+      return importExport(request, ctx, 'fil')
+    },
+  },
+  /**
+   * bertil collecting the answers. Returns the contract's answer file body,
+   * byte-identical to what /svarsfil downloads, and marks what it returned
+   * as handed over in the same request: the read IS the delivery, there is
+   * no second call from bertil to confirm it.
+   *
+   * At-most-once is the safe direction here, and only here: if bertil dies
+   * between the response and its own ingest, the payment it asked about is
+   * still unresolved on its side, so its next export asks again, and
+   * `reconcileWithExport` drops the answer it already received and puts the
+   * post back in front of the user. A re-delivered answer, by contrast,
+   * would keep the workspace claiming answers are still waiting to be sent
+   * long after bertil learned them.
+   */
+  {
+    method: 'GET',
+    path: '/svar',
+    skipAuth: true,
+    handler: async (request) => {
+      const auth = await authenticateLeverans(request)
+      if (!auth.ok) return auth.response
+      const ctx = auth.ctx
 
-      const json = await readJson(request)
-      if (!json.ok) return fail(400, 'INVALID_JSON', 'Filen är inte giltig JSON.')
-
-      const parsed = parseExport(json.body)
-      if (!parsed.ok) {
-        if (parsed.code === 'UNSUPPORTED_VERSION') {
-          return fail(
-            400,
-            'UNSUPPORTED_VERSION',
-            `Exportversion ${parsed.version ?? 'saknas'} stöds inte. Stödda versioner: ${SUPPORTED_EXPORT_VERSIONS.join(', ')}.`,
-            { version: parsed.version, supported: SUPPORTED_EXPORT_VERSIONS },
-          )
-        }
-        return fail(400, 'INVALID_EXPORT', 'Exporten följer inte kontraktet.', { issues: parsed.issues })
+      const now = nowIso()
+      const [{ svar }, journal] = await Promise.all([
+        loadState(ctx.settings),
+        loadLeveransJournal(ctx.settings),
+      ])
+      const beslut = pendingBeslut(svar)
+      if (beslut.length > 0) {
+        await ctx.settings.set(
+          SVAR_KEY,
+          markDelivered(
+            svar,
+            beslut.map((b) => b.transaction_id),
+            now,
+          ),
+        )
       }
-
-      const state = await loadState(ctx.settings)
-      const stored: StoredExport = { ...parsed.export, imported_at: nowIso() }
-      const svar = reconcileWithExport(state.svar, parsed.export)
-      await ctx.settings.set(EXPORT_KEY, stored)
-      await ctx.settings.set(SVAR_KEY, svar)
-      ctx.log.info('underlagsjakt export imported', {
-        version: stored.export_version,
-        posts: stored.sammanstallningar.reduce((n, s) => n + s.posts.length, 0),
-      })
-
-      return NextResponse.json({
-        data: { posts: openPosts(stored, svar).length, export_version: stored.export_version },
-      })
+      // Written on every call, including the ones carrying nothing: a poll is
+      // the only evidence the box has that bertil is still running. See
+      // LeveransJournal and extensions/general/underlagsjakt/leverans-status.ts.
+      await ctx.settings.set(LEVERANS_KEY, recordSvarHandover(journal, beslut.length, now))
+      ctx.log.info('underlagsjakt answers delivered', { count: beslut.length })
+      return NextResponse.json(buildAnswerFile(beslut))
     },
   },
   {
