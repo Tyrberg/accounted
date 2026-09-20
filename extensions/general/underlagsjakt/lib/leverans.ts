@@ -208,7 +208,22 @@ export function extractLeveransToken(request: Request): string | null {
   return apikey || null
 }
 
-/** Constant-time comparison over digests, so inputs of different length are still safe to compare. */
+/**
+ * Constant-time comparison over digests, so inputs of different length are still safe to compare.
+ *
+ * CodeQL flags this as js/insufficient-password-hash. It is not password hashing and a KDF would
+ * add nothing here: the value is never a human-chosen password and is never stored. It is a
+ * machine token that only ever lives in the environment, and inspectLeveransConfig refuses any
+ * token shorter than MIN_TOKEN_LENGTH and tells the operator to generate it with
+ * "openssl rand -base64 24" — so the input is high-entropy by construction, which is the property
+ * a KDF exists to manufacture for low-entropy secrets. SHA-256 is used only to normalise both
+ * sides to a fixed width so timingSafeEqual cannot throw on length mismatch and cannot leak
+ * length through timing. Stretching a 192-bit random token would cost work and buy nothing.
+ *
+ * If the length floor is ever removed, this justification stops holding and the alert must be
+ * re-evaluated rather than re-suppressed.
+ */
+// codeql[js/insufficient-password-hash]
 function tokenMatches(presented: string, expected: string): boolean {
   const a = crypto.createHash('sha256').update(presented).digest()
   const b = crypto.createHash('sha256').update(expected).digest()
