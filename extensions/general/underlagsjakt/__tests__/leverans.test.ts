@@ -35,6 +35,7 @@ import {
   type LeveransEvidence,
 } from '@/extensions/general/underlagsjakt/leverans-status'
 import type { ExtensionContext } from '@/lib/extensions/types'
+import { createLeveransSupabaseSlice, type LeveransSupabaseSlice } from './supabase-slice'
 import fixture from './fixtures/export-1.1.json'
 
 vi.mock('@/lib/auth/require-write', () => ({
@@ -65,85 +66,11 @@ function route(method: string, path: string) {
   return r
 }
 
-// ── A Supabase stand-in with just the three tables this path touches ──
+// The Supabase stand-in lives in ./supabase-slice.ts: leverans-dispatch.test.ts
+// drives the same handlers through the dispatcher and needs the same database.
+let slice: LeveransSupabaseSlice
 
-interface DataRow {
-  user_id: string
-  company_id: string
-  extension_id: string
-  key: string
-  value: unknown
-}
-
-let companyRows: { id: string }[]
-let companyError: { message: string } | null
-let ownerRow: { user_id: string } | null
-let dataRows: DataRow[]
-let inFilters: unknown[]
-
-function companiesChain() {
-  const chain = {
-    select: () => chain,
-    in: (_col: string, values: unknown[]) => {
-      inFilters = values
-      return chain
-    },
-    is: () => Promise.resolve({ data: companyRows, error: companyError }),
-  }
-  return chain
-}
-
-function membersChain() {
-  const chain = {
-    select: () => chain,
-    eq: () => chain,
-    order: () => chain,
-    limit: () => chain,
-    maybeSingle: async () => ({ data: ownerRow, error: null }),
-  }
-  return chain
-}
-
-function extensionDataChain() {
-  const filters: Record<string, string> = {}
-  const chain = {
-    select: () => chain,
-    eq: (column: string, value: string) => {
-      filters[column] = value
-      return chain
-    },
-    single: async () => {
-      const row = dataRows.find(
-        (r) =>
-          r.company_id === filters.company_id &&
-          r.extension_id === filters.extension_id &&
-          r.key === filters.key,
-      )
-      return { data: row ? { value: row.value } : null, error: row ? null : { message: 'no rows' } }
-    },
-    upsert: async (row: DataRow) => {
-      const index = dataRows.findIndex(
-        (r) => r.company_id === row.company_id && r.extension_id === row.extension_id && r.key === row.key,
-      )
-      const stored = { ...row, value: JSON.parse(JSON.stringify(row.value)) }
-      if (index >= 0) dataRows[index] = stored
-      else dataRows.push(stored)
-      return { error: null }
-    },
-  }
-  return chain
-}
-
-function makeClient() {
-  return {
-    from: (table: string) =>
-      table === 'companies'
-        ? companiesChain()
-        : table === 'company_members'
-          ? membersChain()
-          : extensionDataChain(),
-  } as never
-}
+const makeClient = () => slice.client()
 
 const request = (init: { token?: string | null; apikey?: string; body?: unknown } = {}) => {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -160,15 +87,11 @@ async function parse<T>(response: Response): Promise<{ status: number; body: T }
   return { status: response.status, body: (await response.json()) as T }
 }
 
-const storedValue = (key: string) => dataRows.find((r) => r.key === key)?.value as Record<string, unknown> | undefined
+const storedValue = (key: string) => slice.storedValue(key)
 
 beforeEach(() => {
   vi.clearAllMocks()
-  companyRows = [{ id: 'company-1' }]
-  companyError = null
-  ownerRow = { user_id: 'owner-1' }
-  dataRows = []
-  inFilters = []
+  slice = createLeveransSupabaseSlice()
   serviceClient.mockImplementation(() => makeClient())
   process.env[TOKEN_ENV] = TOKEN
   process.env[ORGNR_ENV] = ORGNR
@@ -221,12 +144,12 @@ describe('leveransTargetsCompany', () => {
   })
 
   it('says no when the org number matches no active company', async () => {
-    companyRows = []
+    slice.companyRows = []
     expect(await targets('company-1')).toBe(false)
   })
 
   it('says no when the org number matches several companies, as the delivery would refuse', async () => {
-    companyRows = [{ id: 'company-1' }, { id: 'company-2' }]
+    slice.companyRows = [{ id: 'company-1' }, { id: 'company-2' }]
     expect(await targets('company-1')).toBe(false)
   })
 
@@ -291,11 +214,11 @@ describe('authenticateLeverans', () => {
     expect(result.ctx.companyId).toBe('company-1')
     expect(result.ctx.userId).toBe('owner-1')
     expect(result.ctx.extensionId).toBe('underlagsjakt')
-    expect(inFilters).toEqual([CANONICAL, '556012-5790'])
+    expect(slice.inFilters).toEqual([CANONICAL, '556012-5790'])
   })
 
   it('stops rather than guessing when the org number matches several companies', async () => {
-    companyRows = [{ id: 'company-1' }, { id: 'company-2' }]
+    slice.companyRows = [{ id: 'company-1' }, { id: 'company-2' }]
     const result = await auth()
     expect(result.ok).toBe(false)
     if (result.ok) return
@@ -305,7 +228,7 @@ describe('authenticateLeverans', () => {
   })
 
   it('says which env var to fix when no company matches', async () => {
-    companyRows = []
+    slice.companyRows = []
     const result = await auth()
     expect(result.ok).toBe(false)
     if (result.ok) return
@@ -315,7 +238,7 @@ describe('authenticateLeverans', () => {
   })
 
   it('refuses when the company lookup itself failed', async () => {
-    companyError = { message: 'boom' }
+    slice.companyError = { message: 'boom' }
     const result = await auth()
     expect(result.ok).toBe(false)
     if (result.ok) return
@@ -324,7 +247,7 @@ describe('authenticateLeverans', () => {
   })
 
   it('refuses when the company has no owner to attribute the write to', async () => {
-    ownerRow = null
+    slice.ownerRow = null
     const result = await auth()
     expect(result.ok).toBe(false)
     if (result.ok) return
@@ -347,7 +270,7 @@ describe('the delivery routes', () => {
     expect(status).toBe(200)
     expect(body.data).toEqual({ posts: 3, export_version: '1.1' })
 
-    const row = dataRows.find((r) => r.key === 'export')!
+    const row = slice.dataRows.find((r) => r.key === 'export')!
     expect(row.company_id).toBe('company-1')
     expect(row.user_id).toBe('owner-1')
     expect(row.extension_id).toBe('underlagsjakt')
@@ -357,7 +280,7 @@ describe('the delivery routes', () => {
   it('POST /export refuses a wrong token before touching any state', async () => {
     const res = await route('POST', '/export').handler(request({ token: 'not-the-token-but-long-enough-x', body: fixture }))
     expect(res.status).toBe(401)
-    expect(dataRows).toEqual([])
+    expect(slice.dataRows).toEqual([])
   })
 
   it('POST /export still checks the contract version', async () => {
@@ -365,13 +288,13 @@ describe('the delivery routes', () => {
     const { status, body } = await parse<{ error: { code: string } }>(res)
     expect(status).toBe(400)
     expect(body.error.code).toBe('UNSUPPORTED_VERSION')
-    expect(dataRows).toEqual([])
+    expect(slice.dataRows).toEqual([])
   })
 
   it('GET /svar hands over the pending answers once and marks them delivered', async () => {
     await route('POST', '/export').handler(request({ body: fixture }))
     // The import writes an (empty) svar row of its own; answer one post in it.
-    dataRows.find((r) => r.key === 'svar')!.value = {
+    slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
         reglering: null,
@@ -401,7 +324,7 @@ describe('the delivery routes', () => {
     // with an empty body and read 400 as "token and company are right".
     const res = await route('POST', '/export').handler(request({ body: {} }))
     expect(res.status).toBe(400)
-    expect(dataRows).toEqual([])
+    expect(slice.dataRows).toEqual([])
   })
 
   it('GET /svar refuses a caller without the token', async () => {
@@ -420,7 +343,7 @@ describe('the delivery routes', () => {
     expect(empty.totalt_antal).toBe(0)
     expect(Date.parse(empty.senast_hamtad_at)).not.toBeNaN()
 
-    dataRows.find((r) => r.key === 'svar')!.value = {
+    slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
         reglering: null,
