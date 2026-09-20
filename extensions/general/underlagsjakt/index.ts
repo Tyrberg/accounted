@@ -32,6 +32,7 @@ import {
 import {
   EXPORT_KEY,
   LEVERANS_KEY,
+  KVITTENS_KEY,
   SVAR_KEY,
   bolagChoices,
   felBolagRows,
@@ -211,18 +212,9 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
     },
   },
   /**
-   * bertil collecting the answers. Returns the contract's answer file body,
-   * byte-identical to what /svarsfil downloads, and marks what it returned
-   * as handed over in the same request: the read IS the delivery, there is
-   * no second call from bertil to confirm it.
-   *
-   * At-most-once is the safe direction here, and only here: if bertil dies
-   * between the response and its own ingest, the payment it asked about is
-   * still unresolved on its side, so its next export asks again, and
-   * `reconcileWithExport` drops the answer it already received and puts the
-   * post back in front of the user. A re-delivered answer, by contrast,
-   * would keep the workspace claiming answers are still waiting to be sent
-   * long after bertil learned them.
+   * Fetching never acknowledges consumption. Keep offering every pending answer
+   * until bertil successfully ingests it and posts its transaction_id to
+   * /svar/kvittens. Failed ingestion or a lost response can safely be retried.
    */
   {
     method: 'GET',
@@ -239,22 +231,43 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         loadLeveransJournal(ctx.settings),
       ])
       const beslut = pendingBeslut(svar)
-      if (beslut.length > 0) {
-        await ctx.settings.set(
-          SVAR_KEY,
-          markDelivered(
-            svar,
-            beslut.map((b) => b.transaction_id),
-            now,
-          ),
-        )
-      }
       // Written on every call, including the ones carrying nothing: a poll is
       // the only evidence the box has that bertil is still running. See
       // LeveransJournal and extensions/general/underlagsjakt/leverans-status.ts.
       await ctx.settings.set(LEVERANS_KEY, recordSvarHandover(journal, beslut.length, now))
-      ctx.log.info('underlagsjakt answers delivered', { count: beslut.length })
+      ctx.log.info('underlagsjakt answers offered', { count: beslut.length })
       return NextResponse.json(buildAnswerFile(beslut))
+    },
+  },
+  /** Machine acknowledgement, sent only after successful ingestion in bertil. */
+  {
+    method: 'POST',
+    path: '/svar/kvittens',
+    skipAuth: true,
+    handler: async (request) => {
+      const auth = await authenticateLeverans(request)
+      if (!auth.ok) return auth.response
+      const ctx = auth.ctx
+      const json = await readJson(request)
+      if (!json.ok) return fail(400, 'INVALID_JSON', 'Ogiltig JSON.')
+      const id = json.body && typeof json.body === 'object'
+        ? (json.body as { transaction_id?: unknown }).transaction_id
+        : undefined
+      if (typeof id !== 'string' || !id.trim()) {
+        return fail(400, 'VALIDATION_ERROR', 'transaction_id krävs.')
+      }
+      const { svar } = await loadState(ctx.settings)
+      // Withdrawn or reconciled answers are successful no-ops on retry.
+      // Retrying a lost acknowledgement response preserves the original timestamp.
+      if (Object.hasOwn(svar, id) && svar[id].levererad_at === null) {
+        const now = nowIso()
+        // Persist machine evidence before marking delivered so a failed write
+        // leaves the answer pending and the acknowledgement safe to retry.
+        await ctx.settings.set(KVITTENS_KEY, now)
+        await ctx.settings.set(SVAR_KEY, markDelivered(svar, [id], now))
+      }
+      ctx.log.info('underlagsjakt answer acknowledged', { transaction_id: id })
+      return NextResponse.json({ data: { transaction_id: id } })
     },
   },
   {

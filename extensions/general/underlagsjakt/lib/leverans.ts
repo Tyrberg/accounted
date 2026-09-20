@@ -8,8 +8,8 @@
  * answer 401 (verified 2026-09-20). This module is the one way in for a
  * machine, and it is deliberately the narrowest thing that works:
  *
- *   - It covers exactly two routes: POST /export (lay an export down) and
- *     GET /svar (pick the answers up). Nothing else in Accounted is
+ *   - It covers POST /export (lay an export down), GET /svar (pick answers
+ *     up), and POST /svar/kvittens (confirm successful ingestion). Nothing else in Accounted is
  *     reachable with this credential, by construction: no other route calls
  *     `authenticateLeverans`.
  *   - The credential carries company affiliation. Which company an export

@@ -55,6 +55,17 @@ describe('openPosts', () => {
     expect(openPosts(exp, svar).map((p) => p.transaction_id)).not.toContain('tx-moank-20260821')
   })
 
+  it('reopens a question re-exported after seven days without losing its retryable answer', () => {
+    const svar = answerMoank({}, stored())
+    const id = 'tx-moank-20260821'
+    expect(openPosts(stored('2026-09-24T13:00:00Z'), svar).map(p => p.transaction_id)).not.toContain(id)
+    const later = stored('2026-09-24T13:00:01Z')
+    const reconciled = reconcileWithExport(svar, later)
+    expect(openPosts(later, reconciled).map(p => p.transaction_id)).toContain(id)
+    expect(pendingBeslut(reconciled)).toEqual(pendingBeslut(svar))
+    expect(openPosts(stored(), svar).map(p => p.transaction_id)).not.toContain(id)
+  })
+
   it('is empty without an export', () => {
     expect(openPosts(null, {})).toEqual([])
   })
