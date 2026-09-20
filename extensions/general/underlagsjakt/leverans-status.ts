@@ -43,7 +43,14 @@ import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath } from 'node:path'
 import { config as dotenv } from 'dotenv'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
-import { ORGNR_ENV, TOKEN_ENV, inspectLeveransConfig, openLeveransContext } from './lib/leverans'
+import {
+  ORGNR_ENV,
+  TOKEN_ENV,
+  describeLeveransProblems,
+  inspectLeveransConfig,
+  openLeveransContext,
+  type LeveransConfigProblem,
+} from './lib/leverans'
 import {
   loadLeveransJournal,
   loadState,
@@ -64,12 +71,14 @@ export interface LeveransEvidence {
   /** The `.env` the configuration was read from, or null when none was found. */
   envFile: string | null
   /**
-   * Why the two environment variables do not add up to a configuration, or
-   * null when they do. A set-but-malformed variable reports itself here
-   * rather than as "not switched on": the operator who just wrote both lines
-   * must be told which line to edit, not to write them again.
+   * Why the two environment variables do not add up to a configuration, empty
+   * when they do. A set-but-malformed variable reports itself here rather than
+   * as "not switched on": the operator who just wrote both lines must be told
+   * which line to edit, not to write them again. The problems keep their kind
+   * all the way out here so the headline can say the same thing the detail
+   * line does.
    */
-  configProblem: string | null
+  configProblems: LeveransConfigProblem[]
   /** Why the configured org number names no single active company, if so. */
   companyProblem: string | null
   /** The company the delivery resolves to, when it resolves. */
@@ -168,13 +177,29 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
   // difference between "you never set them" and "I looked somewhere else".
   const source = evidence.envFile ?? 'no .env found; only this shell\'s environment was read'
 
-  if (evidence.configProblem !== null) {
+  if (evidence.configProblems.length > 0) {
+    // "Off" and "on, but one line is wrong" are different boxes and different
+    // next moves. A box whose org number has one mistyped digit is switched
+    // on as far as its operator is concerned, and telling that person the
+    // delivery "is off" sends them to switch on something they already
+    // switched on: the same conflation the detail line stopped making, one
+    // level up. So the headline follows the detail.
+    const wrong = evidence.configProblems.some((problem) => problem.kind === 'invalid')
+    const where = wrong
+      ? `Edit that line in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`
+      : `Both variables belong in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`
     checks.push({
       label: 'configuration',
       state: 'blocked',
-      line: `not switched on: ${evidence.configProblem} Both variables belong in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`,
+      line: `${wrong ? 'set, but not usable' : 'not switched on'}: ${describeLeveransProblems(evidence.configProblems)} ${where}`,
     })
-    return { exitCode: 4, headline: 'The automatic delivery is off on this box.', checks }
+    return {
+      exitCode: 4,
+      headline: wrong
+        ? 'The automatic delivery is configured wrong on this box.'
+        : 'The automatic delivery is off on this box.',
+      checks,
+    }
   }
   checks.push({
     label: 'configuration',
@@ -318,7 +343,7 @@ export function loadDeploymentEnv(...dirs: string[]): string | null {
 export async function gatherEvidence(envFile: string | null = null): Promise<LeveransEvidence> {
   const empty: LeveransEvidence = {
     envFile,
-    configProblem: null,
+    configProblems: [],
     companyProblem: null,
     companyId: null,
     export: null,
@@ -327,7 +352,7 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
   }
 
   const inspected = inspectLeveransConfig()
-  if (!inspected.ok) return { ...empty, configProblem: inspected.problems.join(' ') }
+  if (!inspected.ok) return { ...empty, configProblems: inspected.problems }
 
   const opened = await openLeveransContext(createServiceClientNoCookies(), inspected.config)
   if (!opened.ok) {
@@ -341,7 +366,7 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
 
   return {
     envFile,
-    configProblem: null,
+    configProblems: [],
     companyProblem: null,
     companyId: opened.ctx.companyId,
     export: state.export

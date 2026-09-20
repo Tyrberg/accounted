@@ -23,6 +23,7 @@ import {
   ORGNR_ENV,
   TOKEN_ENV,
   authenticateLeverans,
+  describeLeveransProblems,
   extractLeveransToken,
   inspectLeveransConfig,
   leveransTargetsCompany,
@@ -146,24 +147,45 @@ describe('inspectLeveransConfig', () => {
     expect(lines.ok).toBe(false)
     if (lines.ok) return
     expect(lines.problems).toHaveLength(2)
-    expect(lines.problems.join(' ')).toContain(TOKEN_ENV)
-    expect(lines.problems.join(' ')).toContain(ORGNR_ENV)
+    expect(describeLeveransProblems(lines.problems)).toContain(TOKEN_ENV)
+    expect(describeLeveransProblems(lines.problems)).toContain(ORGNR_ENV)
+    // Nothing was ever written here, so the operator writes both lines.
+    expect(lines.problems.map((p) => p.kind)).toEqual(['missing', 'missing'])
   })
 
   it('says a set token is too short, not that it is missing', () => {
     const lines = problems({ [TOKEN_ENV]: 'hemlighet' })
     expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain('kortare än')
-    expect(lines[0]).toContain('openssl rand -base64 24')
-    expect(lines[0]).not.toContain('är inte satt')
+    expect(lines[0].kind).toBe('invalid')
+    expect(lines[0].message).toContain('kortare än')
+    expect(lines[0].message).toContain('openssl rand -base64 24')
+    expect(lines[0].message).not.toContain('är inte satt')
   })
 
   it('says a set org number is not one, not that it is missing', () => {
     const lines = problems({ [ORGNR_ENV]: 'Tyrberg Group AB' })
     expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain('är inte ett organisationsnummer')
+    expect(lines[0].kind).toBe('invalid')
+    expect(lines[0].message).toContain('är inte ett organisationsnummer')
     // The token is fine here: it must not be dragged into the complaint.
-    expect(lines[0]).not.toContain(TOKEN_ENV)
+    expect(lines[0].message).not.toContain(TOKEN_ENV)
+  })
+
+  /**
+   * One mistyped digit is the typo this message exists to catch, and it is the
+   * one shape where "ange 10 eller 12 siffror" reads as a broken check: the
+   * operator looks at 556012-5791, counts ten digits and one hyphen, and
+   * believes they already did what they were told. So the check digit gets its
+   * own sentence.
+   */
+  it('separates a mistyped digit from a number that is the wrong shape', () => {
+    const lines = problems({ [ORGNR_ENV]: '556012-5791' })
+    expect(lines).toHaveLength(1)
+    expect(lines[0].kind).toBe('invalid')
+    expect(lines[0].message).toContain('kontrollsiffra')
+    expect(lines[0].message).toContain('556012-5791')
+    // The shape advice would be false here, and false advice is the bug.
+    expect(lines[0].message).not.toContain('ange 10 eller 12 siffror')
   })
 
   it('says nothing is wrong when both are right', () => {
@@ -423,9 +445,17 @@ describe('describeLeveransStatus', () => {
   const NOW = new Date('2026-09-21T07:00:00.000Z')
   const recently = '2026-09-21T04:17:00.000Z'
 
+  // The problems as inspectLeveransConfig really produces them, so the report
+  // is never tested against a shape the configuration reader cannot emit.
+  const configProblems = (overrides: Record<string, string | undefined>) => {
+    const result = inspectLeveransConfig({ [TOKEN_ENV]: TOKEN, [ORGNR_ENV]: ORGNR, ...overrides })
+    if (result.ok) throw new Error('expected a configuration problem')
+    return result.problems
+  }
+
   const evidence = (overrides: Partial<LeveransEvidence> = {}): LeveransEvidence => ({
     envFile: '/srv/accounted/.env',
-    configProblem: null,
+    configProblems: [],
     companyProblem: null,
     companyId: 'company-1',
     export: { imported_at: recently, via: 'leverans' },
@@ -445,10 +475,12 @@ describe('describeLeveransStatus', () => {
 
   it('says nothing is switched on when the box has no configuration', () => {
     const report = describeLeveransStatus(
-      evidence({ configProblem: `${TOKEN_ENV} är inte satt. ${ORGNR_ENV} är inte satt.` }),
+      evidence({ configProblems: configProblems({ [TOKEN_ENV]: undefined, [ORGNR_ENV]: undefined }) }),
       NOW,
     )
     expect(report.exitCode).toBe(4)
+    expect(report.headline).toContain('is off on this box')
+    expect(report.checks[0].line).toContain('not switched on')
     expect(report.checks[0].line).toContain(TOKEN_ENV)
     expect(report.checks[0].line).toContain(ORGNR_ENV)
     // Where it looked, so "not switched on" cannot be confused with "looked
@@ -458,7 +490,7 @@ describe('describeLeveransStatus', () => {
 
   it('names the variable that is wrong rather than telling the operator to set both again', () => {
     const report = describeLeveransStatus(
-      evidence({ configProblem: `${ORGNR_ENV} är inte ett organisationsnummer: ange 10 eller 12 siffror, bindestreck valfritt.` }),
+      evidence({ configProblems: configProblems({ [ORGNR_ENV]: 'Tyrberg Group AB' }) }),
       NOW,
     )
     expect(report.exitCode).toBe(4)
@@ -468,9 +500,28 @@ describe('describeLeveransStatus', () => {
     expect(report.checks[0].line).not.toContain(TOKEN_ENV)
   })
 
+  /**
+   * The box with one mistyped digit is switched on, and its operator knows it.
+   * A headline saying the delivery "is off" sends that person to do the thing
+   * they already did, which is the conflation the detail line stopped making:
+   * it must not survive one level up.
+   */
+  it('calls a wrong line wrong, not off, all the way up to the headline', () => {
+    const report = describeLeveransStatus(
+      evidence({ configProblems: configProblems({ [ORGNR_ENV]: '556012-5791' }) }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(4)
+    expect(report.headline).toContain('configured wrong')
+    expect(report.headline).not.toContain('is off')
+    expect(report.checks[0].line).toContain('kontrollsiffra')
+    expect(report.checks[0].line).toContain('Edit that line')
+    expect(report.checks[0].line).not.toContain('not switched on')
+  })
+
   it('says so when it found no .env at all, rather than blaming the operator', () => {
     const report = describeLeveransStatus(
-      evidence({ configProblem: `${TOKEN_ENV} är inte satt.`, envFile: null }),
+      evidence({ configProblems: configProblems({ [TOKEN_ENV]: undefined }), envFile: null }),
       NOW,
     )
     expect(report.exitCode).toBe(4)

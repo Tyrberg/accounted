@@ -42,7 +42,11 @@ import { NextResponse } from 'next/server'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { createExtensionContext } from '@/lib/extensions/context-factory'
-import { formatOrgNumberDisplay, normalizeOrgNumber } from '@/lib/invariants/org-number'
+import {
+  formatOrgNumberDisplay,
+  hasInvalidOrgNumberCheckDigit,
+  normalizeOrgNumber,
+} from '@/lib/invariants/org-number'
 import type { ExtensionContext } from '@/lib/extensions/types'
 
 const EXTENSION_ID = 'underlagsjakt'
@@ -69,10 +73,30 @@ export interface LeveransConfig {
   orgnr: string
 }
 
+/** One thing that is wrong with one variable, and which kind of wrong it is. */
+export interface LeveransConfigProblem {
+  /** The environment variable this sentence is about. */
+  variable: string
+  /**
+   * `missing`: the line is not in the file, so the operator has to write it.
+   * `invalid`: the line is there and does not hold up, so the operator has to
+   * edit it. Telling that person to "switch the delivery on" sends them to do
+   * the thing they already did.
+   */
+  kind: 'missing' | 'invalid'
+  /** What the operator reads: which line, and what to do about it. */
+  message: string
+}
+
 export type LeveransConfigResult =
   | { ok: true; config: LeveransConfig }
-  /** Why the machine path is off, one sentence per variable that is wrong. */
-  | { ok: false; problems: string[] }
+  /** Why the machine path is off, one problem per variable that is wrong. */
+  | { ok: false; problems: LeveransConfigProblem[] }
+
+/** The problems as one paragraph, for the places that show a single line. */
+export function describeLeveransProblems(problems: LeveransConfigProblem[]): string {
+  return problems.map((problem) => problem.message).join(' ')
+}
 
 /**
  * The configuration, or exactly what is wrong with it.
@@ -85,24 +109,45 @@ export type LeveransConfigResult =
  * already holds both lines. So each variable reports its own problem, and the
  * 503 and the switch-on check (leverans-status.ts) both say which line to
  * edit.
+ *
+ * The org number splits that same way once more. `normalizeOrgNumber` refuses
+ * a company name and a mistyped last digit alike, and those two are not the
+ * same news: the operator who fat-fingers one digit of an otherwise perfect
+ * `556012-5790` would count ten digits and one hyphen against a sentence
+ * asking for ten digits and a hyphen, and conclude the check is broken. A
+ * mistyped digit is the typo this whole message exists to catch, so it gets
+ * told the truth: right shape, wrong check digit.
  */
 export function inspectLeveransConfig(env: Env = process.env): LeveransConfigResult {
   const token = env[TOKEN_ENV]?.trim()
   const rawOrgnr = env[ORGNR_ENV]?.trim()
   const orgnr = normalizeOrgNumber(rawOrgnr)
 
-  const problems: string[] = []
+  const problems: LeveransConfigProblem[] = []
+  const problem = (variable: string, kind: LeveransConfigProblem['kind'], message: string) =>
+    problems.push({ variable, kind, message })
+
   if (!token) {
-    problems.push(`${TOKEN_ENV} är inte satt.`)
+    problem(TOKEN_ENV, 'missing', `${TOKEN_ENV} är inte satt.`)
   } else if (token.length < MIN_TOKEN_LENGTH) {
-    problems.push(
+    problem(
+      TOKEN_ENV,
+      'invalid',
       `${TOKEN_ENV} är kortare än ${MIN_TOKEN_LENGTH} tecken och godtas inte. Generera nyckeln med "openssl rand -base64 24".`,
     )
   }
   if (!rawOrgnr) {
-    problems.push(`${ORGNR_ENV} är inte satt.`)
+    problem(ORGNR_ENV, 'missing', `${ORGNR_ENV} är inte satt.`)
+  } else if (hasInvalidOrgNumberCheckDigit(rawOrgnr)) {
+    problem(
+      ORGNR_ENV,
+      'invalid',
+      `${ORGNR_ENV} har rätt form men fel kontrollsiffra: ${rawOrgnr} är inget giltigt organisationsnummer. Siffrorna stämmer inte mot varandra, så kontrollera numret mot bolagets registreringsbevis, oftast är det sista siffran som blivit fel.`,
+    )
   } else if (!orgnr) {
-    problems.push(
+    problem(
+      ORGNR_ENV,
+      'invalid',
       `${ORGNR_ENV} är inte ett organisationsnummer: ange 10 eller 12 siffror, bindestreck valfritt.`,
     )
   }
@@ -301,7 +346,7 @@ export async function authenticateLeverans(
       response: fail(
         503,
         'LEVERANS_NOT_CONFIGURED',
-        `Automatisk leverans är inte påslagen: ${inspected.problems.join(' ')}`,
+        `Automatisk leverans är inte påslagen: ${describeLeveransProblems(inspected.problems)}`,
       ),
     }
   }
