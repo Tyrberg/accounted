@@ -24,6 +24,7 @@ import {
   TOKEN_ENV,
   authenticateLeverans,
   extractLeveransToken,
+  inspectLeveransConfig,
   leveransTargetsCompany,
   readLeveransConfig,
 } from '@/extensions/general/underlagsjakt/lib/leverans'
@@ -128,6 +129,49 @@ describe('readLeveransConfig', () => {
 
 })
 
+/**
+ * Switching the delivery on is four steps on two machines, and the box gets
+ * exactly one line to say what it thinks of the two variables it was given.
+ * "Set them" and "the one you set is wrong" send the operator to different
+ * places, so they must not be the same sentence.
+ */
+describe('inspectLeveransConfig', () => {
+  const problems = (overrides?: Record<string, string | undefined>) => {
+    const result = inspectLeveransConfig(overrides === undefined ? env() : env(overrides))
+    return result.ok ? [] : result.problems
+  }
+
+  it('names both variables when neither is set', () => {
+    const lines = inspectLeveransConfig({})
+    expect(lines.ok).toBe(false)
+    if (lines.ok) return
+    expect(lines.problems).toHaveLength(2)
+    expect(lines.problems.join(' ')).toContain(TOKEN_ENV)
+    expect(lines.problems.join(' ')).toContain(ORGNR_ENV)
+  })
+
+  it('says a set token is too short, not that it is missing', () => {
+    const lines = problems({ [TOKEN_ENV]: 'hemlighet' })
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('kortare än')
+    expect(lines[0]).toContain('openssl rand -base64 24')
+    expect(lines[0]).not.toContain('är inte satt')
+  })
+
+  it('says a set org number is not one, not that it is missing', () => {
+    const lines = problems({ [ORGNR_ENV]: 'Tyrberg Group AB' })
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('är inte ett organisationsnummer')
+    // The token is fine here: it must not be dragged into the complaint.
+    expect(lines[0]).not.toContain(TOKEN_ENV)
+  })
+
+  it('says nothing is wrong when both are right', () => {
+    expect(problems()).toEqual([])
+    expect(inspectLeveransConfig(env())).toEqual({ ok: true, config: { token: TOKEN, orgnr: CANONICAL } })
+  })
+})
+
 describe('leveransTargetsCompany', () => {
   const targets = (companyId: string, overrides?: Record<string, string | undefined>) =>
     leveransTargetsCompany(companyId, { client: makeClient(), env: env(overrides) })
@@ -187,6 +231,18 @@ describe('authenticateLeverans', () => {
     expect(status).toBe(503)
     expect(body.error.code).toBe('LEVERANS_NOT_CONFIGURED')
     expect(body.error.message).toContain(TOKEN_ENV)
+  })
+
+  it('answers 503 naming the variable that is wrong, not both variables', async () => {
+    const result = await auth(undefined, { [ORGNR_ENV]: 'Tyrberg Group AB' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    const { status, body } = await parse<{ error: { code: string; message: string } }>(result.response)
+    expect(status).toBe(503)
+    expect(body.error.code).toBe('LEVERANS_NOT_CONFIGURED')
+    expect(body.error.message).toContain('är inte ett organisationsnummer')
+    // bertil's operator must not be sent to re-mint a token that is correct.
+    expect(body.error.message).not.toContain(TOKEN_ENV)
   })
 
   it('answers 401 without a token', async () => {
@@ -369,7 +425,7 @@ describe('describeLeveransStatus', () => {
 
   const evidence = (overrides: Partial<LeveransEvidence> = {}): LeveransEvidence => ({
     envFile: '/srv/accounted/.env',
-    configured: true,
+    configProblem: null,
     companyProblem: null,
     companyId: 'company-1',
     export: { imported_at: recently, via: 'leverans' },
@@ -388,7 +444,10 @@ describe('describeLeveransStatus', () => {
   })
 
   it('says nothing is switched on when the box has no configuration', () => {
-    const report = describeLeveransStatus(evidence({ configured: false }), NOW)
+    const report = describeLeveransStatus(
+      evidence({ configProblem: `${TOKEN_ENV} är inte satt. ${ORGNR_ENV} är inte satt.` }),
+      NOW,
+    )
     expect(report.exitCode).toBe(4)
     expect(report.checks[0].line).toContain(TOKEN_ENV)
     expect(report.checks[0].line).toContain(ORGNR_ENV)
@@ -397,8 +456,23 @@ describe('describeLeveransStatus', () => {
     expect(report.checks[0].line).toContain('/srv/accounted/.env')
   })
 
+  it('names the variable that is wrong rather than telling the operator to set both again', () => {
+    const report = describeLeveransStatus(
+      evidence({ configProblem: `${ORGNR_ENV} är inte ett organisationsnummer: ange 10 eller 12 siffror, bindestreck valfritt.` }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(4)
+    expect(report.checks[0].line).toContain('är inte ett organisationsnummer')
+    // The token is fine on this box: saying "set it" would send the operator
+    // to rewrite a line that is already correct.
+    expect(report.checks[0].line).not.toContain(TOKEN_ENV)
+  })
+
   it('says so when it found no .env at all, rather than blaming the operator', () => {
-    const report = describeLeveransStatus(evidence({ configured: false, envFile: null }), NOW)
+    const report = describeLeveransStatus(
+      evidence({ configProblem: `${TOKEN_ENV} är inte satt.`, envFile: null }),
+      NOW,
+    )
     expect(report.exitCode).toBe(4)
     expect(report.checks[0].line).toContain('no .env found')
   })

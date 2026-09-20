@@ -69,12 +69,52 @@ export interface LeveransConfig {
   orgnr: string
 }
 
+export type LeveransConfigResult =
+  | { ok: true; config: LeveransConfig }
+  /** Why the machine path is off, one sentence per variable that is wrong. */
+  | { ok: false; problems: string[] }
+
+/**
+ * The configuration, or exactly what is wrong with it.
+ *
+ * "Off" and "set wrong" are different situations for the person switching the
+ * delivery on, and only one of them is fixed by setting the variables. A box
+ * where the token was typed by hand, or where the org number is a company
+ * name, is configured as far as the operator is concerned; answering "set
+ * ${TOKEN_ENV} and ${ORGNR_ENV}" there sends them to re-read a file that
+ * already holds both lines. So each variable reports its own problem, and the
+ * 503 and the switch-on check (leverans-status.ts) both say which line to
+ * edit.
+ */
+export function inspectLeveransConfig(env: Env = process.env): LeveransConfigResult {
+  const token = env[TOKEN_ENV]?.trim()
+  const rawOrgnr = env[ORGNR_ENV]?.trim()
+  const orgnr = normalizeOrgNumber(rawOrgnr)
+
+  const problems: string[] = []
+  if (!token) {
+    problems.push(`${TOKEN_ENV} är inte satt.`)
+  } else if (token.length < MIN_TOKEN_LENGTH) {
+    problems.push(
+      `${TOKEN_ENV} är kortare än ${MIN_TOKEN_LENGTH} tecken och godtas inte. Generera nyckeln med "openssl rand -base64 24".`,
+    )
+  }
+  if (!rawOrgnr) {
+    problems.push(`${ORGNR_ENV} är inte satt.`)
+  } else if (!orgnr) {
+    problems.push(
+      `${ORGNR_ENV} är inte ett organisationsnummer: ange 10 eller 12 siffror, bindestreck valfritt.`,
+    )
+  }
+
+  if (problems.length > 0) return { ok: false, problems }
+  return { ok: true, config: { token: token!, orgnr: orgnr! } }
+}
+
 /** Config for the machine path, or null when the deployment has not enabled it. */
 export function readLeveransConfig(env: Env = process.env): LeveransConfig | null {
-  const token = env[TOKEN_ENV]?.trim()
-  const orgnr = normalizeOrgNumber(env[ORGNR_ENV])
-  if (!token || token.length < MIN_TOKEN_LENGTH || !orgnr) return null
-  return { token, orgnr }
+  const result = inspectLeveransConfig(env)
+  return result.ok ? result.config : null
 }
 
 /**
@@ -254,17 +294,18 @@ export async function authenticateLeverans(
   request: Request,
   deps: LeveransDeps = {},
 ): Promise<LeveransAuth> {
-  const config = readLeveransConfig(deps.env ?? process.env)
-  if (!config) {
+  const inspected = inspectLeveransConfig(deps.env ?? process.env)
+  if (!inspected.ok) {
     return {
       ok: false,
       response: fail(
         503,
         'LEVERANS_NOT_CONFIGURED',
-        `Automatisk leverans är inte påslagen. Sätt ${TOKEN_ENV} och ${ORGNR_ENV} på servern.`,
+        `Automatisk leverans är inte påslagen: ${inspected.problems.join(' ')}`,
       ),
     }
   }
+  const config = inspected.config
 
   const presented = extractLeveransToken(request)
   if (!presented) {

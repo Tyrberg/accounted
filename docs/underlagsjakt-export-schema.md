@@ -256,7 +256,7 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | Status | Code | Meaning |
 |---|---|---|
 | 401 | `LEVERANS_TOKEN_MISSING` / `LEVERANS_TOKEN_INVALID` | No token, or not the configured one. |
-| 503 | `LEVERANS_NOT_CONFIGURED` | The server has no delivery configured. |
+| 503 | `LEVERANS_NOT_CONFIGURED` | The server has no usable delivery configuration. The message names each variable that is unset, too short or malformed, so a token that was typed by hand is not reported as a token that was never set. |
 | 503 | `LEVERANS_COMPANY_NOT_FOUND` / `LEVERANS_COMPANY_AMBIGUOUS` | `UNDERLAGSJAKT_LEVERANS_ORGNR` matches no active company, or several. |
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 

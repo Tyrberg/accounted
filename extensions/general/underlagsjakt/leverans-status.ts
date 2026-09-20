@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath } from 'node:path'
 import { config as dotenv } from 'dotenv'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
-import { ORGNR_ENV, TOKEN_ENV, openLeveransContext, readLeveransConfig } from './lib/leverans'
+import { ORGNR_ENV, TOKEN_ENV, inspectLeveransConfig, openLeveransContext } from './lib/leverans'
 import {
   loadLeveransJournal,
   loadState,
@@ -63,8 +63,13 @@ export const MAX_QUIET_DAYS = 2
 export interface LeveransEvidence {
   /** The `.env` the configuration was read from, or null when none was found. */
   envFile: string | null
-  /** Both environment variables present and well-formed. */
-  configured: boolean
+  /**
+   * Why the two environment variables do not add up to a configuration, or
+   * null when they do. A set-but-malformed variable reports itself here
+   * rather than as "not switched on": the operator who just wrote both lines
+   * must be told which line to edit, not to write them again.
+   */
+  configProblem: string | null
   /** Why the configured org number names no single active company, if so. */
   companyProblem: string | null
   /** The company the delivery resolves to, when it resolves. */
@@ -163,11 +168,11 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
   // difference between "you never set them" and "I looked somewhere else".
   const source = evidence.envFile ?? 'no .env found; only this shell\'s environment was read'
 
-  if (!evidence.configured) {
+  if (evidence.configProblem !== null) {
     checks.push({
       label: 'configuration',
       state: 'blocked',
-      line: `not switched on: set ${TOKEN_ENV} and ${ORGNR_ENV} in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`,
+      line: `not switched on: ${evidence.configProblem} Both variables belong in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`,
     })
     return { exitCode: 4, headline: 'The automatic delivery is off on this box.', checks }
   }
@@ -313,7 +318,7 @@ export function loadDeploymentEnv(...dirs: string[]): string | null {
 export async function gatherEvidence(envFile: string | null = null): Promise<LeveransEvidence> {
   const empty: LeveransEvidence = {
     envFile,
-    configured: false,
+    configProblem: null,
     companyProblem: null,
     companyId: null,
     export: null,
@@ -321,12 +326,12 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     pendingAnswers: 0,
   }
 
-  const config = readLeveransConfig()
-  if (!config) return empty
+  const inspected = inspectLeveransConfig()
+  if (!inspected.ok) return { ...empty, configProblem: inspected.problems.join(' ') }
 
-  const opened = await openLeveransContext(createServiceClientNoCookies(), config)
+  const opened = await openLeveransContext(createServiceClientNoCookies(), inspected.config)
   if (!opened.ok) {
-    return { ...empty, configured: true, companyProblem: `${opened.code}: ${opened.message}` }
+    return { ...empty, companyProblem: `${opened.code}: ${opened.message}` }
   }
 
   const [state, journal] = await Promise.all([
@@ -336,7 +341,7 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
 
   return {
     envFile,
-    configured: true,
+    configProblem: null,
     companyProblem: null,
     companyId: opened.ctx.companyId,
     export: state.export
