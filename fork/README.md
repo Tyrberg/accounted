@@ -605,7 +605,7 @@ can be told from a wrong place to look. Its exit code is the whole verdict:
 
 | Exit | What it means |
 | --- | --- |
-| `4` | Nothing to check: the variables are unset, one of them is set to something unusable (a hand-typed token, an org number with a mistyped digit), or the org number names no single active company. The headline separates "off" from "configured wrong", the line names the variable and what is wrong with it, and it says which `.env` was read or that none was found. Fix and rerun before going further. |
+| `4` | Nothing to check: the variables are unset, one of them is set to something unusable (a hand-typed token, an org number with a mistyped digit), or the org number names no single active company. The configuration headline distinguishes "not switched on", "configured wrong", and "partly missing and partly invalid". The line names each problem and says "Add" for each missing variable and "Correct" for each invalid one, so a mixed configuration gets both actions. Report framing is English; shared API error details remain Swedish. It also says which `.env` was read or that none was found. Fix and rerun before going further. |
 | `2` | Configured and resolving, but nothing has come through yet. **This is the expected answer at this point**, and it stays the answer until step 4 succeeds. |
 | `0` | Both directions have carried real data, recently. Only step 4 can produce this. |
 

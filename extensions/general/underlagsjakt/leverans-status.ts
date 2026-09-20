@@ -178,26 +178,28 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
   const source = evidence.envFile ?? 'no .env found; only this shell\'s environment was read'
 
   if (evidence.configProblems.length > 0) {
-    // "Off" and "on, but one line is wrong" are different boxes and different
-    // next moves. A box whose org number has one mistyped digit is switched
-    // on as far as its operator is concerned, and telling that person the
-    // delivery "is off" sends them to switch on something they already
-    // switched on: the same conflation the detail line stopped making, one
-    // level up. So the headline follows the detail.
-    const wrong = evidence.configProblems.some((problem) => problem.kind === 'invalid')
-    const where = wrong
-      ? `Edit that line in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`
-      : `Both variables belong in the deployment's .env (fork/README.md section 11, step 2). Read ${source}.`
+    const missing = evidence.configProblems.filter((problem) => problem.kind === 'missing')
+    const invalid = evidence.configProblems.filter((problem) => problem.kind === 'invalid')
+    const mixed = missing.length > 0 && invalid.length > 0
+    const state = mixed
+      ? 'configuration is partly missing and partly invalid'
+      : invalid.length > 0 ? 'set, but not usable' : 'not switched on'
+    // Keep the action tied to each variable, including partially configured boxes.
+    const advice = evidence.configProblems.map((problem) =>
+      `${problem.kind === 'missing' ? 'Add' : 'Correct'} ${problem.variable} in the deployment's .env.`,
+    ).join(' ')
     checks.push({
       label: 'configuration',
       state: 'blocked',
-      line: `${wrong ? 'set, but not usable' : 'not switched on'}: ${describeLeveransProblems(evidence.configProblems)} ${where}`,
+      line: `${state}: ${describeLeveransProblems(evidence.configProblems)} ${advice} See fork/README.md section 11, step 2. ${evidence.envFile ? `Read ${source}` : source}.`,
     })
     return {
       exitCode: 4,
-      headline: wrong
-        ? 'The automatic delivery is configured wrong on this box.'
-        : 'The automatic delivery is off on this box.',
+      headline: mixed
+        ? 'The automatic delivery configuration is partly missing and partly invalid.'
+        : invalid.length > 0
+          ? 'The automatic delivery is configured wrong on this box.'
+          : 'The automatic delivery is not switched on on this box.',
       checks,
     }
   }

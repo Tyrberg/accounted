@@ -479,13 +479,16 @@ describe('describeLeveransStatus', () => {
       NOW,
     )
     expect(report.exitCode).toBe(4)
-    expect(report.headline).toContain('is off on this box')
+    expect(report.headline).toContain('is not switched on on this box')
     expect(report.checks[0].line).toContain('not switched on')
     expect(report.checks[0].line).toContain(TOKEN_ENV)
     expect(report.checks[0].line).toContain(ORGNR_ENV)
+    expect(report.checks[0].line).toContain(`Add ${TOKEN_ENV}`)
+    expect(report.checks[0].line).toContain(`Add ${ORGNR_ENV}`)
+    expect(report.checks[0].line).not.toContain('Correct')
     // Where it looked, so "not switched on" cannot be confused with "looked
     // in the wrong place".
-    expect(report.checks[0].line).toContain('/srv/accounted/.env')
+    expect(report.checks[0].line).toContain('Read /srv/accounted/.env.')
   })
 
   it('names the variable that is wrong rather than telling the operator to set both again', () => {
@@ -512,11 +515,44 @@ describe('describeLeveransStatus', () => {
       NOW,
     )
     expect(report.exitCode).toBe(4)
-    expect(report.headline).toContain('configured wrong')
-    expect(report.headline).not.toContain('is off')
+    expect(report.headline).toContain('is configured wrong')
+    expect(report.headline).not.toContain('not switched on')
     expect(report.checks[0].line).toContain('kontrollsiffra')
-    expect(report.checks[0].line).toContain('Edit that line')
+    expect(report.checks[0].line).toContain(`Correct ${ORGNR_ENV} in the deployment's .env.`)
     expect(report.checks[0].line).not.toContain('not switched on')
+  })
+
+  it.each([
+    { missing: TOKEN_ENV, invalid: ORGNR_ENV, value: '556012-5791' },
+    { missing: ORGNR_ENV, invalid: TOKEN_ENV, value: 'short-token' },
+  ])('distinguishes missing $missing from invalid $invalid', ({ missing, invalid, value }) => {
+    const report = describeLeveransStatus(
+      evidence({ configProblems: configProblems({ [missing]: undefined, [invalid]: value }) }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(4)
+    expect(report.headline).toContain('is partly missing and partly invalid')
+    expect(report.checks).toHaveLength(1)
+    expect(report.checks[0].state).toBe('blocked')
+    expect(report.checks[0].line).toContain('configuration is partly missing and partly invalid')
+    expect(report.checks[0].line).toContain(`Add ${missing} in the deployment's .env.`)
+    expect(report.checks[0].line).toContain(`Correct ${invalid} in the deployment's .env.`)
+    expect(report.checks[0].line).not.toContain(`Correct ${missing}`)
+    expect(report.checks[0].line).not.toContain(`Add ${invalid}`)
+    expect(report.checks[0].line).toContain('Read /srv/accounted/.env.')
+    expect(report.checks[0].line).not.toContain('short-token')
+  })
+
+  it('gives correction advice for both invalid variables', () => {
+    const report = describeLeveransStatus(
+      evidence({ configProblems: configProblems({ [TOKEN_ENV]: 'short-token', [ORGNR_ENV]: '556012-5791' }) }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(4)
+    expect(report.headline).toContain('is configured wrong')
+    expect(report.checks[0].line).toContain(`Correct ${TOKEN_ENV}`)
+    expect(report.checks[0].line).toContain(`Correct ${ORGNR_ENV}`)
+    expect(report.checks[0].line).not.toContain('Add')
   })
 
   it('says so when it found no .env at all, rather than blaming the operator', () => {
@@ -525,7 +561,9 @@ describe('describeLeveransStatus', () => {
       NOW,
     )
     expect(report.exitCode).toBe(4)
-    expect(report.checks[0].line).toContain('no .env found')
+    expect(report.checks[0].line).toContain("See fork/README.md section 11, step 2. no .env found; only this shell's environment was read.")
+    expect(report.checks[0].line).not.toContain('Läste')
+    expect(report.checks[0].line).not.toContain('Read no .env')
   })
 
   it('stops at the company when the org number names none, as the delivery would', () => {
