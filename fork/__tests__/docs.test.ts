@@ -111,10 +111,12 @@ function cronBlocks(path: string): CronBlock[] {
 }
 
 const readmeCron = cronBlocks('fork/README.md')
-// Both schedules a human installs on a box: the fork sync (section 5) and
-// bertil's export delivery (section 11). The second one is why the delivery
-// is nobody's daily chore, so a line cron silently refuses there means the
-// chain quietly goes back to Mattias uploading a file by hand.
+// Every schedule a human installs on a box: the fork sync (section 5),
+// bertil's export delivery and the standing check that watches it (section
+// 11). The delivery one is why the hand-off is nobody's daily chore, so a
+// line cron silently refuses there means the chain quietly goes back to
+// Mattias uploading a file by hand, and the watcher is what makes that
+// noticed.
 const everyCronBlock = [...readmeCron, ...cronBlocks('docs/underlagsjakt-export-schema.md')]
 
 describe.each(everyCronBlock)('the /etc/cron.d entry in $where', (block) => {
@@ -193,6 +195,61 @@ describe("the underlagsjakt delivery crontab, which is what makes the delivery a
     expect(minute).toMatch(/^\d+$/)
     expect(hour).toMatch(/^\d+$/)
     expect([dayOfMonth, month, dayOfWeek]).toEqual(['*', '*', '*'])
+  })
+})
+
+describe('the standing-check crontab in fork/README.md section 11, step 5', () => {
+  // The check in step 2 is what tells the operator whether the delivery is
+  // carrying anything, and section 11 calls it "the standing check
+  // afterwards". A standing check nobody runs is the same silence it exists to
+  // break, one step further out: the delivery dies, nobody remembers the
+  // command, and the surface goes back to "import the file" unnoticed.
+  const block = readmeCron.find((candidate) =>
+    candidate.scheduleLines.some((line) => line.includes('leverans-status.ts')),
+  )
+
+  it('exists, so the alarm does not depend on somebody remembering a command', () => {
+    expect(block).toBeDefined()
+  })
+
+  it('runs at least daily, which is what MAX_QUIET_DAYS assumes', () => {
+    // leverans-status.ts alarms after 2 quiet days. A weekly schedule would
+    // find every outage up to a week late, which is the delay the check was
+    // written to remove.
+    const [minute, hour, dayOfMonth, month, dayOfWeek] = block!.scheduleLines[0].trim().split(/\s+/)
+    expect(minute).toMatch(/^\d+$/)
+    expect(hour).toMatch(/^\d+$/)
+    expect([dayOfMonth, month, dayOfWeek]).toEqual(['*', '*', '*'])
+  })
+
+  it('pings the heartbeat only on a zero exit, so an alarm is a missing ping', () => {
+    // `&&` is the whole dead-man's switch: exits 2 and 4, a wiped clone and a
+    // box that is off must all reach the operator from outside as silence. A
+    // `;` or a `||` there would ping on failure too and report a dead delivery
+    // as healthy, which is worse than no check at all.
+    const line = block!.scheduleLines[0]
+    const check = line.indexOf('leverans-status.ts')
+    const ping = line.indexOf('curl')
+
+    expect(ping).toBeGreaterThan(check)
+    const between = line.slice(check, ping)
+    expect(between).toContain('&&')
+    expect(between).not.toContain('||')
+    expect(between).not.toContain(';')
+  })
+
+  it('carries its own heartbeat variable, not the fork sync\'s', () => {
+    // Section 5 already pings a check for the weekly sync. Sharing one URL
+    // would make either routine's ping cover for the other's silence, so
+    // neither outage is visible.
+    const variables = block!.lines
+      .filter(isAssignment)
+      .map((line) => line.split('=')[0])
+      .filter((name) => /HEARTBEAT/.test(name))
+
+    expect(variables).toHaveLength(1)
+    expect(variables[0]).not.toBe('FORK_SYNC_HEARTBEAT_URL')
+    expect(block!.scheduleLines[0]).toContain(`$${variables[0]}`)
   })
 })
 

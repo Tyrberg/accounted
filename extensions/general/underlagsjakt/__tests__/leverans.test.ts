@@ -15,6 +15,9 @@
  *   - the box can tell a delivery that runs from one that was configured and
  *     never called, which is what leverans-status.ts reports on
  */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   ORGNR_ENV,
@@ -27,6 +30,8 @@ import {
 import {
   MAX_QUIET_DAYS,
   describeLeveransStatus,
+  loadDeploymentEnv,
+  main,
   type LeveransEvidence,
 } from '@/extensions/general/underlagsjakt/leverans-status'
 import type { ExtensionContext } from '@/lib/extensions/types'
@@ -440,6 +445,7 @@ describe('describeLeveransStatus', () => {
   const recently = '2026-09-21T04:17:00.000Z'
 
   const evidence = (overrides: Partial<LeveransEvidence> = {}): LeveransEvidence => ({
+    envFile: '/srv/accounted/.env',
     configured: true,
     companyProblem: null,
     companyId: 'company-1',
@@ -463,6 +469,15 @@ describe('describeLeveransStatus', () => {
     expect(report.exitCode).toBe(4)
     expect(report.checks[0].line).toContain(TOKEN_ENV)
     expect(report.checks[0].line).toContain(ORGNR_ENV)
+    // Where it looked, so "not switched on" cannot be confused with "looked
+    // in the wrong place".
+    expect(report.checks[0].line).toContain('/srv/accounted/.env')
+  })
+
+  it('says so when it found no .env at all, rather than blaming the operator', () => {
+    const report = describeLeveransStatus(evidence({ configured: false, envFile: null }), NOW)
+    expect(report.exitCode).toBe(4)
+    expect(report.checks[0].line).toContain('no .env found')
   })
 
   it('stops at the company when the org number names none, as the delivery would', () => {
@@ -495,8 +510,9 @@ describe('describeLeveransStatus', () => {
     expect(labels(report, 'alarm')).toEqual(['answers (Accounted -> bertil)'])
   })
 
+  const stale = new Date(NOW.getTime() - (MAX_QUIET_DAYS + 1) * 86_400_000).toISOString()
+
   it('treats silence as the alarm it is: an unscheduled client looks exactly like a dead one', () => {
-    const stale = new Date(NOW.getTime() - (MAX_QUIET_DAYS + 1) * 86_400_000).toISOString()
     const report = describeLeveransStatus(
       evidence({
         export: { imported_at: stale, via: 'leverans' },
@@ -506,6 +522,58 @@ describe('describeLeveransStatus', () => {
     )
     expect(report.exitCode).toBe(2)
     expect(labels(report, 'alarm')).toEqual(['freshness'])
+  })
+
+  /**
+   * The two halves stop independently, and each one alone is a dead delivery.
+   * Measuring recency as the newest moment across both would let the half that
+   * still runs hold the other one green: exit 0, and on the schedule in
+   * fork/README.md section 11 step 5 a heartbeat pinging healthy every morning
+   * over a direction that has been down for weeks.
+   */
+  it('alarms when the export stopped, even though bertil still collects answers daily', () => {
+    const report = describeLeveransStatus(
+      evidence({ export: { imported_at: stale, via: 'leverans' } }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(2)
+    expect(labels(report, 'alarm')).toEqual(['freshness'])
+    const freshness = report.checks.find((c) => c.label === 'freshness')!
+    expect(freshness.line).toContain('no export has arrived since')
+    expect(freshness.line).not.toContain('has not collected')
+  })
+
+  it('alarms when bertil stopped collecting, even though exports still arrive daily', () => {
+    const report = describeLeveransStatus(
+      evidence({ journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 } }),
+      NOW,
+    )
+    expect(report.exitCode).toBe(2)
+    expect(labels(report, 'alarm')).toEqual(['freshness'])
+    const freshness = report.checks.find((c) => c.label === 'freshness')!
+    expect(freshness.line).toContain('has not collected answers since')
+    expect(freshness.line).not.toContain('no export has arrived')
+  })
+
+  it('names both halves when both went quiet, so the log says what stopped', () => {
+    const report = describeLeveransStatus(
+      evidence({
+        export: { imported_at: stale, via: 'leverans' },
+        journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 },
+      }),
+      NOW,
+    )
+    const freshness = report.checks.find((c) => c.label === 'freshness')!
+    expect(freshness.line).toContain('no export has arrived since')
+    expect(freshness.line).toContain('has not collected answers since')
+  })
+
+  it('reports each direction it can date, and passes only when neither is quiet', () => {
+    const report = describeLeveransStatus(evidence(), NOW)
+    const freshness = report.checks.find((c) => c.label === 'freshness')!
+    expect(freshness.state).toBe('ok')
+    expect(freshness.line).toContain('last export')
+    expect(freshness.line).toContain('last collection')
   })
 
   it('reports every check whatever the code, so one alarm never hides another', () => {
@@ -520,6 +588,71 @@ describe('describeLeveransStatus', () => {
       'answers (Accounted -> bertil)',
       'waiting',
     ])
+  })
+})
+
+describe('where the check reads its configuration', () => {
+  /**
+   * The box the operator actually has after step 2: the two variables are in
+   * the deployment's .env, which docker compose hands the app through
+   * `env_file`, and nothing exported them into the shell that runs the check.
+   * A check that only read process.env would report that box as switched off,
+   * send the operator back to re-edit correct variables, and never alarm on a
+   * delivery that had died: both states print the same thing.
+   */
+  let box: string
+
+  beforeEach(() => {
+    box = mkdtempSync(join(tmpdir(), 'leverans-box-'))
+    writeFileSync(join(box, '.env'), `${TOKEN_ENV}=${TOKEN}\n${ORGNR_ENV}=${ORGNR}\n`)
+    delete process.env[TOKEN_ENV]
+    delete process.env[ORGNR_ENV]
+  })
+
+  afterEach(() => {
+    rmSync(box, { recursive: true, force: true })
+  })
+
+  it('loads the deployment .env, because that is where the configuration lives', () => {
+    expect(readLeveransConfig()).toBeNull()
+    expect(loadDeploymentEnv(box)).toBe(join(box, '.env'))
+    expect(readLeveransConfig()?.orgnr).toBe(CANONICAL)
+  })
+
+  it('lets the file win over a stale variable left exported in the shell', () => {
+    process.env[TOKEN_ENV] = 'aStaleTokenFromAnEarlierAttempt!!'
+    loadDeploymentEnv(box)
+    expect(readLeveransConfig()?.token).toBe(TOKEN)
+  })
+
+  it('reports a correctly configured box as configured, not as switched off', async () => {
+    const written: string[] = []
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      written.push(String(chunk))
+      return true
+    })
+
+    // 2, not 4: configured and resolving, nothing carried yet. That is the
+    // answer step 2 of the switch-on documents, and exit 0 is only reachable
+    // from here.
+    const code = await main(box)
+    stdout.mockRestore()
+
+    expect(code).toBe(2)
+    const output = written.join('')
+    expect(output).toContain(join(box, '.env'))
+    expect(output).not.toContain('not switched on')
+    expect(output).toContain('deliveries land in company company-1')
+  })
+
+  it('says which directory it searched when there is no .env anywhere', () => {
+    const empty = mkdtempSync(join(tmpdir(), 'leverans-empty-'))
+    try {
+      expect(loadDeploymentEnv(empty)).toBeNull()
+      expect(readLeveransConfig()).toBeNull()
+    } finally {
+      rmSync(empty, { recursive: true, force: true })
+    }
   })
 })
 
