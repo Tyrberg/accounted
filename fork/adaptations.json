@@ -303,6 +303,26 @@
         }
       ],
       "branch": "main"
+    },
+    {
+      "id": "leverans-mfa-gate-prefix",
+      "tier": 2,
+      "summary": "api-mfa-gate.ts listar underlagsjaktens leveransvag bland de sokvagar vars auth-kontrakt ar Authorization-rubriken.",
+      "why": "Underlagsjaktens export- och svarsrutter ar en maskinvag: bertil postar utan att en manniska ar inloggad. Rutterna deklarerar skipAuth och autentiserar sjalva via authenticateLeverans, som binder bolaget till UNDERLAGSJAKT_LEVERANS_ORGNR och jamfor token i konstant tid mot en nyckel som maste vara minst 32 tecken. Men MFA-grinden i lib/supabase/middleware.ts kor FORE dispatchern och avvisade anropet med 401, eftersom BEARER_AUTH_PREFIXES bara listade /api/v1/ och mcp-serverns rutt. Upptackt vid forsta skarpa leveransforsoket 2026-09-20: bade med och utan nyckel gav 401, och ingenting nadde extensionen. Prefixet galler endast underlagsjaktens egna rutter och slapper inte igenom nagot annat, och grinden kraver fortfarande att Authorization-rubriken finns.",
+      "paths": ["lib/auth/api-mfa-gate.ts"],
+      "tracked": true,
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "lib/auth/api-mfa-gate.ts",
+          "pattern": "/api/extensions/ext/underlagsjakt/",
+          "reason": "Faller prefixet bort slutar bertils leverans fungera med 401 fran middleware, utan att nagot i extensionen sager ifran."
+        }
+      ],
+      "branch": "main"
     }
   ]
 }

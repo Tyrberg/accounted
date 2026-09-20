@@ -43,6 +43,7 @@ const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
     'lib/import/__tests__/sie-migration-validation.test.ts',
   ],
   'docker-extensions-preset-underlagsjakt': ['docker/extensions.self-hosted.json'],
+  'leverans-mfa-gate-prefix': ['lib/auth/api-mfa-gate.ts'],
   'docker-publish-ghcr-namespace': ['.github/workflows/docker-publish.yml'],
   'docker-cron-entrypoint-hardening': [
     'docker/cron.Dockerfile',
@@ -224,6 +225,11 @@ describe('the committed manifest', () => {
     //   the extension is missing from every published image. Found on the
     //   first deploy of our own image (2026-09-17): green tests, no entry in
     //   the UI. The preset is upstream's file, so the path is named here.
+    // - leverans-mfa-gate-prefix: underlagsjaktens leveransvag ar en maskinvag,
+    //   sa dess auth-kontrakt ar Authorization-rubriken. MFA-grinden kor fore
+    //   dispatchern och gav 401 pa forsta skarpa leveransen (2026-09-20) tills
+    //   prefixet lades till. api-mfa-gate.ts ar upstreams fil, sa sokvagen
+    //   namnges har med flit.
     expect(findUnreviewedPaths(manifest.adaptations)).toEqual([])
   })
 

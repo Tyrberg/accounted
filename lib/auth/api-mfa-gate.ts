@@ -29,7 +29,18 @@
 // Routes whose auth contract IS the Authorization header. Everything else
 // under /api/extensions/ext/ authenticates via requireAuth (cookies) in the
 // dispatcher and must stay behind the gate.
-const BEARER_AUTH_PREFIXES = ['/api/v1/', '/api/extensions/ext/mcp-server/mcp']
+const BEARER_AUTH_PREFIXES = [
+  '/api/v1/',
+  '/api/extensions/ext/mcp-server/mcp',
+  // Underlagsjaktens leveransvag: bertil postar exporten och hamtar svar utan
+  // manniska, sa dess auth-kontrakt AR Authorization-rubriken. Rutterna
+  // (extensions/general/underlagsjakt/index.ts, path /export och /svar) deklarerar
+  // skipAuth och autentiserar sjalva via authenticateLeverans, som binder bolaget
+  // till UNDERLAGSJAKT_LEVERANS_ORGNR och jamfor token i konstant tid. Utan detta
+  // prefix avvisar MFA-grinden anropet med 401 innan dispatchern kors, vilket ar
+  // precis vad som hande vid forsta skarpa leveransforsoket 2026-09-20.
+  '/api/extensions/ext/underlagsjakt/',
+]
 
 export function apiPathSkipsMfaGate(
   pathname: string,
