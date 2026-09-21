@@ -135,6 +135,12 @@ export function bulkTargets(open: Post[], anchor: Post): Post[] {
  * ran out, or an answer bertil rejected): drop it so the post shows again.
  * Answers not yet handed over are always kept, and an older export read back
  * in never resurrects a post that was answered after it was generated.
+ *
+ * Exception: for "levererar_sjalv" (I will deliver it myself) answers where the
+ * document still hasn't been found (`underlag_hittat_at` is null), bertil asking
+ * again means "I still haven't found it", not "this answer is stale". These must
+ * be kept so the promise stays in the waiting list and the 14-day alarm keeps
+ * ticking.
  */
 export function reconcileWithExport(svar: SvarMap, exp: ParsedExport): SvarMap {
   const generated = Date.parse(exp.generated_at)
@@ -143,7 +149,13 @@ export function reconcileWithExport(svar: SvarMap, exp: ParsedExport): SvarMap {
   for (const [id, rec] of Object.entries(svar)) {
     const deliveredBefore =
       rec.levererad_at !== null && !Number.isNaN(generated) && Date.parse(rec.levererad_at) < generated
-    if (asked.has(id) && deliveredBefore) continue
+
+    // For "levererar_sjalv" answers where the document still hasn't been found,
+    // keep them even if delivered before. They're not stale; they're waiting.
+    const isPromiseWithoutDocument =
+      rec.beslut.svarstyp === 'levererar_sjalv' && rec.beslut.underlag_hittat_at === null
+
+    if (asked.has(id) && deliveredBefore && !isPromiseWithoutDocument) continue
     next[id] = rec
   }
   return next

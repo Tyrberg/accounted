@@ -42,6 +42,7 @@ import {
 import type { ExtensionContext } from '@/lib/extensions/types'
 import { createLeveransSupabaseSlice, type LeveransSupabaseSlice } from './supabase-slice'
 import fixture from './fixtures/export-1.1.json'
+import fixtureWithPromise from './fixtures/export-promise-reask.json'
 
 vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: vi.fn(async () => ({ ok: true })),
@@ -1018,6 +1019,31 @@ describe('promised documents (levererar_sjalv waiting list)', () => {
       const evidence = await gatherEvidence()
       expect(evidence.promisedDocuments).toBe(0)
       expect(promised(describeLeveransStatus(evidence, NOW))).toEqual([])
+    })
+
+    it('keeps counting a delivered promise when bertil asks again without finding the document', async () => {
+      await route('POST', '/export').handler(request({ body: fixture }))
+      const answerId = '2026-09-05T08:00:00.000Z:promise-1'
+      slice.dataRows.find((r) => r.key === 'svar')!.value = {
+        'promise-1': {
+          beslut: { transaction_id: 'promise-1', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: null },
+          reglering: null,
+          post: {},
+          besvarad_at: daysAgo(30),
+          besvarad_av: 'owner-1',
+          answer_id: answerId,
+          erbjudet_at: daysAgo(29),
+          levererad_at: daysAgo(29), // Bertil already received this promise
+        },
+      }
+      expect((await gatherEvidence()).promisedDocuments).toBe(1)
+
+      // Bertil asks again (the same post is in the next export) but still hasn't found the document
+      await route('POST', '/export').handler(request({ body: fixtureWithPromise }))
+      const evidence = await gatherEvidence()
+      // The promise should still be counted because underlag_hittat_at is null
+      expect(evidence.promisedDocuments).toBe(1)
+      expect(evidence.oldestPromisedAt).toBe(daysAgo(30))
     })
 
     it('GET /svar hands bertil a 1.5 file when it carries a promise', async () => {
