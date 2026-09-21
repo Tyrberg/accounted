@@ -224,6 +224,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     ['GET', ['underlagsjakt'], undefined],
     ['POST', ['underlagsjakt', 'export', 'fil'], fixture],
     ['POST', ['underlagsjakt', 'svar'], { svarstyp: 'osaker', transaction_id: 'tx-moank-20260821' }],
+    ['POST', ['underlagsjakt', 'svar', 'underlag'], { transaction_id: 'tx-moank-20260821' }],
     ['DELETE', ['underlagsjakt', 'svar', 'tx-moank-20260821'], undefined],
     ['GET', ['underlagsjakt', 'svarsfil'], undefined],
     ['POST', ['underlagsjakt', 'svarsfil', 'levererad'], { transaction_ids: ['tx-moank-20260821'] }],

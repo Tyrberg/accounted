@@ -153,6 +153,93 @@ describe('buildAnswerInput: fel_bolag', () => {
   })
 })
 
+describe('buildAnswerInput: uppladdat_underlag', () => {
+  const PDF = new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], 'kvitto.pdf', { type: 'application/pdf' })
+  const BASE_UPLOAD = { ...BASE_VAL_KANDIDAT, mode: 'uppladdat_underlag' as const, hasCandidate: false, file: PDF }
+
+  it('needs a file, and never a chosen candidate', () => {
+    expect(buildAnswerInput({ ...BASE_UPLOAD, file: undefined })).toEqual({ missing: ['missing_file'] })
+  })
+
+  it('still needs the classification the rule is learned from', () => {
+    expect(buildAnswerInput({ ...BASE_UPLOAD, kategori: undefined, motpart: ' ' })).toEqual({
+      missing: ['missing_kategori', 'missing_motpart'],
+    })
+  })
+
+  it('builds an uppladdat_underlag input once a file is chosen', () => {
+    expect(buildAnswerInput({ ...BASE_UPLOAD, basKonto: '6570', begransaBolag: true })).toEqual({
+      input: {
+        svarstyp: 'uppladdat_underlag',
+        transaction_id: 't1',
+        motpart: 'Banken',
+        kategori: 'bankavgift',
+        bas_konto: '6570',
+        momstyp: null,
+        begransa_bolag: true,
+        begransa_belopp: false,
+      },
+    })
+  })
+})
+
+describe('submitAnswer: uppladdat_underlag', () => {
+  const PNG = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'foto.png', { type: 'image/png' })
+  const input = {
+    svarstyp: 'uppladdat_underlag' as const,
+    transaction_id: 't1',
+    motpart: 'Banken',
+    kategori: 'bankavgift' as const,
+    bas_konto: null,
+    momstyp: null,
+    begransa_bolag: false,
+    begransa_belopp: true,
+  }
+
+  it('posts the file and the answer as multipart to /svar/underlag', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: SVAR_RECORD }) })
+    const onAnswered = vi.fn(async () => {})
+    const outcomes: SaveOutcome[] = []
+
+    await submitAnswer(input, t, (o) => outcomes.push(o), onAnswered, mockFetch as unknown as typeof fetch, PNG)
+
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(url).toBe('/api/extensions/ext/underlagsjakt/svar/underlag')
+    expect(init.method).toBe('POST')
+    // No JSON content type: the browser must set the multipart boundary itself.
+    expect(init.headers).toBeUndefined()
+    const form = init.body as FormData
+    expect((form.get('file') as File).name).toBe('foto.png')
+    expect(form.get('transaction_id')).toBe('t1')
+    expect(form.get('kategori')).toBe('bankavgift')
+    expect(form.get('bas_konto')).toBe('')
+    expect(form.get('begransa_belopp')).toBe('true')
+    expect(outcomes[0].refresh).toBe(true)
+    expect(onAnswered).toHaveBeenCalledTimes(1)
+  })
+
+  it('never calls the API without a file', async () => {
+    const mockFetch = vi.fn()
+    const outcomes: SaveOutcome[] = []
+    await submitAnswer(input, t, (o) => outcomes.push(o), vi.fn(), mockFetch as unknown as typeof fetch)
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(outcomes[0].refresh).toBe(false)
+    expect(outcomes[0].toast.variant).toBe('destructive')
+  })
+
+  it('keeps the list unrefreshed when the server refuses the file', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      json: async () => ({ error: { code: 'UNDERLAG_UNSUPPORTED_TYPE' } }),
+    })
+    const onAnswered = vi.fn()
+    const outcomes: SaveOutcome[] = []
+    await submitAnswer(input, t, (o) => outcomes.push(o), onAnswered, mockFetch as unknown as typeof fetch, PNG)
+    expect(outcomes[0].toast.description).toBe('error_UNDERLAG_UNSUPPORTED_TYPE:{}')
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+})
+
 describe('deriveTillBolag', () => {
   it('is undefined when nothing is chosen yet', () => {
     expect(deriveTillBolag(undefined, '')).toBeUndefined()
@@ -231,6 +318,43 @@ describe('answerSummary', () => {
     expect(summary).not.toContain(messages.underlagsjakt.kategori_option_bankavgift)
     expect(interpretSaveResult(translate, true, { data: SVAR_RECORD }).toast.description).toBe(summary)
   })
+  it.each(['sv', 'en'] as const)('names an uploaded document, and says when it did not follow a transaction, in %s', (locale) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    const uploaded = {
+      ...SVAR_RECORD,
+      beslut: {
+        answer_id: 'a1',
+        transaction_id: 't1',
+        svarstyp: 'uppladdat_underlag' as const,
+        dokument_id: 'd1',
+        filnamn: 'kvitto.pdf',
+        sha256: 'a'.repeat(64),
+        mime_type: 'application/pdf',
+        storage_path: 'documents/c/u/1_kvitto.pdf',
+        kalla: 'gnubok_uppladdning' as const,
+        motpart: 'Banken',
+        kategori: 'bankavgift' as const,
+        bas_konto: null,
+        momstyp: null,
+        bolag: null,
+        bankkonto: null,
+        belopp: null,
+      },
+    }
+    const summary = answerSummary(translate, uploaded)
+    expect(summary).toContain('kvitto.pdf')
+    expect(interpretSaveResult(translate, true, { data: { ...uploaded, koppling: 'kopplad' } }).toast.description).toBe(summary)
+    expect(interpretSaveResult(translate, true, { data: { ...uploaded, koppling: 'ej_pa_verifikat' } }).toast.description).toContain(
+      messages.underlagsjakt.answer_uppladdat_not_on_verifikat,
+    )
+    expect(interpretSaveResult(translate, true, { data: { ...uploaded, koppling: 'annat_verifikat' } }).toast.description).toContain(
+      messages.underlagsjakt.answer_uppladdat_other_verifikat,
+    )
+    expect(interpretSaveResult(translate, true, { data: { ...uploaded, koppling: 'ingen_transaktion' } }).toast.description).toContain(
+      messages.underlagsjakt.answer_uppladdat_not_linked,
+    )
+  })
   it('describes a val_kandidat save without a chosen document', () => {
     expect(answerSummary(t, SVAR_RECORD)).toContain('Banken')
   })
@@ -284,7 +408,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
     tvetydiga_alternativ: [],
   }
 
-  function renderPanel(postOverride?: Partial<Post>, bolagChoices?: string[]) {
+  function renderPanel(postOverride?: Partial<Post>, bolagChoices?: string[], uploadEnabled = true) {
     let finalPost: Post = post
     if (postOverride?.forslag) {
       const baseForslag = post.forslag || { kategori: '', varfor: '', bas_konto: null, momstyp: null }
@@ -311,7 +435,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
           messages: sv,
           timeZone: 'Europe/Stockholm',
         } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-        createElement(PostAnswerPanel, { post: finalPost, bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], onAnswered: async () => {} })
+        createElement(PostAnswerPanel, { post: finalPost, bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, onAnswered: async () => {} })
       )
     )
   }
@@ -332,7 +456,18 @@ describe('PostAnswerPanel: rendered correctly', () => {
   it('includes candidates legend and handles no-candidate case', () => {
     const html = renderPanel()
     expect(html).toContain('Vilket dokument hör till betalningen?')
-    expect(html).toContain('Inget dokument, ange motpart och kategori')
+    expect(html).toContain('Inget underlag behövs, ange motpart och kategori')
+    // Nothing found is no longer a dead end: the upload path is offered next to it.
+    expect(html).toContain('Ladda upp dokumentet här')
+    expect(html).toContain('Ladda upp underlag')
+  })
+
+  it('does not offer the upload path while it is switched off', () => {
+    const html = renderPanel(undefined, undefined, false)
+    expect(html).toContain('Inget underlag behövs, ange motpart och kategori')
+    expect(html).not.toContain('Ladda upp dokumentet här')
+    expect(html).not.toContain('Ladda upp underlag')
+    expect(html).toContain('Gäller annat bolag')
   })
 
   it('preserves an exported BAS account in the input value', () => {
@@ -457,6 +592,27 @@ describe('translations for the new copy exist in both locales', () => {
     'missing_mottagare',
     'missing_mottagare_namn',
     'missing_reglering',
+    'missing_file',
+    'mode_uppladdat_underlag',
+    'candidates_none_upload',
+    'upload_legend',
+    'upload_description',
+    'upload_choose',
+    'upload_change',
+    'upload_formats',
+    'upload_rejected_title',
+    'upload_unsupported_type',
+    'upload_too_large',
+    'submit_uppladdat_underlag',
+    'answer_uppladdat_underlag',
+    'answer_uppladdat_not_linked',
+    'answer_uppladdat_not_on_verifikat',
+    'answer_uppladdat_other_verifikat',
+    'error_UNDERLAG_FILE_MISSING',
+    'error_UNDERLAG_UNSUPPORTED_TYPE',
+    'error_UNDERLAG_TOO_LARGE',
+    'error_UNDERLAG_INVALID_CONTENT',
+    'error_UNDERLAG_UPLOAD_FAILED',
   ]
 
   it.each(keys)('%s exists in sv.json and en.json', (key) => {

@@ -8,11 +8,14 @@ import fixture from './fixtures/export-1.1.json'
 import fixture14 from './fixtures/export-1.4.json'
 import {
   ANSWER_VERSION,
+  ANSWER_VERSION_UPLOAD,
   buildAnswerFile,
   buildBeslut,
+  buildUppladdatBeslut,
   candidatesOf,
   parseExport,
   svarInputSchema,
+  uppladdatInputSchema,
   type Post,
 } from '../lib/contract'
 
@@ -298,6 +301,37 @@ describe('buildAnswerFile', () => {
     expect(buildAnswerFile([])).toEqual({ version: '1.4', beslut: [] })
   })
 
+  it('keeps every file without an upload at 1.4, so a 1.4 reader is not refused', () => {
+    const p = post('tx-ocr-20260812')
+    const osaker = buildBeslut(p, { svarstyp: 'osaker', transaction_id: p.transaction_id }, 'a1')
+    if (!osaker.ok) throw new Error('unreachable')
+    expect(buildAnswerFile([osaker.beslut]).version).toBe('1.4')
+  })
+
+  it('writes 1.5 only to a file that holds an uppladdat_underlag', () => {
+    const p = post('tx-ocr-20260812')
+    const osaker = buildBeslut(p, { svarstyp: 'osaker', transaction_id: p.transaction_id }, 'a1')
+    if (!osaker.ok) throw new Error('unreachable')
+    const upload = buildUppladdatBeslut(
+      p,
+      {
+        svarstyp: 'uppladdat_underlag',
+        transaction_id: p.transaction_id,
+        motpart: 'Google',
+        kategori: 'leverantor',
+        bas_konto: null,
+        momstyp: null,
+        begransa_bolag: false,
+        begransa_belopp: false,
+      },
+      { id: 'doc-1', filnamn: 'kvitto.pdf', sha256: 'a'.repeat(64), mime_type: 'application/pdf', storage_path: 'c/doc-1.pdf' },
+      'a2',
+    )
+    expect(ANSWER_VERSION_UPLOAD).toBe('1.5')
+    expect(buildAnswerFile([osaker.beslut, upload]).version).toBe('1.5')
+    expect(buildAnswerFile([upload]).version).toBe('1.5')
+  })
+
   it('includes reglering in fel_bolag beslut', () => {
     const p = post('tx-moank-20260821')
     const result = buildBeslut(p, {
@@ -338,5 +372,70 @@ describe('buildAnswerFile', () => {
       till_bolag: null,
     })
     expect(result.beslut).not.toHaveProperty('reglering')
+  })
+})
+
+describe('uppladdat_underlag', () => {
+  const fields = {
+    svarstyp: 'uppladdat_underlag',
+    transaction_id: 'tx-google-20260803',
+    motpart: 'Google',
+    kategori: 'leverantor',
+    bas_konto: '6540',
+    momstyp: 'eu_reverse_charge',
+    begransa_bolag: true,
+    begransa_belopp: false,
+  }
+  const dokument = {
+    id: 'doc-1',
+    filnamn: 'kvitto.pdf',
+    sha256: 'A'.repeat(64),
+    mime_type: 'application/pdf',
+    storage_path: 'documents/c-1/u-1/1_kvitto.pdf',
+  }
+
+  it('is not accepted as a JSON answer: a file-less answer must never claim one', () => {
+    expect(svarInputSchema.safeParse(fields).success).toBe(false)
+  })
+
+  it('validates the classification like val_kandidat', () => {
+    expect(uppladdatInputSchema.safeParse(fields).success).toBe(true)
+    expect(uppladdatInputSchema.safeParse({ ...fields, motpart: '  ' }).success).toBe(false)
+    expect(uppladdatInputSchema.safeParse({ ...fields, kategori: 'okand' }).success).toBe(false)
+    expect(uppladdatInputSchema.safeParse({ ...fields, bas_konto: 6540 }).success).toBe(false)
+  })
+
+  it('carries the stored document instead of a choice among candidates', () => {
+    const p = posts(fixture14 as typeof fixture)[0]
+    const input = uppladdatInputSchema.parse({ ...fields, transaction_id: p.transaction_id })
+    const beslut = buildUppladdatBeslut(p, input, dokument, 'answer-1')
+    expect(beslut).toEqual({
+      answer_id: 'answer-1',
+      transaction_id: p.transaction_id,
+      svarstyp: 'uppladdat_underlag',
+      dokument_id: 'doc-1',
+      filnamn: 'kvitto.pdf',
+      // Lower-cased: bertil compares hashes case-insensitively but stores them lower-case.
+      sha256: 'a'.repeat(64),
+      mime_type: 'application/pdf',
+      storage_path: 'documents/c-1/u-1/1_kvitto.pdf',
+      kalla: 'gnubok_uppladdning',
+      motpart: 'Google',
+      kategori: 'leverantor',
+      bas_konto: '6540',
+      momstyp: 'eu_reverse_charge',
+      bolag: p.bolag,
+      bankkonto: null,
+      belopp: null,
+    })
+    expect(beslut).not.toHaveProperty('vald_kandidat')
+  })
+
+  it('restricts the learned rule to the amount only when asked', () => {
+    const p = posts(fixture14 as typeof fixture)[0]
+    const input = uppladdatInputSchema.parse({ ...fields, begransa_bolag: false, begransa_belopp: true })
+    const beslut = buildUppladdatBeslut(p, input, dokument, 'answer-1')
+    expect(beslut.bolag).toBeNull()
+    expect(beslut.belopp).toBe(p.belopp)
   })
 })
