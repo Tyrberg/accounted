@@ -636,9 +636,8 @@ curl -s -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application
 | `401` | The token is not the one the box has. |
 | `503` | The box has no delivery configured, or the org number matches no active company or several. The body names which. |
 
-Do **not** probe the other direction by hand. `GET /svar` hands each answer
-over exactly once, so anything fetched with curl is something bertil will
-never see.
+Fetching `GET /svar` by hand does not consume answers: they repeat until
+acknowledged. Never send a probe acknowledgement for an answer bertil has not ingested.
 
 ### Step 3: bertil's box
 
@@ -648,6 +647,15 @@ In bertil's `.env`:
 GNUBOK_API_URL=https://bokforing.bohed.com
 GNUBOK_API_KEY=<the same value from step 1>
 ```
+
+Install a client that posts
+`{ "transaction_id": "<id>", "answer_id": "<answer_id>" }` (both copied from
+the answer it ingested; a body without `answer_id` is rejected with 400) to
+`POST /svar/kvittens` after successful durable ingestion (including an
+already-ingested no-op). Use the same bearer token. Retry failed acknowledgements;
+never acknowledge failed ingestion. Update `fetch_svar`'s docstring to describe
+repeat-until-acknowledged delivery. The complete contract is in
+`docs/underlagsjakt-export-schema.md`, Transport.
 
 Then schedule the client, so the delivery is nobody's daily chore:
 
@@ -682,19 +690,20 @@ carried a real export is not a working delivery.
 3. Answer one question in that surface.
 4. Let the client run again (or wait for the 06:17 tick) and confirm the
    answer is in bertil's knowledge base as a learned rule.
-5. If it is not: the answer was handed over and bertil dropped it, so `GET
-   /svar` will not repeat it. bertil's next export asks about that payment
-   again and the question reappears in the surface, which is where to answer
-   it a second time once the ingest is fixed.
+5. If ingestion fails, fetch again and verify the same answer is offered.
+   After successful ingestion, verify the client's acknowledgement returns 200,
+   `levererad_at` is set, and the next fetch omits the answer. Retry a lost
+   acknowledgement response and verify it also returns 200. If acknowledgements
+   never arrive, the standing check alarms after two days. A question re-exported
+   after seven days reopens while its old answer remains available for retries.
 6. Run `npx tsx extensions/general/underlagsjakt/leverans-status.ts` on the
    Accounted box once more. **Exit 0 is the pass**, and it is the one the row
    in section 10 comes out for. Anything else names the half that did not
    happen: an export that only ever arrived as a file, a bertil that never
-   called `GET /svar`, or a collection that has never carried an answer.
+   called `GET /svar`, no recorded acknowledgement, or an overdue unacknowledged answer.
 
 The command is the record. It reads what the two directions actually wrote
-(`imported_via` on the stored export, and the journal `GET /svar` writes on
-every call), so "we did this once in September" cannot survive a delivery that
+(`imported_via` on the stored export, the polling journal, and answer acknowledgement timestamps), so "we did this once in September" cannot survive a delivery that
 has since stopped: the same run that proved the chain is the run that keeps
 proving it.
 

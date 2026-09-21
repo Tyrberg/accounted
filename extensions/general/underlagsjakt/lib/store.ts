@@ -2,8 +2,8 @@
  * Workspace state for underlagsjakt, kept in `extension_data` (no own tables).
  *
  *   key `export`:   the last export read from bertil, as parsed.
- *   key `svar`:     answers by transaction_id, including when they were handed
- *                   back to bertil (`levererad_at`).
+ *   key `svar`:     answers by transaction_id, including when consumption was confirmed
+ *                   by bertil (`levererad_at`).
  *   key `leverans`: what the machine path has actually carried; see
  *                   LeveransJournal.
  *
@@ -16,6 +16,8 @@ import type { Beslut, ParsedExport, Post, Reglering, Sammanstallning } from './c
 export const EXPORT_KEY = 'export'
 export const SVAR_KEY = 'svar'
 export const LEVERANS_KEY = 'leverans'
+/** Machine-only ingestion evidence, retained when answered posts are reconciled. */
+export const KVITTENS_KEY = 'svar_kvittens'
 
 /** How the stored export got here: bertil delivered it, or a human uploaded the file. */
 export type ImportKalla = 'leverans' | 'fil'
@@ -38,6 +40,11 @@ export interface SvarRecord {
   post: PostSnapshot
   besvarad_at: string
   besvarad_av: string
+  /** Unique identity for this version of the answer. Used to match acknowledgements. */
+  answer_id: string
+  /** When the answer was first offered to bertil via GET /svar. Blocks withdrawal if set. */
+  erbjudet_at: string | null
+  /** When bertil acknowledged receiving and ingesting the answer via POST /svar/kvittens. */
   levererad_at: string | null
 }
 
@@ -51,22 +58,16 @@ export interface State {
 /**
  * What the machine path has carried, written by `GET /svar` on every call.
  *
- * The stored export already records the delivery direction (`imported_via`,
- * `imported_at`); this is the other one. Without it, "bertil collected the
- * answers" and "I downloaded the file and ticked the dialog" leave the same
- * `levererad_at`, so nothing on the box can tell a running delivery from a
- * configured one that has never been called. A poll carrying nothing still
- * counts as a call: that is what makes a delivery that stopped (or that was
- * never scheduled on bertil's side) visible as silence rather than as
- * "nothing to report".
+ * The stored export records the incoming direction (`imported_via`,
+ * `imported_at`). This journal records polling activity, not consumption:
+ * repeated offers count again and only an acknowledgement sets levererad_at.
+ * Empty polls still show that bertil is running, making silence observable.
  */
 export interface LeveransJournal {
   /** When bertil last called `GET /svar`, whether or not anything was waiting. */
   senast_hamtad_at: string
   /** How many answers that call carried. */
   senast_antal: number
-  /** How many answers have gone to bertil over the machine path, ever. */
-  totalt_antal: number
 }
 
 export function recordSvarHandover(
@@ -77,7 +78,6 @@ export function recordSvarHandover(
   return {
     senast_hamtad_at: now,
     senast_antal: count,
-    totalt_antal: (journal?.totalt_antal ?? 0) + count,
   }
 }
 
@@ -101,7 +101,7 @@ export function findPost(exp: StoredExport | null, transactionId: string): Post 
   return allPosts(exp).find((p) => p.transaction_id === transactionId) ?? null
 }
 
-/** Posts still waiting for an answer: anything answered here leaves the list at once. */
+/** Unanswered posts: no answer record exists. */
 export function openPosts(exp: StoredExport | null, svar: SvarMap): Post[] {
   return allPosts(exp).filter((p) => !svar[p.transaction_id])
 }
@@ -139,7 +139,10 @@ export function recordAnswer(
   now: string,
 ): RecordAnswerResult {
   const existing = svar[post.transaction_id]
-  if (existing?.levererad_at) return { ok: false, code: 'ALREADY_DELIVERED' }
+  if (existing?.levererad_at || existing?.erbjudet_at) {
+    return { ok: false, code: 'ALREADY_DELIVERED' }
+  }
+  const answerId = `${now}:${post.transaction_id}`
   return {
     ok: true,
     svar: {
@@ -159,6 +162,8 @@ export function recordAnswer(
         },
         besvarad_at: now,
         besvarad_av: userId,
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     },
@@ -173,12 +178,15 @@ export function withdrawAnswer(svar: SvarMap, transactionId: string): WithdrawRe
   const existing = svar[transactionId]
   if (!existing) return { ok: false, code: 'NOT_FOUND' }
   if (existing.levererad_at) return { ok: false, code: 'ALREADY_DELIVERED' }
+  if (existing.erbjudet_at !== null) {
+    return { ok: false, code: 'ALREADY_DELIVERED' }
+  }
   const next = { ...svar }
   delete next[transactionId]
   return { ok: true, svar: next }
 }
 
-/** Answers not yet handed to bertil, oldest first. */
+/** Answers not yet acknowledged by bertil, oldest first. */
 export function pendingBeslut(svar: SvarMap): Beslut[] {
   return Object.values(svar)
     .filter((r) => r.levererad_at === null)
@@ -186,7 +194,31 @@ export function pendingBeslut(svar: SvarMap): Beslut[] {
     .map((r) => r.beslut)
 }
 
-export function markDelivered(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
+export function markOffered(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
+  const next = { ...svar }
+  for (const id of transactionIds) {
+    const rec = next[id]
+    if (rec && rec.erbjudet_at === null) next[id] = { ...rec, erbjudet_at: now }
+  }
+  return next
+}
+
+export function markDelivered(
+  svar: SvarMap,
+  transactionIds: Array<{ id: string; answerId: string }>,
+  now: string,
+): SvarMap {
+  const next = { ...svar }
+  for (const entry of transactionIds) {
+    const rec = next[entry.id]
+    if (rec && rec.levererad_at === null && rec.answer_id === entry.answerId) {
+      next[entry.id] = { ...rec, levererad_at: now }
+    }
+  }
+  return next
+}
+
+export function markDeliveredManual(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
   const next = { ...svar }
   for (const id of transactionIds) {
     const rec = next[id]

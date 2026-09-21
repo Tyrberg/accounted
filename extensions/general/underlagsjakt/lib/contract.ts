@@ -220,6 +220,7 @@ export function candidatesOf(post: Post): Kandidat[] {
 /** One entry in `beslut`, as the answer schema lists it (1.4 includes reglering in fel_bolag only). */
 export type Beslut =
   | {
+      answer_id: string
       transaction_id: string
       svarstyp: 'val_kandidat'
       vald_kandidat: string | null
@@ -234,13 +235,14 @@ export type Beslut =
       belopp: number | null
     }
   | {
+      answer_id: string
       transaction_id: string
       svarstyp: 'fel_bolag'
       fel_bolag_mottagare: string
       till_bolag: string | null
       reglering?: Reglering | null
     }
-  | { transaction_id: string; svarstyp: 'osaker' }
+  | { answer_id: string; transaction_id: string; svarstyp: 'osaker' }
 
 /** What the workspace sends for one post. Validated against the stored post before it becomes a Beslut. */
 export const svarInputSchema = z.discriminatedUnion('svarstyp', [
@@ -286,16 +288,25 @@ export type BuildBeslutResult =
  * resolved from the stored post by hash, so filnamn/kalla/sha256 always come
  * from what bertil offered, never from the browser.
  */
-export function buildBeslut(post: Post, input: SvarInput): BuildBeslutResult {
+export function buildBeslut(
+  post: Post,
+  input: SvarInput,
+  answerId: string,
+): BuildBeslutResult {
   const transaction_id = post.transaction_id
   if (input.svarstyp === 'osaker') {
-    return { ok: true, beslut: { transaction_id, svarstyp: 'osaker' }, reglering: null }
+    return {
+      ok: true,
+      beslut: { answer_id: answerId, transaction_id, svarstyp: 'osaker' },
+      reglering: null,
+    }
   }
   const regleringSvar = input.svarstyp === 'fel_bolag' && input.till_bolag !== null ? input.reglering : null
   if (input.svarstyp === 'fel_bolag') {
     return {
       ok: true,
       beslut: {
+        answer_id: answerId,
         transaction_id,
         svarstyp: 'fel_bolag',
         fel_bolag_mottagare: input.fel_bolag_mottagare,
@@ -317,6 +328,7 @@ export function buildBeslut(post: Post, input: SvarInput): BuildBeslutResult {
   return {
     ok: true,
     beslut: {
+      answer_id: answerId,
       transaction_id,
       svarstyp: 'val_kandidat',
       vald_kandidat: chosen ? chosen.filnamn : null,
@@ -333,6 +345,8 @@ export function buildBeslut(post: Post, input: SvarInput): BuildBeslutResult {
   }
 }
 
-export function buildAnswerFile(beslut: Beslut[]): { version: string; beslut: Beslut[] } {
+export function buildAnswerFile(
+  beslut: Beslut[],
+): { version: string; beslut: Beslut[] } {
   return { version: ANSWER_VERSION, beslut }
 }

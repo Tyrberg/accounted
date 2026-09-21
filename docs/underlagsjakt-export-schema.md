@@ -172,7 +172,7 @@ A supporting document (email, invoice, receipt).
 ## Transport: the automatic delivery
 
 The export does not have to be uploaded by hand. bertil can deliver it, and
-collect the answers, over two HTTP endpoints. They are the only routes in
+collect the answers, over three HTTP endpoints. They are the only routes in
 Accounted reachable without a logged-in user, and they are authenticated by a
 shared token, not by a session.
 
@@ -180,16 +180,34 @@ shared token, not by a session.
 |---|---|---|
 | Deliver an export | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export` | The root wrapper above |
 | Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4", "beslut": [...] }` |
+| Acknowledge ingestion | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar/kvittens` | Acknowledgement request with both `transaction_id` and `answer_id` (see below) |
 
-Both calls send the token as `Authorization: Bearer <token>` (the `apikey`
+All three calls send the token as `Authorization: Bearer <token>` (the `apikey`
 header is accepted as well, since bertil's client sets both).
 
-`GET /svar` hands each answer over exactly once: what it returns is marked as
-delivered in the same request, so the next call returns only what was answered
-since. If bertil fails to ingest a response, the payment stays unresolved on
-its side, its next export asks about it again, and Accounted puts the question
-back in front of the user. For the same reason it is not a probe: an answer
-fetched by hand is an answer bertil never receives.
+`GET /svar` offers every unacknowledged answer on every fetch. It never sets
+`levererad_at`. After successfully persisting each answer through
+`mottak_svar_fran_ui`, bertil must POST both the transaction ID and the answer ID to
+`/svar/kvittens`. An already-ingested no-op is also safe to acknowledge.
+Never acknowledge failed ingestion. Retry after network or server errors,
+including a lost acknowledgement response.
+
+Acknowledgement request body must include both fields:
+- **`transaction_id`** (string, required): The transaction ID from the answer.
+- **`answer_id`** (string, required): The answer ID from the answer. This ensures the acknowledgement matches the exact version that was ingested.
+
+Acknowledgement returns HTTP 200 with `{ "data": { "transaction_id": "<id>" } }`.
+Repeated acknowledgements preserve the original delivery timestamp. Unknown
+IDs (including withdrawn or reconciled answers) succeed without a write.
+Malformed JSON or a missing, blank, or non-string ID returns 400; authentication
+and configuration failures use the same 401/503 responses as the other calls.
+The answer file remains version 1.4.
+
+An unacknowledged answer stays on offer until it is acknowledged; a re-export
+does not reopen its question. Once an answer has been offered to bertil it can
+no longer be withdrawn or replaced in the UI (it shows as "Offered to bertil"
+until acknowledged). The standing check alarms after two days without an
+acknowledgement even when polling continues. Poll counts are not proof of ingestion.
 
 To check the configuration without writing anything, post a body the contract
 rejects, e.g. `{}`. Authentication and the company lookup run first and the
@@ -201,7 +219,7 @@ section 11.
 ### What the server needs
 
 Two environment variables on the Accounted box, both unset by default (with
-either missing, the two endpoints answer `503 LEVERANS_NOT_CONFIGURED` and no
+either missing, the three endpoints answer `503 LEVERANS_NOT_CONFIGURED` and no
 token exists):
 
 | Variable | Meaning |

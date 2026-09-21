@@ -11,7 +11,7 @@
  * What was already covered, and what was not:
  *   - `leverans.test.ts` exercises the rules of the machine path by invoking
  *     the handlers directly, and guards the dispatcher contract with one
- *     assertion: that exactly `POST /export` and `GET /svar` carry `skipAuth`.
+ *     assertion: that only the machine routes carry `skipAuth`.
  *     That does catch a route losing the flag, but it reads the route table,
  *     not the dispatcher, so it passes unchanged if the dispatcher stops
  *     honouring `skipAuth`.
@@ -136,6 +136,7 @@ describe('bertil delivering through the extension dispatcher', () => {
       machineRequest(['underlagsjakt', 'export'], { method: 'POST', body: fixture }),
       pathParams('underlagsjakt', 'export'),
     )
+    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
@@ -143,6 +144,8 @@ describe('bertil delivering through the extension dispatcher', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
@@ -155,6 +158,29 @@ describe('bertil delivering through the extension dispatcher', () => {
 
     expect(status).toBe(200)
     expect(body.beslut.map((b) => b.transaction_id)).toEqual(['tx-moank-20260821'])
+    // No acknowledgement after a failed consumer: the next poll must retry.
+    const retry = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
+    expect(await retry.json()).toEqual(body)
+    // A later export: the answered question stays answered (no 7-day reopen).
+    const reexport = await POST(
+      machineRequest(['underlagsjakt', 'export'], {
+        method: 'POST', body: { ...fixture, generated_at: '2026-09-27T08:00:00.000Z' },
+      }),
+      pathParams('underlagsjakt', 'export'),
+    )
+    expect(reexport.status).toBe(200)
+    expect((await reexport.json()).data.posts).toBe(2)
+    const retained = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
+    expect(await retained.json()).toEqual(body)
+    const ack = await POST(
+      machineRequest(['underlagsjakt', 'svar', 'kvittens'], {
+        method: 'POST', body: { transaction_id: 'tx-moank-20260821', answer_id: answerId },
+      }),
+      pathParams('underlagsjakt', 'svar', 'kvittens'),
+    )
+    expect(ack.status).toBe(200)
+    const after = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
+    expect((await after.json()).beslut).toEqual([])
   })
 
   it('answers the delivery 401, not the session 401, when the token is missing', async () => {
@@ -188,7 +214,7 @@ describe('bertil delivering through the extension dispatcher', () => {
   })
 
   /**
-   * Every route of this extension that is not one of the two delivery routes,
+   * Every route of this extension that is not one of the delivery routes,
    * so "the token opens nothing else" is a statement about the whole surface
    * rather than a sample of it. Keep this list in step with
    * `underlagsjaktExtension.apiRoutes`; the completeness check below fails if

@@ -11,7 +11,7 @@
  *     carries its id)
  *   - the workspace promises an automatic delivery only to the company that
  *     actually receives one, so nobody waits for an export going elsewhere
- *   - answers go out exactly once
+ *   - answers remain available until explicitly acknowledged
  *   - the box can tell a delivery that runs from one that was configured and
  *     never called, which is what leverans-status.ts reports on
  */
@@ -32,6 +32,8 @@ import {
 import {
   MAX_QUIET_DAYS,
   describeLeveransStatus,
+  formatReport,
+  gatherEvidence,
   loadDeploymentEnv,
   main,
   type LeveransEvidence,
@@ -335,11 +337,11 @@ describe('authenticateLeverans', () => {
 })
 
 describe('the delivery routes', () => {
-  it('are the only two that bypass the session dispatcher', () => {
+  it('are the only routes that bypass the session dispatcher', () => {
     const machine = underlagsjaktExtension
       .apiRoutes!.filter((r) => r.skipAuth)
       .map((r) => `${r.method} ${r.path}`)
-    expect(machine).toEqual(['POST /export', 'GET /svar'])
+    expect(machine).toEqual(['POST /export', 'GET /svar', 'POST /svar/kvittens'])
   })
 
   it("POST /export stores bertil's export on the configured company", async () => {
@@ -369,9 +371,10 @@ describe('the delivery routes', () => {
     expect(slice.dataRows).toEqual([])
   })
 
-  it('GET /svar hands over the pending answers once and marks them delivered', async () => {
+  it('GET /svar retries failed ingestion until an explicit, idempotent acknowledgement', async () => {
     await route('POST', '/export').handler(request({ body: fixture }))
     // The import writes an (empty) svar row of its own; answer one post in it.
+    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
@@ -379,6 +382,8 @@ describe('the delivery routes', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
@@ -391,10 +396,98 @@ describe('the delivery routes', () => {
     expect(first.body.beslut.map((b) => b.transaction_id)).toEqual(['tx-moank-20260821'])
 
     const svar = storedValue('svar') as Record<string, { levererad_at: string | null }>
-    expect(svar['tx-moank-20260821'].levererad_at).not.toBeNull()
+    expect(svar['tx-moank-20260821'].levererad_at).toBeNull()
+
+    const ingest = vi.fn().mockRejectedValue(new Error('ingestion failed'))
+    await expect(ingest(first.body)).rejects.toThrow('ingestion failed')
 
     const second = await parse<{ beslut: unknown[] }>(await route('GET', '/svar').handler(request()))
-    expect(second.body.beslut).toEqual([])
+    expect(second.body).toEqual(first.body)
+    expect((await gatherEvidence()).lastAcknowledgedAt).toBeNull()
+    const acknowledge = () => route('POST', '/svar/kvittens').handler(
+      request({ body: { transaction_id: 'tx-moank-20260821', answer_id: answerId } }),
+    )
+    expect((await acknowledge()).status).toBe(200)
+    const acknowledged = structuredClone(storedValue('svar')) as Record<string, { levererad_at: string | null }>
+    expect(acknowledged['tx-moank-20260821'].levererad_at).toEqual(expect.any(String))
+    const receipt = (await gatherEvidence()).lastAcknowledgedAt
+    expect(receipt).toBe(acknowledged['tx-moank-20260821'].levererad_at)
+    expect((await acknowledge()).status).toBe(200)
+    expect((await gatherEvidence()).lastAcknowledgedAt).toBe(receipt)
+    expect(storedValue('svar')).toEqual(acknowledged)
+    const third = await parse<{ beslut: unknown[] }>(await route('GET', '/svar').handler(request()))
+    expect(third.body.beslut).toEqual([])
+
+    // A later export prunes this answer but must retain machine evidence.
+    const later = { ...fixture, generated_at: new Date(Date.parse(receipt!) + 1000).toISOString() }
+    expect((await route('POST', '/export').handler(request({ body: later }))).status).toBe(200)
+    expect(storedValue('svar')).toEqual({})
+    await route('GET', '/svar').handler(request())
+    const evidence = await gatherEvidence()
+    expect(evidence.lastAcknowledgedAt).toBe(receipt)
+    expect(describeLeveransStatus(evidence, new Date()).exitCode).toBe(0)
+  })
+
+
+  it('does not count manual delivery or legacy delivery timestamps as machine acknowledgement', async () => {
+    await route('POST', '/export').handler(request({ body: fixture }))
+    slice.dataRows.find((r) => r.key === 'svar')!.value = {
+      'tx-moank-20260821': {
+        beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
+        reglering: null,
+        post: {},
+        besvarad_at: new Date().toISOString(),
+        besvarad_av: 'owner-1',
+        levererad_at: null,
+      },
+    }
+    const auth = await authenticateLeverans(request())
+    expect(auth.ok).toBe(true)
+    if (!auth.ok) throw new Error('Expected authenticated context')
+    const delivered = await route('POST', '/svarsfil/levererad').handler(
+      request({ body: { transaction_ids: ['tx-moank-20260821'] } }), auth.ctx,
+    )
+    expect(delivered.status).toBe(200)
+    expect(storedValue('svar')).toMatchObject({
+      'tx-moank-20260821': { levererad_at: expect.any(String) },
+    })
+    await route('GET', '/svar').handler(request())
+    const evidence = await gatherEvidence()
+    expect(evidence.lastAcknowledgedAt).toBeNull()
+    const report = describeLeveransStatus(evidence, new Date())
+    expect(report.exitCode).toBe(2)
+    expect(report.checks.find((c) => c.label === 'answers (Accounted -> bertil)')?.state).toBe('alarm')
+  })
+
+  it.each([null, 'wrong-token'])('rejects acknowledgement with token %s', async (token) => {
+    const res = await route('POST', '/svar/kvittens').handler(request({ token, body: { transaction_id: 'tx' } }))
+    expect(res.status).toBe(401)
+    expect(slice.dataRows).toEqual([])
+  })
+
+  it.each([null, {}, { transaction_id: '' }, { transaction_id: ' ' }, { transaction_id: 1 }])(
+    'rejects invalid acknowledgement %j', async (body) => {
+      const res = await route('POST', '/svar/kvittens').handler(request({ body }))
+      expect(res.status).toBe(400)
+      expect(slice.dataRows).toEqual([])
+    },
+  )
+
+  it('rejects malformed JSON and accepts unknown acknowledgements without writes', async () => {
+    const malformed = new Request('http://localhost/svar/kvittens', {
+      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` }, body: '{',
+    })
+    expect((await route('POST', '/svar/kvittens').handler(malformed)).status).toBe(400)
+    const missing = await route('POST', '/svar/kvittens').handler(
+      request({ body: { transaction_id: 'missing', answer_id: 'missing-answer-id' } }),
+    )
+    expect(missing.status).toBe(200)
+    expect(await missing.json()).toEqual({ data: { transaction_id: 'missing' } })
+    const retry = await route('POST', '/svar/kvittens').handler(
+      request({ body: { transaction_id: 'missing', answer_id: 'missing-answer-id' } }),
+    )
+    expect(retry.status).toBe(200)
+    expect(slice.dataRows).toEqual([])
   })
 
   it('POST /export answers the documented preflight: 400 for a rejected body, nothing stored', async () => {
@@ -416,9 +509,8 @@ describe('the delivery routes', () => {
     // A poll with no answers waiting: the only evidence the box gets that
     // bertil is still running at all.
     await route('GET', '/svar').handler(request())
-    const empty = storedValue('leverans') as { senast_antal: number; totalt_antal: number; senast_hamtad_at: string }
+    const empty = storedValue('leverans') as { senast_antal: number; senast_hamtad_at: string }
     expect(empty.senast_antal).toBe(0)
-    expect(empty.totalt_antal).toBe(0)
     expect(Date.parse(empty.senast_hamtad_at)).not.toBeNaN()
 
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
@@ -428,16 +520,17 @@ describe('the delivery routes', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: '2026-09-19T08:00:00.000Z:tx-moank-20260821',
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
     await route('GET', '/svar').handler(request())
-    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1, totalt_antal: 1 })
+    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1 })
 
-    // The total is what proves an answer ever reached bertil, so it counts up
-    // rather than tracking only the last call.
+    // Poll statistics count repeated offers, not confirmed consumption.
     await route('GET', '/svar').handler(request())
-    expect(storedValue('leverans')).toMatchObject({ senast_antal: 0, totalt_antal: 1 })
+    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1 })
   })
 })
 
@@ -459,8 +552,10 @@ describe('describeLeveransStatus', () => {
     companyProblem: null,
     companyId: 'company-1',
     export: { imported_at: recently, via: 'leverans' },
-    journal: { senast_hamtad_at: recently, senast_antal: 1, totalt_antal: 3 },
+    journal: { senast_hamtad_at: recently, senast_antal: 1 },
     pendingAnswers: 0,
+    lastAcknowledgedAt: recently,
+    oldestPendingAt: null,
     ...overrides,
   })
 
@@ -589,7 +684,7 @@ describe('describeLeveransStatus', () => {
 
   it('fails while no answer has ever gone the other way, even though exports arrive', () => {
     const report = describeLeveransStatus(
-      evidence({ journal: { senast_hamtad_at: recently, senast_antal: 0, totalt_antal: 0 } }),
+      evidence({ lastAcknowledgedAt: null, journal: { senast_hamtad_at: recently, senast_antal: 0 } }),
       NOW,
     )
     expect(report.exitCode).toBe(2)
@@ -598,11 +693,35 @@ describe('describeLeveransStatus', () => {
 
   const stale = new Date(NOW.getTime() - (MAX_QUIET_DAYS + 1) * 86_400_000).toISOString()
 
+  it('alarms on overdue unacknowledged answers despite fresh repeated polls and past acknowledgements', () => {
+    const report = describeLeveransStatus(evidence({
+      pendingAnswers: 1, oldestPendingAt: stale,
+      journal: { senast_hamtad_at: recently, senast_antal: 1 },
+    }), NOW)
+    expect(report.exitCode).toBe(2)
+    expect(labels(report, 'alarm')).toContain('waiting')
+    expect(formatReport(report)).not.toContain('handed over')
+  })
+
+  it('allows pending acknowledgements within the deadline but alarms immediately after it', () => {
+    const boundary = new Date(NOW.getTime() - MAX_QUIET_DAYS * 86_400_000).toISOString()
+    expect(describeLeveransStatus(evidence({
+      pendingAnswers: 1, oldestPendingAt: boundary,
+    }), NOW).exitCode).toBe(0)
+    expect(describeLeveransStatus(evidence({
+      pendingAnswers: 1, oldestPendingAt: boundary,
+    }), new Date(NOW.getTime() + 1)).exitCode).toBe(2)
+  })
+
+  it('does not treat repeated offers as acknowledgement evidence', () => {
+    expect(describeLeveransStatus(evidence({ lastAcknowledgedAt: null }), NOW).exitCode).toBe(2)
+  })
+
   it('treats silence as the alarm it is: an unscheduled client looks exactly like a dead one', () => {
     const report = describeLeveransStatus(
       evidence({
         export: { imported_at: stale, via: 'leverans' },
-        journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 },
+        journal: { senast_hamtad_at: stale, senast_antal: 1 },
       }),
       NOW,
     )
@@ -631,7 +750,7 @@ describe('describeLeveransStatus', () => {
 
   it('alarms when bertil stopped collecting, even though exports still arrive daily', () => {
     const report = describeLeveransStatus(
-      evidence({ journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 } }),
+      evidence({ journal: { senast_hamtad_at: stale, senast_antal: 1 } }),
       NOW,
     )
     expect(report.exitCode).toBe(2)
@@ -645,7 +764,7 @@ describe('describeLeveransStatus', () => {
     const report = describeLeveransStatus(
       evidence({
         export: { imported_at: stale, via: 'leverans' },
-        journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 },
+        journal: { senast_hamtad_at: stale, senast_antal: 1 },
       }),
       NOW,
     )

@@ -28,9 +28,7 @@
  *      number does not name exactly one active company, so every delivery
  *      would be refused with 503.
  *
- * It writes nothing. In particular it does not call `GET /svar`, which hands
- * each answer over exactly once: an answer collected by a probe is an answer
- * bertil never receives.
+ * It writes nothing and does not poll or acknowledge answers.
  *
  * It reads its configuration from the deployment's `.env`, because that is
  * where the configuration is: `docker-compose.yml` hands that file to the app
@@ -52,6 +50,7 @@ import {
   type LeveransConfigProblem,
 } from './lib/leverans'
 import {
+  KVITTENS_KEY,
   loadLeveransJournal,
   loadState,
   pendingBeslut,
@@ -88,6 +87,9 @@ export interface LeveransEvidence {
   journal: LeveransJournal | null
   /** Answers waiting in the surface for bertil's next call. */
   pendingAnswers: number
+  /** Last confirmed machine ingestion, independent of retained answers. */
+  lastAcknowledgedAt: string | null
+  oldestPendingAt: string | null
 }
 
 export type CheckState = 'ok' | 'alarm' | 'blocked'
@@ -251,25 +253,26 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
       state: 'alarm',
       line: 'bertil has never called GET /svar. Nothing you answer here can reach its knowledge base.',
     })
-  } else if (evidence.journal.totalt_antal === 0) {
+  } else if (evidence.lastAcknowledgedAt === null) {
     checks.push({
       label: 'answers (Accounted -> bertil)',
       state: 'alarm',
-      line: `bertil collects (last ${evidence.journal.senast_hamtad_at}) but has never been given an answer. Answer one question in the surface and let the client run again.`,
+      line: `bertil collects (last ${evidence.journal.senast_hamtad_at}) but no answer has been acknowledged via POST /svar/kvittens. Verify ingestion and POST /svar/kvittens on bertil.`,
     })
   } else {
     checks.push({
       label: 'answers (Accounted -> bertil)',
       state: 'ok',
-      line: `${evidence.journal.totalt_antal} answer(s) handed over, last collection ${evidence.journal.senast_hamtad_at} carrying ${evidence.journal.senast_antal}.`,
+      line: `last machine acknowledgement ${evidence.lastAcknowledgedAt}, last collection ${evidence.journal.senast_hamtad_at} carrying ${evidence.journal.senast_antal}.`,
     })
   }
 
   if (evidence.pendingAnswers > 0) {
     checks.push({
       label: 'waiting',
-      state: 'ok',
-      line: `${evidence.pendingAnswers} answer(s) waiting for bertil's next call.`,
+      state: evidence.oldestPendingAt === null ||
+        (daysSince(evidence.oldestPendingAt, now) ?? Infinity) > MAX_QUIET_DAYS ? 'alarm' : 'ok',
+      line: `${evidence.pendingAnswers} answer(s) awaiting acknowledgement, oldest ${evidence.oldestPendingAt ?? 'unknown'}. Acknowledgement is required within ${MAX_QUIET_DAYS} days; check ingestion and POST /svar/kvittens on bertil.`,
     })
   }
 
@@ -299,7 +302,7 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
     exitCode: alarms.length === 0 ? 0 : 2,
     headline:
       alarms.length === 0
-        ? 'The automatic delivery has carried an export and an answer, both recently.'
+        ? 'The automatic delivery has received an export and recorded an acknowledged answer; polls are recent and no acknowledgement is overdue.'
         : `The automatic delivery is not working: ${alarms.length} of ${checks.length} checks failed.`,
     checks,
   }
@@ -351,6 +354,8 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     export: null,
     journal: null,
     pendingAnswers: 0,
+    lastAcknowledgedAt: null,
+    oldestPendingAt: null,
   }
 
   const inspected = inspectLeveransConfig()
@@ -361,9 +366,10 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     return { ...empty, companyProblem: `${opened.code}: ${opened.message}` }
   }
 
-  const [state, journal] = await Promise.all([
+  const [state, journal, lastAcknowledgedAt] = await Promise.all([
     loadState(opened.ctx.settings),
     loadLeveransJournal(opened.ctx.settings),
+    opened.ctx.settings.get<string>(KVITTENS_KEY),
   ])
 
   return {
@@ -376,6 +382,9 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
       : null,
     journal,
     pendingAnswers: pendingBeslut(state.svar).length,
+    lastAcknowledgedAt: lastAcknowledgedAt ?? null,
+    oldestPendingAt: Object.values(state.svar).filter((r) => r.levererad_at === null)
+      .map((r) => r.besvarad_at).sort()[0] ?? null,
   }
 }
 

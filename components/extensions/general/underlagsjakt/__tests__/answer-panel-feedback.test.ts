@@ -195,12 +195,15 @@ const SVAR_RECORD_BASE = {
   },
   besvarad_at: '2026-09-18T10:00:00.000Z',
   besvarad_av: 'mattias@meme.com',
+  answer_id: '2026-09-18T10:00:00.000Z:t1',
+  erbjudet_at: null,
   levererad_at: null,
 }
 
 const SVAR_RECORD: SvarRecord = {
   ...SVAR_RECORD_BASE,
   beslut: {
+    answer_id: 'test-answer-1',
     transaction_id: 't1',
     svarstyp: 'val_kandidat',
     vald_kandidat: null,
