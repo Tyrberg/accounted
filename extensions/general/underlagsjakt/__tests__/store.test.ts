@@ -381,6 +381,56 @@ describe('store', () => {
       const result = reconcileWithExport(svar, oldExp)
       expect(result['tx-1']).toBeDefined()
     })
+
+    it('keeps levererar_sjalv promises with underlag_hittat_at=null even if delivered and re-asked', () => {
+      const post1 = makePost({ transaction_id: 'tx-1' })
+      const exp = makeStoredExport([post1])
+      exp.generated_at = '2026-09-21T10:00:00Z'
+      const beslut: Beslut = {
+        answer_id: 'test-answer-1',
+        transaction_id: 'tx-1',
+        svarstyp: 'levererar_sjalv',
+        motpart: 'HI3G',
+        underlag_hittat_at: null,
+      }
+      const svar: SvarMap = {
+        'tx-1': makeSvarRecord({
+          post: post1,
+          beslut,
+          levererad_at: '2026-09-20T10:00:00Z',
+        }),
+      }
+
+      const result = reconcileWithExport(svar, exp)
+      expect(result['tx-1']).toBeDefined()
+      expect(result['tx-1'].beslut.svarstyp).toBe('levererar_sjalv')
+      if (result['tx-1'].beslut.svarstyp === 'levererar_sjalv') {
+        expect(result['tx-1'].beslut.underlag_hittat_at).toBeNull()
+      }
+    })
+
+    it('drops levererar_sjalv promises with underlag_hittat_at set if delivered and re-asked', () => {
+      const post1 = makePost({ transaction_id: 'tx-1' })
+      const exp = makeStoredExport([post1])
+      exp.generated_at = '2026-09-21T10:00:00Z'
+      const beslut: Beslut = {
+        answer_id: 'test-answer-1',
+        transaction_id: 'tx-1',
+        svarstyp: 'levererar_sjalv',
+        motpart: 'HI3G',
+        underlag_hittat_at: '2026-09-20T14:00:00Z',
+      }
+      const svar: SvarMap = {
+        'tx-1': makeSvarRecord({
+          post: post1,
+          beslut,
+          levererad_at: '2026-09-20T10:00:00Z',
+        }),
+      }
+
+      const result = reconcileWithExport(svar, exp)
+      expect(result['tx-1']).toBeUndefined()
+    })
   })
 
   describe('felBolagRows', () => {
