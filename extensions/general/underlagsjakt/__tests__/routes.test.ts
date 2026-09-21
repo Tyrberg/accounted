@@ -88,6 +88,7 @@ interface GetBody {
     posts: { transaction_id: string; konto_identitet: string; kandidater: { bevisgrund: string }[] }[]
     pending_count: number
     fel_bolag: { transaction_id: string; reglering: string | null }[]
+    waiting: { transaction_id: string; underlag_hittat_at: string | null }[]
     bolag_choices: string[]
   }
 }
@@ -107,6 +108,7 @@ describe('auth', () => {
     ['POST', '/export/fil'],
     ['POST', '/svar'],
     ['POST', '/svar/underlag'],
+    ['POST', '/svar/bulk'],
     ['DELETE', '/svar/:transactionId'],
     ['GET', '/svarsfil'],
     ['POST', '/svarsfil/levererad'],
@@ -119,6 +121,7 @@ describe('auth', () => {
     ['POST', '/export/fil'],
     ['POST', '/svar'],
     ['POST', '/svar/underlag'],
+    ['POST', '/svar/bulk'],
     ['DELETE', '/svar/:transactionId'],
     ['POST', '/svarsfil/levererad'],
   ])('%s %s is closed to read-only members', async (method, path) => {
@@ -600,5 +603,274 @@ describe('POST /svar/underlag', () => {
     await importFixture(ctx)
     const res = await route('POST', '/svar').handler(post('/svar', { ...fields, svarstyp: 'uppladdat_underlag', begransa_bolag: false, begransa_belopp: false }), ctx)
     expect(res.status).toBe(400)
+  })
+})
+
+describe('levererar_sjalv', () => {
+  const sjalv = { svarstyp: 'levererar_sjalv', transaction_id: 'tx-google-20260803', motpart: 'GOOGLE*WORKSPACE' }
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('POST /svar answers 403 FEATURE_DISABLED while the type is off, and stores nothing', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const before = JSON.stringify([...store.entries()])
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar').handler(post('/svar', sjalv), ctx),
+    )
+    expect(status).toBe(403)
+    expect(body.error.code).toBe('FEATURE_DISABLED')
+    expect(JSON.stringify([...store.entries()])).toBe(before)
+  })
+
+  it('POST /svar records the promise as waiting when the type is on, and the file is stamped 1.5', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    expect((await route('POST', '/svar').handler(post('/svar', sjalv), ctx)).status).toBe(200)
+
+    const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(body.data.posts.map((p) => p.transaction_id)).not.toContain('tx-google-20260803')
+    expect(body.data.waiting).toEqual([
+      expect.objectContaining({ transaction_id: 'tx-google-20260803', underlag_hittat_at: null }),
+    ])
+
+    const file = await parseJsonResponse<{ version: string; beslut: { svarstyp: string }[] }>(
+      await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx),
+    )
+    expect(file.body.version).toBe('1.5')
+    expect(file.body.beslut.map((b) => b.svarstyp)).toEqual(['levererar_sjalv'])
+  })
+
+  it('GET / tells the workspace whether the type is switched on', async () => {
+    const off = await parseJsonResponse<{ data: { levererar_sjalv_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(off.body.data.levererar_sjalv_enabled).toBe(false)
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', 'true')
+    const on = await parseJsonResponse<{ data: { levererar_sjalv_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(on.body.data.levererar_sjalv_enabled).toBe(true)
+  })
+
+  it('an export that lists underlag_hittat moves the waiting post to "with document" and asks nothing again', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    await route('POST', '/svar').handler(post('/svar', sjalv), ctx)
+    await route('POST', '/svar').handler(post('/svar', { ...sjalv, transaction_id: 'tx-ocr-20260812', motpart: 'OCR' }), ctx)
+
+    // bertil found only the Google document. Its export must not resurrect either post.
+    const later = { ...fixture, generated_at: '2000-01-01T00:00:00Z', underlag_hittat: ['tx-google-20260803', 'tx-unknown'] }
+    expect((await route('POST', '/export/fil').handler(post('/export/fil', later), ctx)).status).toBe(200)
+
+    const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(body.data.posts.map((p) => p.transaction_id)).not.toContain('tx-google-20260803')
+    const byId = Object.fromEntries(body.data.waiting.map((w) => [w.transaction_id, w.underlag_hittat_at]))
+    expect(byId['tx-google-20260803']).toEqual(expect.any(String))
+    expect(byId['tx-ocr-20260812']).toBeNull()
+    expect(byId).not.toHaveProperty('tx-unknown')
+    // The list of found documents is a signal, not something kept with the export.
+    expect(store.get('export')).not.toHaveProperty('underlag_hittat')
+  })
+
+  it('without the list in the export, waiting posts stay waiting', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    await route('POST', '/svar').handler(post('/svar', sjalv), ctx)
+    await importFixture(ctx)
+    const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(body.data.waiting.map((w) => w.underlag_hittat_at)).toEqual([null])
+  })
+})
+
+describe('POST /svar/bulk', () => {
+  /**
+   * Nine open payments: three HI3G (one spelled differently), one HI3G that
+   * bertil suspects belongs to another company, one HI3G already answered, a
+   * different vendor, and two SEB rows whose motpart is a reference number.
+   */
+  const ids = {
+    hi3g: ['tx-hi3g-1', 'tx-hi3g-2', 'tx-hi3g-3'],
+    felBolag: 'tx-hi3g-fel',
+    answered: 'tx-hi3g-answered',
+    telia: 'tx-telia-1',
+    ocr: ['tx-ocr-a', 'tx-ocr-b'],
+  }
+
+  function exportWithVendors() {
+    const raw = JSON.parse(JSON.stringify(fixture)) as {
+      sammanstallningar: { posts: Record<string, unknown>[] }[]
+    }
+    const template = raw.sammanstallningar[0].posts.find((p) => p.transaction_id === 'tx-ocr-20260812')!
+    const add = (transaction_id: string, motpart: string, kategori = 'behover_mattias') =>
+      raw.sammanstallningar[0].posts.push({ ...template, transaction_id, motpart, kategori })
+    add(ids.hi3g[0], 'HI3G')
+    add(ids.hi3g[1], 'Hi3G ')
+    add(ids.hi3g[2], 'HI3G')
+    add(ids.felBolag, 'HI3G', 'fel_bolag')
+    add(ids.answered, 'HI3G')
+    add(ids.telia, 'Telia')
+    add(ids.ocr[0], '100004000001')
+    add(ids.ocr[1], '100004000002')
+    return raw
+  }
+
+  const bulk = (body: unknown) => post('/svar/bulk', body)
+  const hi3gBody = (over: Record<string, unknown> = {}) => ({
+    svarstyp: 'levererar_sjalv',
+    transaction_id: ids.hi3g[0],
+    motpart: 'HI3G',
+    bekrafta_antal: 3,
+    ...over,
+  })
+
+  async function setup() {
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', 'true')
+    const ctx = buildCtx()
+    expect((await route('POST', '/export/fil').handler(post('/export/fil', exportWithVendors()), ctx)).status).toBe(200)
+    // One HI3G post was answered on its own earlier: it is not open, so it is not counted.
+    const answered = await route('POST', '/svar').handler(
+      post('/svar', { svarstyp: 'osaker', transaction_id: ids.answered }),
+      ctx,
+    )
+    expect(answered.status).toBe(200)
+    return ctx
+  }
+
+  const svarStore = () =>
+    store.get('svar') as Record<string, { beslut: Record<string, unknown>; answer_id: string; levererad_at: string | null }>
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('returns 400 for a body that is not JSON', async () => {
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar/bulk').handler(
+        new Request('http://localhost/svar/bulk', { method: 'POST', body: '{nope' }),
+        buildCtx(),
+      ),
+    )
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('INVALID_JSON')
+  })
+
+  it.each([
+    ['another svarstyp', { svarstyp: 'osaker' }],
+    ['a list of ids instead of an anchor', { transaction_id: undefined, transaction_ids: ['tx-hi3g-1'] }],
+    ['no promised count', { bekrafta_antal: undefined }],
+    ['a count of zero', { bekrafta_antal: 0 }],
+    ['a blank motpart', { motpart: ' ' }],
+  ])('returns 400 VALIDATION_ERROR for %s, and stores nothing new', async (_label, over) => {
+    const ctx = await setup()
+    const before = JSON.stringify(svarStore())
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar/bulk').handler(bulk(hi3gBody(over)), ctx),
+    )
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(JSON.stringify(svarStore())).toBe(before)
+  })
+
+  it('returns 403 FEATURE_DISABLED while the type is off, and stores nothing new', async () => {
+    const ctx = await setup()
+    vi.stubEnv('UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED', '')
+    const before = JSON.stringify(svarStore())
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx),
+    )
+    expect(status).toBe(403)
+    expect(body.error.code).toBe('FEATURE_DISABLED')
+    expect(JSON.stringify(svarStore())).toBe(before)
+  })
+
+  it('returns 404 for an anchor that is not in the export', async () => {
+    const ctx = await setup()
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar/bulk').handler(bulk(hi3gBody({ transaction_id: 'tx-nope' })), ctx),
+    )
+    expect(status).toBe(404)
+    expect(body.error.code).toBe('POST_NOT_FOUND')
+  })
+
+  it.each([2, 4, 7])('returns 409 COUNT_CHANGED for a promise of %i when 3 are covered, and writes nothing', async (antal) => {
+    const ctx = await setup()
+    const before = JSON.stringify(svarStore())
+    const { status, body } = await parseJsonResponse<{ error: { code: string; antal: number } }>(
+      await route('POST', '/svar/bulk').handler(bulk(hi3gBody({ bekrafta_antal: antal })), ctx),
+    )
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('COUNT_CHANGED')
+    expect(body.error.antal).toBe(3)
+    expect(JSON.stringify(svarStore())).toBe(before)
+  })
+
+  it('writes one levererar_sjalv beslut per covered post, each with its own answer_id, and no other post', async () => {
+    const ctx = await setup()
+    const { status, body } = await parseJsonResponse<{ data: { recorded: number; transaction_ids: string[] } }>(
+      await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx),
+    )
+    expect(status).toBe(200)
+    expect(body.data.recorded).toBe(3)
+    expect(body.data.transaction_ids).toEqual(ids.hi3g)
+
+    const svar = svarStore()
+    for (const id of ids.hi3g) {
+      expect(svar[id].beslut).toEqual({
+        answer_id: expect.stringContaining(id),
+        transaction_id: id,
+        svarstyp: 'levererar_sjalv',
+        motpart: 'HI3G',
+        underlag_hittat_at: null,
+      })
+    }
+    // Acknowledgement is per transaction: no answer identity is shared between payments.
+    expect(new Set(ids.hi3g.map((id) => svar[id].answer_id)).size).toBe(3)
+    // Untouched: another vendor, the other-company post, the earlier answer, the reference numbers.
+    expect(Object.keys(svar).sort()).toEqual([...ids.hi3g, ids.answered].sort())
+    expect(svar[ids.answered].beslut.svarstyp).toBe('osaker')
+
+    const { body: view } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    const open = view.data.posts.map((p) => p.transaction_id)
+    expect(open).toContain(ids.felBolag)
+    expect(open).toContain(ids.telia)
+    expect(open).not.toContain(ids.hi3g[0])
+    expect(view.data.waiting.map((w) => w.transaction_id).sort()).toEqual([...ids.hi3g].sort())
+  })
+
+  it('covers exactly one post for a reference-number motpart (task 1438): the OCR number is the whole key', async () => {
+    const ctx = await setup()
+    const anchor = { transaction_id: ids.ocr[0], motpart: '100004000001' }
+    const tooMany = await route('POST', '/svar/bulk').handler(bulk(hi3gBody({ ...anchor, bekrafta_antal: 2 })), ctx)
+    expect(tooMany.status).toBe(409)
+
+    const res = await route('POST', '/svar/bulk').handler(bulk(hi3gBody({ ...anchor, bekrafta_antal: 1 })), ctx)
+    expect(res.status).toBe(200)
+    const svar = svarStore()
+    expect(svar[ids.ocr[0]]).toBeDefined()
+    expect(svar[ids.ocr[1]]).toBeUndefined()
+  })
+
+  it('answers a fel_bolag anchor for itself only, never sweeping in the others of that vendor', async () => {
+    const ctx = await setup()
+    const res = await route('POST', '/svar/bulk').handler(
+      bulk(hi3gBody({ transaction_id: ids.felBolag, bekrafta_antal: 4 })),
+      ctx,
+    )
+    // The anchor plus the three ordinary HI3G posts share the rule key: 4 posts, and the count is honest.
+    expect(res.status).toBe(200)
+    expect(Object.keys(svarStore()).sort()).toEqual([...ids.hi3g, ids.felBolag, ids.answered].sort())
+  })
+
+  it('refuses a second identical bulk: the posts are no longer open, so the promised count no longer matches', async () => {
+    const ctx = await setup()
+    await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx)
+    const again = await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx)
+    expect(again.status).toBe(409)
   })
 })

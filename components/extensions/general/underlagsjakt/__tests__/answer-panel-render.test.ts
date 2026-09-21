@@ -22,7 +22,7 @@ function renderPanel(locale: 'sv' | 'en', account: string | null = null) {
         messages: locale === 'sv' ? sv : en,
         timeZone: 'Europe/Stockholm',
       } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-      createElement(PostAnswerPanel, { post, bolagChoices: [], uploadEnabled: true, onAnswered: async () => {} })
+      createElement(PostAnswerPanel, { post, posts: [post], bolagChoices: [], uploadEnabled: true, leverarSjalvEnabled: false, onAnswered: async () => {} })
     )
   )
 }

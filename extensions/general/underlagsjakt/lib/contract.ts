@@ -33,11 +33,24 @@ export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
  */
 export const ANSWER_VERSION = '1.4'
 /**
- * 1.5 adds the `uppladdat_underlag` svarstyp (a document the user uploaded in
- * Accounted). Written only to a file that actually holds one: that is the only
- * file a 1.4 reader cannot understand.
+ * 1.5 adds the `uppladdat_underlag` and `levererar_sjalv` svarstyper. Written
+ * only to a file that actually holds one of them: that is the only file a 1.4
+ * reader cannot understand. Both types are also switched off (see
+ * `leverarSjalvEnabled` and the upload flag) until bertil reads 1.5, so a
+ * 1.5 file is never produced before then.
  */
 export const ANSWER_VERSION_UPLOAD = '1.5'
+
+/**
+ * Whether the `levererar_sjalv` answer type is available: the option is hidden
+ * and both `POST /svar` and `POST /svar/bulk` answer 403 until
+ * UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED=true, which is set only once bertil's
+ * mottak_svar_fran_ui reads answer version 1.5 and the type, and its export
+ * carries the optional `underlag_hittat` list.
+ */
+export function leverarSjalvEnabled(): boolean {
+  return process.env.UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED === 'true'
+}
 
 /** `SVARSKATEGORIER` in bertil. */
 export const KATEGORIER = [
@@ -143,6 +156,15 @@ const sammanfattningSchema = z
   })
   .passthrough()
 
+/**
+ * Optional list of transaction_ids whose promised (`levererar_sjalv`) document
+ * bertil has since found on the usual place. Deliberately NOT tied to an
+ * export_version: it is optional in every supported version and its presence
+ * is the signal, so it cannot collide with what a given version number
+ * already means in bertil (1.5 carries the root `information` field).
+ */
+const underlagHittatSchema = z.array(z.string().min(1)).optional()
+
 const sammanstallningSchema = z
   .object({
     export_version: z.string(),
@@ -151,6 +173,7 @@ const sammanstallningSchema = z
     generated_at: z.string(),
     sammanfattning: sammanfattningSchema,
     posts: z.array(postSchema),
+    underlag_hittat: underlagHittatSchema,
   })
   .passthrough()
 export type Sammanstallning = z.infer<typeof sammanstallningSchema>
@@ -160,6 +183,7 @@ const wrapperSchema = z
     export_version: z.string(),
     generated_at: z.string(),
     sammanstallningar: z.array(sammanstallningSchema),
+    underlag_hittat: underlagHittatSchema,
   })
   .passthrough()
 
@@ -170,7 +194,7 @@ export interface ParsedExport {
 }
 
 export type ParseExportResult =
-  | { ok: true; export: ParsedExport }
+  | { ok: true; export: ParsedExport; underlag_hittat: string[] }
   | { ok: false; code: 'UNSUPPORTED_VERSION'; version: string | null }
   | { ok: false; code: 'INVALID_EXPORT'; issues: string[] }
 
@@ -213,7 +237,7 @@ export function parseExport(raw: unknown): ParseExportResult {
     }
     const parsed = wrapperSchema.safeParse(raw)
     if (!parsed.success) return { ok: false, code: 'INVALID_EXPORT', issues: formatIssues(parsed.error) }
-    return { ok: true, export: parsed.data }
+    return { ok: true, export: parsed.data, underlag_hittat: collectUnderlagHittat(parsed.data) }
   }
 
   const parsed = sammanstallningSchema.safeParse(raw)
@@ -225,7 +249,17 @@ export function parseExport(raw: unknown): ParseExportResult {
       generated_at: parsed.data.generated_at,
       sammanstallningar: [parsed.data],
     },
+    underlag_hittat: collectUnderlagHittat({ sammanstallningar: [parsed.data] }),
   }
+}
+
+/** Every `underlag_hittat` id in a wrapper, at the root or on a sammanstallning, without duplicates. */
+function collectUnderlagHittat(exp: {
+  underlag_hittat?: string[]
+  sammanstallningar: { underlag_hittat?: string[] }[]
+}): string[] {
+  const ids = [...(exp.underlag_hittat ?? []), ...exp.sammanstallningar.flatMap((s) => s.underlag_hittat ?? [])]
+  return [...new Set(ids)]
 }
 
 function formatIssues(error: z.ZodError): string[] {
@@ -242,6 +276,18 @@ export function candidatesOf(post: Post): Kandidat[] {
 }
 
 // ── Answers ──────────────────────────────────────────────────
+
+/**
+ * bertil's learned-rule key for a motpart with no bolag, bankkonto or belopp
+ * restriction: `motpart|bolag=|bankkonto=|belopp=`. A `levererar_sjalv` bulk
+ * reuses exactly this key (all three restrictions empty) to decide which posts
+ * it covers, rather than inventing a second matching rule. The motpart is
+ * compared as exact normalized text: NFKC, trimmed, single-spaced, lower-cased.
+ */
+export function motpartRegelNyckel(motpart: string): string {
+  const normalized = motpart.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase()
+  return `${normalized}|bolag=|bankkonto=|belopp=`
+}
 
 /** One entry in `beslut`, as the answer schema lists it (1.4 includes reglering in fel_bolag only). */
 export type Beslut =
@@ -289,7 +335,26 @@ export type Beslut =
       bankkonto: string | null
       belopp: number | null
     }
+  | {
+      answer_id: string
+      transaction_id: string
+      svarstyp: 'levererar_sjalv'
+      motpart: string
+      /** ISO timestamp when bertil confirmed the document was found. Null while waiting. */
+      underlag_hittat_at: string | null
+    }
   | { answer_id: string; transaction_id: string; svarstyp: 'osaker' }
+
+/**
+ * "The document exists and I will leave it in the usual place." The opposite of
+ * `osaker` and of "no underlag needed": it promises a document, so the post is
+ * kept as waiting until bertil reports it found.
+ */
+const levererarSjalvSchema = z.object({
+  svarstyp: z.literal('levererar_sjalv'),
+  transaction_id: z.string().min(1),
+  motpart: z.string().trim().min(1),
+})
 
 /** What the workspace sends for one post. Validated against the stored post before it becomes a Beslut. */
 export const svarInputSchema = z.discriminatedUnion('svarstyp', [
@@ -319,6 +384,7 @@ export const svarInputSchema = z.discriminatedUnion('svarstyp', [
       message: 'reglering krävs när till_bolag är satt',
       path: ['reglering'],
     }),
+  levererarSjalvSchema,
   z.object({
     svarstyp: z.literal('osaker'),
     transaction_id: z.string().min(1),
@@ -401,6 +467,19 @@ export function buildBeslut(
       reglering: null,
     }
   }
+  if (input.svarstyp === 'levererar_sjalv') {
+    return {
+      ok: true,
+      beslut: {
+        answer_id: answerId,
+        transaction_id,
+        svarstyp: 'levererar_sjalv',
+        motpart: input.motpart,
+        underlag_hittat_at: null,
+      },
+      reglering: null,
+    }
+  }
   const regleringSvar = input.svarstyp === 'fel_bolag' && input.till_bolag !== null ? input.reglering : null
   if (input.svarstyp === 'fel_bolag') {
     return {
@@ -445,9 +524,21 @@ export function buildBeslut(
   }
 }
 
+/**
+ * "The same for every payment from this motpart": the answer for one anchor
+ * post plus the number of posts the browser counted. Only `levererar_sjalv` can
+ * be bulked. The server derives the affected posts itself with `bulkTargets` and
+ * refuses (409 COUNT_CHANGED) when its count differs from `bekrafta_antal`, so
+ * a client can never name posts the rule does not cover.
+ */
+export const bulkSvarInputSchema = levererarSjalvSchema.extend({
+  bekrafta_antal: z.number().int().min(1),
+})
+export type BulkSvarInput = z.infer<typeof bulkSvarInputSchema>
+
 export function buildAnswerFile(
   beslut: Beslut[],
 ): { version: string; beslut: Beslut[] } {
-  const hasUpload = beslut.some((b) => b.svarstyp === 'uppladdat_underlag')
-  return { version: hasUpload ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION, beslut }
+  const needsNewVersion = beslut.some((b) => b.svarstyp === 'uppladdat_underlag' || b.svarstyp === 'levererar_sjalv')
+  return { version: needsNewVersion ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION, beslut }
 }

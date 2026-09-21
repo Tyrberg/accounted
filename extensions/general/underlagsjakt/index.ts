@@ -30,6 +30,8 @@ import {
   buildAnswerFile,
   buildBeslut,
   buildUppladdatBeslut,
+  bulkSvarInputSchema,
+  leverarSjalvEnabled,
   parseExport,
   svarInputSchema,
   uppladdatInputSchema,
@@ -40,6 +42,7 @@ import {
   KVITTENS_KEY,
   SVAR_KEY,
   bolagChoices,
+  bulkTargets,
   felBolagRows,
   findPost,
   loadLeveransJournal,
@@ -47,11 +50,13 @@ import {
   markDelivered,
   markDeliveredManual,
   markOffered,
+  markUnderlagHittat,
   openPosts,
   pendingBeslut,
   reconcileWithExport,
   recordAnswer,
   recordSvarHandover,
+  waitingRows,
   withdrawAnswer,
   type ImportKalla,
   type StoredExport,
@@ -141,8 +146,11 @@ async function importExport(request: Request, ctx: ExtensionContext, via: Import
   }
 
   const state = await loadState(ctx.settings)
-  const stored: StoredExport = { ...parsed.export, imported_at: nowIso(), imported_via: via }
-  const svar = reconcileWithExport(state.svar, parsed.export)
+  const now = nowIso()
+  const stored: StoredExport = { ...parsed.export, imported_at: now, imported_via: via }
+  // The list of found documents is a signal, not part of the export we keep.
+  delete (stored as { underlag_hittat?: unknown }).underlag_hittat
+  const svar = markUnderlagHittat(reconcileWithExport(state.svar, parsed.export), parsed.underlag_hittat, now)
   await ctx.settings.set(EXPORT_KEY, stored)
   await ctx.settings.set(SVAR_KEY, svar)
   ctx.log.info('underlagsjakt export imported', {
@@ -175,6 +183,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
           supported_export_versions: SUPPORTED_EXPORT_VERSIONS,
           answer_version: ANSWER_VERSION,
           underlag_upload_enabled: uploadEnabled(),
+          levererar_sjalv_enabled: leverarSjalvEnabled(),
           leverans: { till_detta_bolag: leveransHit },
           export: exp
             ? {
@@ -197,6 +206,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
             .sort((a, b) => b.besvarad_at.localeCompare(a.besvarad_at)),
           pending_count: pending.length,
           fel_bolag: felBolagRows(svar),
+          waiting: waitingRows(svar),
           bolag_choices: bolagChoices(exp, svar, members),
         },
       })
@@ -313,6 +323,10 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         return fail(400, 'VALIDATION_ERROR', 'Svaret är ofullständigt.', {
           issues: input.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
         })
+      }
+
+      if (input.data.svarstyp === 'levererar_sjalv' && !leverarSjalvEnabled()) {
+        return fail(403, 'FEATURE_DISABLED', 'Svarstypen "jag levererar underlaget själv" är inte påslagen.')
       }
 
       const now = nowIso()
@@ -455,6 +469,70 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       }
 
       return NextResponse.json({ data: { ...recorded.svar[post.transaction_id], koppling } })
+    },
+  },
+  /**
+   * "I will deliver the documents myself, for every payment from this motpart."
+   * Records one `levererar_sjalv` answer per affected post, so acknowledgement
+   * stays per transaction and no document is ever bound to several payments
+   * (task 1435). The affected posts are derived here with `bulkTargets`, the
+   * same function the browser counts with; the browser only promises how many
+   * (`bekrafta_antal`), and a different count is refused with 409 COUNT_CHANGED.
+   */
+  {
+    method: 'POST',
+    path: '/svar/bulk',
+    handler: async (request, ctx) => {
+      if (!ctx) return unauthorized()
+      const denied = await writeGuard(ctx)
+      if (denied) return denied
+
+      const json = await readJson(request)
+      if (!json.ok) return fail(400, 'INVALID_JSON', 'Ogiltig JSON.')
+      const input = bulkSvarInputSchema.safeParse(json.body)
+      if (!input.success) {
+        return fail(400, 'VALIDATION_ERROR', 'Svaret är ofullständigt.', {
+          issues: input.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        })
+      }
+      if (!leverarSjalvEnabled()) {
+        return fail(403, 'FEATURE_DISABLED', 'Svarstypen "jag levererar underlaget själv" är inte påslagen.')
+      }
+
+      const state = await loadState(ctx.settings)
+      const anchor = findPost(state.export, input.data.transaction_id)
+      if (!anchor) return fail(404, 'POST_NOT_FOUND', 'Posten finns inte i den inlästa exporten.')
+
+      const targets = bulkTargets(openPosts(state.export, state.svar), anchor)
+      if (targets.length !== input.data.bekrafta_antal) {
+        return fail(
+          409,
+          'COUNT_CHANGED',
+          `Antalet poster har ändrats: du bekräftade ${input.data.bekrafta_antal}, men ${targets.length} omfattas nu.`,
+          { antal: targets.length },
+        )
+      }
+
+      const now = nowIso()
+      let svar = state.svar
+      for (const target of targets) {
+        const built = buildBeslut(
+          target,
+          { svarstyp: 'levererar_sjalv', transaction_id: target.transaction_id, motpart: input.data.motpart },
+          `${now}:${target.transaction_id}`,
+        )
+        // levererar_sjalv always builds; the guard keeps the type honest.
+        if (!built.ok) return fail(400, built.code, 'Svaret kunde inte byggas.')
+        const recorded = recordAnswer(svar, target, built.beslut, built.reglering, ctx.userId, now)
+        // Open posts have no answer to be delivered, so this cannot happen; if it
+        // ever does, nothing is written rather than half of the posts.
+        if (!recorded.ok) return fail(409, recorded.code, 'Svaret är redan erbjudet till bertil och kan inte ändras.')
+        svar = recorded.svar
+      }
+
+      await ctx.settings.set(SVAR_KEY, svar)
+      ctx.log.info('underlagsjakt bulk answer recorded', { count: targets.length, svarstyp: 'levererar_sjalv' })
+      return NextResponse.json({ data: { recorded: targets.length, transaction_ids: targets.map((p) => p.transaction_id) } })
     },
   },
   {

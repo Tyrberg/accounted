@@ -14,9 +14,10 @@ import { HOVER_REVEAL_CLASS, RowFoldout, TD_CLASS, TH_CLASS } from '@/components
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate, formatDateLong } from '@/lib/utils'
 import { PostAnswerPanel } from './underlagsjakt/PostAnswerPanel'
+import { MAX_WAITING_DAYS } from '@/extensions/general/underlagsjakt/lib/store'
 import { answerSummary, errorText, type WorkspaceData } from './underlagsjakt/shared'
 
-type Tab = 'open' | 'answered' | 'fel_bolag'
+type Tab = 'open' | 'answered' | 'vantar' | 'fel_bolag'
 
 const API = '/api/extensions/ext/underlagsjakt'
 
@@ -179,6 +180,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
           options={[
             { value: 'open', label: t('tab_open'), count: data.posts.length },
             { value: 'answered', label: t('tab_answered'), count: pendingCount },
+            { value: 'vantar', label: t('tab_vantar'), count: data.waiting.filter((row) => !row.underlag_hittat_at).length },
             { value: 'fel_bolag', label: t('tab_fel_bolag'), count: data.fel_bolag.length },
           ]}
         />
@@ -249,8 +251,10 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                       expanded={expanded}
                       onToggle={() => setExpandedId(expanded ? null : post.transaction_id)}
                       post={post}
+                      posts={data.posts}
                       bolagChoices={data.bolag_choices}
                       uploadEnabled={data.underlag_upload_enabled}
+                      leverarSjalvEnabled={data.levererar_sjalv_enabled}
                       onAnswered={async () => {
                         setExpandedId(null)
                         await load()
@@ -318,6 +322,50 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
           </div>
         ))}
 
+      {tab === 'vantar' &&
+        (data.waiting.length === 0 ? (
+          <EmptyState icon={FileSearch} title={t('vantar_empty_title')} description={t('vantar_empty_description')} />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr>
+                  <th className={TH_CLASS}>{t('col_date')}</th>
+                  <th className={TH_CLASS}>{t('col_counterparty')}</th>
+                  <th className={cn(TH_CLASS, 'text-right')}>{t('col_amount')}</th>
+                  <th className={TH_CLASS}>{t('col_answered')}</th>
+                  <th className={TH_CLASS}>{t('col_status')}</th>
+                </tr>
+              </thead>
+              <tbody className="stagger-enter">
+                {data.waiting.map((row) => {
+                  const days = Math.floor((Date.now() - new Date(row.besvarad_at).getTime()) / (1000 * 60 * 60 * 24))
+                  const isOverdue = !row.underlag_hittat_at && days > MAX_WAITING_DAYS
+                  return (
+                    <tr key={row.transaction_id} className={cn('hover:bg-secondary/35', isOverdue && 'bg-destructive/5')} data-ph-mask="">
+                      <td className={cn(TD_CLASS, 'whitespace-nowrap tabular-nums')}>{formatDate(row.post.datum)}</td>
+                      <td className={TD_CLASS}>{row.motpart}</td>
+                      <td className={cn(TD_CLASS, 'text-right whitespace-nowrap tabular-nums')}>
+                        {formatCurrency(row.post.belopp, row.post.valuta)}
+                      </td>
+                      <td className={cn(TD_CLASS, 'whitespace-nowrap text-xs text-muted-foreground')}>{formatDateLong(row.besvarad_at, locale)}</td>
+                      <td className={cn(TD_CLASS, 'whitespace-nowrap')}>
+                        {row.underlag_hittat_at ? (
+                          <span className="text-xs text-muted-foreground">{t('status_underlag_hittat', { date: formatDate(row.underlag_hittat_at) })}</span>
+                        ) : isOverdue ? (
+                          <Badge variant="destructive">{t('status_overdue', { days })}</Badge>
+                        ) : (
+                          <Badge variant="warning">{t('status_waiting')}</Badge>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
       {tab === 'fel_bolag' &&
         (data.fel_bolag.length === 0 ? (
           <EmptyState icon={FileSearch} title={t('fel_bolag_empty_title')} description={t('fel_bolag_empty_description')} />
@@ -378,17 +426,21 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
 
 function PostRows({
   post,
+  posts,
   expanded,
   onToggle,
   bolagChoices,
   uploadEnabled,
+  leverarSjalvEnabled,
   onAnswered,
 }: {
   post: WorkspaceData['posts'][number]
+  posts: WorkspaceData['posts']
   expanded: boolean
   onToggle: () => void
   bolagChoices: string[]
   uploadEnabled: boolean
+  leverarSjalvEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -431,7 +483,7 @@ function PostRows({
         <tr>
           <td colSpan={6} className="border-b border-border p-0">
             <RowFoldout>
-              <PostAnswerPanel post={post} bolagChoices={bolagChoices} uploadEnabled={uploadEnabled} onAnswered={onAnswered} />
+              <PostAnswerPanel post={post} posts={posts} bolagChoices={bolagChoices} uploadEnabled={uploadEnabled} leverarSjalvEnabled={leverarSjalvEnabled} onAnswered={onAnswered} />
             </RowFoldout>
           </td>
         </tr>

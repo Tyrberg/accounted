@@ -31,6 +31,7 @@ import {
 } from '@/extensions/general/underlagsjakt/lib/leverans'
 import {
   MAX_QUIET_DAYS,
+  MAX_WAITING_DAYS,
   describeLeveransStatus,
   formatReport,
   gatherEvidence,
@@ -556,6 +557,8 @@ describe('describeLeveransStatus', () => {
     pendingAnswers: 0,
     lastAcknowledgedAt: recently,
     oldestPendingAt: null,
+    promisedDocuments: 0,
+    oldestPromisedAt: null,
     ...overrides,
   })
 
@@ -908,5 +911,121 @@ describe('what the workspace is told', () => {
   it('promises nothing while the box has no delivery configured', async () => {
     delete process.env[TOKEN_ENV]
     expect(await status('company-1')).toEqual({ till_detta_bolag: false })
+  })
+})
+
+describe('promised documents (levererar_sjalv waiting list)', () => {
+  const NOW = new Date('2026-09-21T07:00:00.000Z')
+  const daysAgo = (n: number) => new Date(NOW.getTime() - n * 86_400_000).toISOString()
+  const recently = '2026-09-21T04:17:00.000Z'
+  const healthy = (overrides: Partial<LeveransEvidence> = {}): LeveransEvidence => ({
+    envFile: '/srv/accounted/.env',
+    configProblems: [],
+    companyProblem: null,
+    companyId: 'company-1',
+    export: { imported_at: recently, via: 'leverans' },
+    journal: { senast_hamtad_at: recently, senast_antal: 1 },
+    pendingAnswers: 0,
+    lastAcknowledgedAt: recently,
+    oldestPendingAt: null,
+    promisedDocuments: 0,
+    oldestPromisedAt: null,
+    ...overrides,
+  })
+  const promised = (report: ReturnType<typeof describeLeveransStatus>) =>
+    report.checks.filter((c) => c.label === 'promised documents')
+
+  it('adds no check while nothing is promised', () => {
+    expect(promised(describeLeveransStatus(healthy(), NOW))).toEqual([])
+  })
+
+  it('is ok while the oldest promise is within the limit, and the exit code stays 0', () => {
+    const report = describeLeveransStatus(healthy({ promisedDocuments: 4, oldestPromisedAt: daysAgo(MAX_WAITING_DAYS - 1) }), NOW)
+    expect(promised(report)).toEqual([expect.objectContaining({ state: 'ok' })])
+    expect(report.exitCode).toBe(0)
+  })
+
+  it('alarms past the limit with exit 2, in ONE line however many posts are late', () => {
+    const report = describeLeveransStatus(healthy({ promisedDocuments: 9, oldestPromisedAt: daysAgo(MAX_WAITING_DAYS + 3) }), NOW)
+    const checks = promised(report)
+    expect(checks).toHaveLength(1)
+    expect(checks[0].state).toBe('alarm')
+    expect(checks[0].line).toContain('9 document(s)')
+    expect(checks[0].line).toContain(`${MAX_WAITING_DAYS + 3} days, over the ${MAX_WAITING_DAYS} allowed`)
+    expect(report.exitCode).toBe(2)
+  })
+
+  it('does not claim the delivery is broken when only promised documents are late', () => {
+    const report = describeLeveransStatus(healthy({ promisedDocuments: 1, oldestPromisedAt: daysAgo(30) }), NOW)
+    expect(report.exitCode).toBe(2)
+    expect(report.headline).toBe('The automatic delivery works, but promised documents are overdue.')
+    expect(report.headline).not.toContain('not working')
+  })
+
+  it('still says the delivery is broken, counting its own checks, when both are wrong', () => {
+    const report = describeLeveransStatus(
+      healthy({ promisedDocuments: 1, oldestPromisedAt: daysAgo(30), journal: null, lastAcknowledgedAt: null }),
+      NOW,
+    )
+    expect(report.headline).toMatch(/^The automatic delivery is not working: /)
+    expect(report.headline).not.toBe('The automatic delivery works, but promised documents are overdue.')
+  })
+
+  it('reads the limit from the one constant: 14 days until someone changes it', () => {
+    expect(MAX_WAITING_DAYS).toBe(14)
+  })
+
+  describe('gatherEvidence', () => {
+    const answered = (id: string, besvarad_at: string, beslut: Record<string, unknown>) => ({
+      beslut: { transaction_id: id, ...beslut },
+      reglering: null,
+      post: {},
+      besvarad_at,
+      besvarad_av: 'owner-1',
+      answer_id: `${besvarad_at}:${id}`,
+      erbjudet_at: null,
+      levererad_at: null,
+    })
+    const waiting = (id: string, besvarad_at: string, hittat: string | null = null) =>
+      answered(id, besvarad_at, { svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: hittat })
+
+    it('counts only promised answers bertil has not found, and reports the oldest', async () => {
+      await route('POST', '/export').handler(request({ body: fixture }))
+      slice.dataRows.find((r) => r.key === 'svar')!.value = {
+        a: waiting('a', '2026-09-10T08:00:00.000Z'),
+        b: waiting('b', '2026-09-05T08:00:00.000Z'),
+        found: waiting('found', '2026-08-01T08:00:00.000Z', '2026-09-02T08:00:00.000Z'),
+        other: answered('other', '2026-07-01T08:00:00.000Z', { svarstyp: 'osaker' }),
+      }
+      const evidence = await gatherEvidence()
+      expect(evidence.promisedDocuments).toBe(2)
+      expect(evidence.oldestPromisedAt).toBe('2026-09-05T08:00:00.000Z')
+    })
+
+    it('reports nothing promised when no answer is a promise', async () => {
+      await route('POST', '/export').handler(request({ body: fixture }))
+      const evidence = await gatherEvidence()
+      expect(evidence.promisedDocuments).toBe(0)
+      expect(evidence.oldestPromisedAt).toBeNull()
+    })
+
+    it('stops alarming once bertil reports the document found in a later export', async () => {
+      await route('POST', '/export').handler(request({ body: fixture }))
+      slice.dataRows.find((r) => r.key === 'svar')!.value = { a: waiting('a', daysAgo(30)) }
+      expect((await gatherEvidence()).promisedDocuments).toBe(1)
+
+      await route('POST', '/export').handler(request({ body: { ...fixture, underlag_hittat: ['a'] } }))
+      const evidence = await gatherEvidence()
+      expect(evidence.promisedDocuments).toBe(0)
+      expect(promised(describeLeveransStatus(evidence, NOW))).toEqual([])
+    })
+
+    it('GET /svar hands bertil a 1.5 file when it carries a promise', async () => {
+      await route('POST', '/export').handler(request({ body: fixture }))
+      slice.dataRows.find((r) => r.key === 'svar')!.value = { a: waiting('a', daysAgo(1)) }
+      const res = await parse<{ version: string; beslut: { svarstyp: string }[] }>(await route('GET', '/svar').handler(request()))
+      expect(res.body.version).toBe('1.5')
+      expect(res.body.beslut.map((b) => b.svarstyp)).toEqual(['levererar_sjalv'])
+    })
   })
 })

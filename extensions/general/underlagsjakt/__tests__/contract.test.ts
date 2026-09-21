@@ -12,7 +12,9 @@ import {
   buildAnswerFile,
   buildBeslut,
   buildUppladdatBeslut,
+  bulkSvarInputSchema,
   candidatesOf,
+  motpartRegelNyckel,
   parseExport,
   svarInputSchema,
   uppladdatInputSchema,
@@ -437,5 +439,108 @@ describe('uppladdat_underlag', () => {
     const beslut = buildUppladdatBeslut(p, input, dokument, 'answer-1')
     expect(beslut.bolag).toBeNull()
     expect(beslut.belopp).toBe(p.belopp)
+  })
+})
+
+describe('levererar_sjalv: "I will deliver the document myself"', () => {
+  const p = posts(fixture14 as typeof fixture)[0]
+
+  it('validates as a svar input', () => {
+    const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: p.transaction_id, motpart: 'HI3G' }
+    expect(svarInputSchema.safeParse(input).success).toBe(true)
+  })
+
+  it('requires motpart to be non-empty', () => {
+    expect(svarInputSchema.safeParse({ svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: '  ' }).success).toBe(false)
+  })
+
+  it('builds a beslut with the vendor name and null underlag_hittat_at', () => {
+    const input = svarInputSchema.parse({ svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G' })
+    const built = buildBeslut(p, input, 'answer-1')
+    expect(built.ok).toBe(true)
+    if (!built.ok) return
+    expect(built.beslut).toEqual({
+      answer_id: 'answer-1',
+      transaction_id: p.transaction_id,
+      svarstyp: 'levererar_sjalv',
+      motpart: 'HI3G',
+      underlag_hittat_at: null,
+    })
+  })
+})
+
+describe('bulkSvarInputSchema', () => {
+  const p = posts(fixture14 as typeof fixture)[0]
+  const valid = { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G', bekrafta_antal: 3 }
+
+  it('takes the anchor post, the motpart and the promised count, and nothing that names other posts', () => {
+    const parsed = bulkSvarInputSchema.parse({ ...valid, transaction_ids: ['a', 'b'] })
+    expect(parsed).toEqual(valid)
+  })
+
+  it.each([
+    ['osaker', { ...valid, svarstyp: 'osaker' }],
+    ['val_kandidat', { ...valid, svarstyp: 'val_kandidat' }],
+    ['fel_bolag', { ...valid, svarstyp: 'fel_bolag' }],
+    ['a zero count', { ...valid, bekrafta_antal: 0 }],
+    ['a fractional count', { ...valid, bekrafta_antal: 1.5 }],
+    ['a missing count', { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G' }],
+    ['a blank motpart', { ...valid, motpart: '  ' }],
+    ['a missing anchor', { ...valid, transaction_id: '' }],
+  ])('rejects %s', (_label, body) => {
+    expect(bulkSvarInputSchema.safeParse(body).success).toBe(false)
+  })
+})
+
+describe('answer file version', () => {
+  const osaker = { answer_id: 'a', transaction_id: 't1', svarstyp: 'osaker' } as const
+  const sjalv = { answer_id: 'b', transaction_id: 't2', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: null } as const
+
+  it('stays 1.4 for a file bertil already reads', () => {
+    expect(buildAnswerFile([osaker]).version).toBe('1.4')
+  })
+
+  it('is 1.5 for a file that holds a levererar_sjalv answer, the only file a 1.4 reader cannot take', () => {
+    expect(buildAnswerFile([osaker, sjalv]).version).toBe('1.5')
+    expect(buildAnswerFile([sjalv]).version).toBe(ANSWER_VERSION_UPLOAD)
+  })
+})
+
+describe('motpartRegelNyckel', () => {
+  it('is the existing rule key with bolag, bankkonto and belopp all empty', () => {
+    expect(motpartRegelNyckel('HI3G')).toBe('hi3g|bolag=|bankkonto=|belopp=')
+  })
+
+  it('ignores case, surrounding and repeated spaces, but nothing else', () => {
+    expect(motpartRegelNyckel('  Hi3G   Sweden ')).toBe(motpartRegelNyckel('HI3G SWEDEN'))
+    expect(motpartRegelNyckel('HI3G')).not.toBe(motpartRegelNyckel('HI3G SWEDEN'))
+  })
+})
+
+describe('underlag_hittat in an export', () => {
+  it('is empty when the export does not carry the list, at any version', () => {
+    for (const fx of [fixture, fixture14]) {
+      const parsed = parseExport(clone(fx))
+      expect(parsed.ok && parsed.underlag_hittat).toEqual([])
+    }
+  })
+
+  it('is read from the root, whatever the export_version says', () => {
+    const raw = { ...clone(fixture14), export_version: '1.5', underlag_hittat: ['tx-a', 'tx-b'] }
+    const parsed = parseExport(raw)
+    expect(parsed.ok && parsed.underlag_hittat).toEqual(['tx-a', 'tx-b'])
+  })
+
+  it('also collects it from a sammanstallning, without duplicates', () => {
+    const raw = clone(fixture14) as unknown as { underlag_hittat?: string[]; sammanstallningar: { underlag_hittat?: string[] }[] }
+    raw.underlag_hittat = ['tx-a']
+    raw.sammanstallningar[0].underlag_hittat = ['tx-a', 'tx-c']
+    const parsed = parseExport(raw)
+    expect(parsed.ok && parsed.underlag_hittat).toEqual(['tx-a', 'tx-c'])
+  })
+
+  it('refuses a list that is not a list of ids', () => {
+    const parsed = parseExport({ ...clone(fixture14), underlag_hittat: [1, 2] })
+    expect(parsed.ok).toBe(false)
   })
 })

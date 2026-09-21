@@ -51,6 +51,7 @@ import {
 } from './lib/leverans'
 import {
   KVITTENS_KEY,
+  MAX_WAITING_DAYS,
   loadLeveransJournal,
   loadState,
   pendingBeslut,
@@ -65,6 +66,10 @@ import {
  * on a run that merely slipped past midnight.
  */
 export const MAX_QUIET_DAYS = 2
+
+// The limit on a promised (`levererar_sjalv`) document lives in lib/store.ts so
+// the workspace marks overdue posts by the same number; re-exported for callers.
+export { MAX_WAITING_DAYS }
 
 export interface LeveransEvidence {
   /** The `.env` the configuration was read from, or null when none was found. */
@@ -90,7 +95,14 @@ export interface LeveransEvidence {
   /** Last confirmed machine ingestion, independent of retained answers. */
   lastAcknowledgedAt: string | null
   oldestPendingAt: string | null
+  /** Promises to deliver documents waiting for bertil to confirm receipt. */
+  promisedDocuments: number
+  /** Oldest promised document awaiting confirmation, if any. */
+  oldestPromisedAt: string | null
 }
+
+/** Label of the promised-documents check; it is judged apart from the delivery's own checks. */
+const PROMISED_LABEL = 'promised documents'
 
 export type CheckState = 'ok' | 'alarm' | 'blocked'
 
@@ -276,6 +288,19 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
     })
   }
 
+  // One line for all promised documents, never one per post. It is an alarm
+  // (exit 2) so an unkept promise cannot go unnoticed, but it says nothing about
+  // whether the delivery itself works.
+  if (evidence.promisedDocuments > 0) {
+    const oldestDays = evidence.oldestPromisedAt === null ? null : daysSince(evidence.oldestPromisedAt, now)
+    const overdueDays = oldestDays !== null && oldestDays > MAX_WAITING_DAYS ? Math.floor(oldestDays) : null
+    checks.push({
+      label: PROMISED_LABEL,
+      state: overdueDays !== null ? 'alarm' : 'ok',
+      line: `${evidence.promisedDocuments} document(s) promised with "I will deliver it myself" and not yet found by bertil, oldest answered ${evidence.oldestPromisedAt ?? 'unknown'}${overdueDays !== null ? `: ${overdueDays} days, over the ${MAX_WAITING_DAYS} allowed` : ''}. Deliver them or ask bertil to look again; the posts are listed under "Väntar på underlag".`,
+    })
+  }
+
   // Freshness, measured per direction. Only meaningful for a direction that
   // has been used at all; before that the two checks above already say so, and
   // "quiet" would be noise.
@@ -298,12 +323,15 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
   }
 
   const alarms = checks.filter((check) => check.state === 'alarm')
+  const deliveryAlarms = alarms.filter((check) => check.label !== PROMISED_LABEL)
   return {
     exitCode: alarms.length === 0 ? 0 : 2,
     headline:
       alarms.length === 0
         ? 'The automatic delivery has received an export and recorded an acknowledged answer; polls are recent and no acknowledgement is overdue.'
-        : `The automatic delivery is not working: ${alarms.length} of ${checks.length} checks failed.`,
+        : deliveryAlarms.length === 0
+          ? 'The automatic delivery works, but promised documents are overdue.'
+          : `The automatic delivery is not working: ${deliveryAlarms.length} of ${checks.length} checks failed.`,
     checks,
   }
 }
@@ -356,6 +384,8 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     pendingAnswers: 0,
     lastAcknowledgedAt: null,
     oldestPendingAt: null,
+    promisedDocuments: 0,
+    oldestPromisedAt: null,
   }
 
   const inspected = inspectLeveransConfig()
@@ -372,6 +402,11 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     opened.ctx.settings.get<string>(KVITTENS_KEY),
   ])
 
+  const promisedDocs = Object.values(state.svar).filter(
+    (r) => r.beslut.svarstyp === 'levererar_sjalv' && r.beslut.underlag_hittat_at === null
+  )
+  const oldestPromisedAt = promisedDocs.map((r) => r.besvarad_at).sort()[0] ?? null
+
   return {
     envFile,
     configProblems: [],
@@ -385,6 +420,8 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     lastAcknowledgedAt: lastAcknowledgedAt ?? null,
     oldestPendingAt: Object.values(state.svar).filter((r) => r.levererad_at === null)
       .map((r) => r.besvarad_at).sort()[0] ?? null,
+    promisedDocuments: promisedDocs.length,
+    oldestPromisedAt,
   }
 }
 
