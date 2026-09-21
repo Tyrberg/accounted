@@ -1,10 +1,12 @@
-import type { Kategori, Momstyp, Post, Reglering, SvarInput } from '@/extensions/general/underlagsjakt/lib/contract'
+import type { Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
 export interface WorkspaceData {
   supported_export_versions: string[]
   answer_version: string
+  /** Whether the "I have the document" answer is switched on (bertil reads answer version 1.5). */
+  underlag_upload_enabled: boolean
   /** Whether bertil's delivery lands in the company being viewed, not merely somewhere on this box. */
   leverans: { till_detta_bolag: boolean }
   export: {
@@ -46,6 +48,11 @@ const KNOWN_ERROR_CODES = new Set([
   'POST_NOT_FOUND',
   'CANDIDATE_NOT_FOUND',
   'CANDIDATE_WITHOUT_HASH',
+  'UNDERLAG_FILE_MISSING',
+  'UNDERLAG_UNSUPPORTED_TYPE',
+  'UNDERLAG_TOO_LARGE',
+  'UNDERLAG_INVALID_CONTENT',
+  'UNDERLAG_UPLOAD_FAILED',
   'ALREADY_DELIVERED',
   'NOT_FOUND',
 ])
@@ -93,8 +100,10 @@ export function deriveTillBolag(tillBolagChoice: string | undefined, externalBol
 }
 
 export interface AnswerFormState {
-  mode: 'val_kandidat' | 'fel_bolag' | 'osaker'
+  mode: 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'osaker'
   transactionId: string
+  /** The file chosen in uppladdat_underlag mode; undefined until one is picked. */
+  file?: File
   hasCandidate: boolean
   sha256: string | null
   kategori?: Kategori
@@ -115,7 +124,9 @@ export interface AnswerFormState {
   reglering?: Reglering
 }
 
-export type AnswerFormResult = { input: SvarInput; missing?: undefined } | { input?: undefined; missing: string[] }
+export type AnswerFormResult =
+  | { input: SvarInput | UppladdatInput; missing?: undefined }
+  | { input?: undefined; missing: string[] }
 
 /**
  * Single source for both what "Spara svar" submits and why it's disabled:
@@ -163,12 +174,29 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
     }
   }
 
+  const uploading = state.mode === 'uppladdat_underlag'
   const missing: string[] = []
-  if (!state.hasCandidate) missing.push('missing_candidate')
+  if (uploading) {
+    if (!state.file) missing.push('missing_file')
+  } else if (!state.hasCandidate) missing.push('missing_candidate')
   if (!state.kategori) missing.push('missing_kategori')
   if (!state.motpart.trim()) missing.push('missing_motpart')
   if (!state.basKontoValid) missing.push('missing_bas_konto')
   if (missing.length > 0) return { missing }
+  if (uploading) {
+    return {
+      input: {
+        svarstyp: 'uppladdat_underlag',
+        transaction_id,
+        motpart: state.motpart.trim(),
+        kategori: state.kategori!,
+        bas_konto: state.basKonto.trim() || null,
+        momstyp: state.momstyp,
+        begransa_bolag: state.begransaBolag,
+        begransa_belopp: state.begransaBelopp,
+      },
+    }
+  }
   return {
     input: {
       svarstyp: 'val_kandidat',
@@ -191,6 +219,7 @@ export function answerSummary(t: T, rec: SvarRecord): string {
     return t('answer_fel_bolag', { bolag: b.till_bolag ?? t('unknown_company'), mottagare: b.fel_bolag_mottagare })
   }
   const kategori = t(`kategori_${b.kategori}`)
+  if (b.svarstyp === 'uppladdat_underlag') return t('answer_uppladdat_underlag', { filnamn: b.filnamn, kategori })
   return b.vald_kandidat
     ? t('answer_val_kandidat', { filnamn: b.vald_kandidat, kategori })
     : t('answer_ingen_kandidat', { motpart: b.motpart, kategori })
@@ -211,27 +240,67 @@ export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutco
   if (!ok) {
     return { toast: { title: t('save_failed'), description: errorText(t, body), variant: 'destructive' }, refresh: false }
   }
-  const data = (body as { data?: SvarRecord } | null)?.data
+  const data = (body as { data?: (SvarRecord & { koppling?: string }) } | null)?.data
+  // An uploaded underlag is always filed; whether it also followed a transaction is worth saying.
+  const unlinked = data?.beslut.svarstyp === 'uppladdat_underlag' && data.koppling !== 'kopplad'
+  const unlinkedKey =
+    data?.koppling === 'ej_pa_verifikat'
+      ? 'answer_uppladdat_not_on_verifikat'
+      : data?.koppling === 'annat_verifikat'
+        ? 'answer_uppladdat_other_verifikat'
+        : 'answer_uppladdat_not_linked'
   return {
-    toast: { title: t('save_success'), description: data ? answerSummary(t, data) : undefined },
+    toast: {
+      title: t('save_success'),
+      description: data ? [answerSummary(t, data), unlinked ? t(unlinkedKey) : null].filter(Boolean).join('. ') : undefined,
+    },
     refresh: true,
   }
 }
 
-/** Submit an answer to the API and handle the outcome. Extracted for testability. */
+const SVAR_URL = '/api/extensions/ext/underlagsjakt/svar'
+
+/**
+ * An uploaded underlag travels as multipart, the file next to the answer's own
+ * fields, so the server can refuse or record both together.
+ */
+export function buildUppladdatForm(input: UppladdatInput, file: File): FormData {
+  const form = new FormData()
+  form.set('file', file)
+  form.set('transaction_id', input.transaction_id)
+  form.set('motpart', input.motpart)
+  form.set('kategori', input.kategori)
+  form.set('bas_konto', input.bas_konto ?? '')
+  form.set('momstyp', input.momstyp ?? '')
+  form.set('begransa_bolag', String(input.begransa_bolag))
+  form.set('begransa_belopp', String(input.begransa_belopp))
+  return form
+}
+
+/**
+ * Submit an answer to the API and handle the outcome. Extracted for testability.
+ * `file` is required for (and only read by) an `uppladdat_underlag` input.
+ */
 export async function submitAnswer(
-  input: SvarInput,
+  input: SvarInput | UppladdatInput,
   t: T,
   onOutcome: (outcome: SaveOutcome) => void,
   onAnswered: () => Promise<void>,
   fetchFn?: typeof fetch,
+  file?: File,
 ): Promise<void> {
+  const uploading = input.svarstyp === 'uppladdat_underlag'
+  if (uploading && !file) {
+    onOutcome(interpretSaveResult(t, false, { error: { code: 'UNDERLAG_FILE_MISSING' } }))
+    return
+  }
   try {
-    const res = await (fetchFn || fetch)('/api/extensions/ext/underlagsjakt/svar', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    })
+    const res = await (fetchFn || fetch)(
+      uploading ? `${SVAR_URL}/underlag` : SVAR_URL,
+      uploading
+        ? { method: 'POST', body: buildUppladdatForm(input as UppladdatInput, file!) }
+        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) },
+    )
     const json: unknown = await res.json().catch(() => null)
     const outcome = interpretSaveResult(t, res.ok, json)
     onOutcome(outcome)

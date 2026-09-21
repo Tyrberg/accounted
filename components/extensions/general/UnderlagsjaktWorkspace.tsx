@@ -250,6 +250,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                       onToggle={() => setExpandedId(expanded ? null : post.transaction_id)}
                       post={post}
                       bolagChoices={data.bolag_choices}
+                      uploadEnabled={data.underlag_upload_enabled}
                       onAnswered={async () => {
                         setExpandedId(null)
                         await load()
@@ -380,12 +381,14 @@ function PostRows({
   expanded,
   onToggle,
   bolagChoices,
+  uploadEnabled,
   onAnswered,
 }: {
   post: WorkspaceData['posts'][number]
   expanded: boolean
   onToggle: () => void
   bolagChoices: string[]
+  uploadEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -428,7 +431,7 @@ function PostRows({
         <tr>
           <td colSpan={6} className="border-b border-border p-0">
             <RowFoldout>
-              <PostAnswerPanel post={post} bolagChoices={bolagChoices} onAnswered={onAnswered} />
+              <PostAnswerPanel post={post} bolagChoices={bolagChoices} uploadEnabled={uploadEnabled} onAnswered={onAnswered} />
             </RowFoldout>
           </td>
         </tr>

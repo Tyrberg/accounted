@@ -6,9 +6,10 @@
  * exports what it could not decide under a versioned contract (see
  * lib/contract.ts). This extension reads that export, shows one row per
  * payment with the readable account name, the candidates and their evidence,
- * and collects one of three answers per row: the right document (or none,
- * with motpart/kategori/BAS-konto/momstyp as the CLI's --svara), "gäller
- * annat bolag", or "osäker". The answers go back to bertil as the contract's
+ * and collects one of four answers per row: the right document (or none,
+ * with motpart/kategori/BAS-konto/momstyp as the CLI's --svara), a document
+ * the user uploads on the spot when bertil found none, "gäller annat bolag",
+ * or "osäker". The answers go back to bertil as the contract's
  * answer file, where they become rules.
  *
  * Nothing here books anything. Wrong-company payments are collected as a
@@ -21,13 +22,17 @@
 import { NextResponse } from 'next/server'
 import type { ApiRouteDefinition, Extension, ExtensionContext } from '@/lib/extensions/types'
 import { requireWritePermission } from '@/lib/auth/require-write'
+import { MAX_DOCUMENT_SIZE, uploadDocument } from '@/lib/core/documents/document-service'
 import {
   ANSWER_VERSION,
   SUPPORTED_EXPORT_VERSIONS,
+  UNDERLAG_UPLOAD_MIME_TYPES,
   buildAnswerFile,
   buildBeslut,
+  buildUppladdatBeslut,
   parseExport,
   svarInputSchema,
+  uppladdatInputSchema,
 } from './lib/contract'
 import {
   EXPORT_KEY,
@@ -52,6 +57,7 @@ import {
   type StoredExport,
 } from './lib/store'
 import { authenticateLeverans, leveransTargetsCompany } from './lib/leverans'
+import { kopplaTillTransaktion } from './lib/koppla'
 
 const EXTENSION_ID = 'underlagsjakt'
 
@@ -77,6 +83,16 @@ async function writeGuard(ctx: ExtensionContext): Promise<Response | null> {
 }
 
 const nowIso = () => new Date().toISOString()
+
+/**
+ * The upload answer is off until bertil reads answer version 1.5: an upload
+ * files a document bertil cannot take in, and a 1.5 answer file is one a 1.4
+ * reader refuses. Switched on with UNDERLAGSJAKT_UPLOAD_ENABLED=true once
+ * bertil's mottak_svar_fran_ui understands `uppladdat_underlag`.
+ */
+function uploadEnabled(): boolean {
+  return process.env.UNDERLAGSJAKT_UPLOAD_ENABLED === 'true'
+}
 
 /**
  * Names of the user's non-archived companies. A failed read only narrows the
@@ -158,6 +174,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         data: {
           supported_export_versions: SUPPORTED_EXPORT_VERSIONS,
           answer_version: ANSWER_VERSION,
+          underlag_upload_enabled: uploadEnabled(),
           leverans: { till_detta_bolag: leveransHit },
           export: exp
             ? {
@@ -320,6 +337,124 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       await ctx.settings.set(SVAR_KEY, recorded.svar)
 
       return NextResponse.json({ data: recorded.svar[post.transaction_id] })
+    },
+  },
+  /**
+   * "I have the document": the file and the answer arrive in one request, and
+   * the answer is only recorded once the file is archived, so bertil is never
+   * told about a document Accounted does not hold and Accounted never holds a
+   * document bertil is not told about (barring a failed write of the answer
+   * itself, which leaves a filed, deduplicated document and a retryable
+   * request). Everything that can be refused is refused before the upload.
+   */
+  {
+    method: 'POST',
+    path: '/svar/underlag',
+    handler: async (request, ctx) => {
+      if (!ctx) return unauthorized()
+      const denied = await writeGuard(ctx)
+      if (denied) return denied
+      if (!uploadEnabled()) {
+        return fail(403, 'UNDERLAG_UPLOAD_DISABLED', 'Uppladdning av underlag är inte påslagen.')
+      }
+
+      let form: FormData
+      try {
+        form = await request.formData()
+      } catch {
+        return fail(400, 'VALIDATION_ERROR', 'Ogiltigt formulär.')
+      }
+
+      const file = form.get('file')
+      if (!(file instanceof File) || file.size === 0) {
+        return fail(400, 'UNDERLAG_FILE_MISSING', 'Ingen fil vald.')
+      }
+      if (!(UNDERLAG_UPLOAD_MIME_TYPES as readonly string[]).includes(file.type)) {
+        return fail(400, 'UNDERLAG_UNSUPPORTED_TYPE', 'Filtypen stöds inte. Ladda upp en PDF eller en bild.')
+      }
+      if (file.size > MAX_DOCUMENT_SIZE) {
+        return fail(400, 'UNDERLAG_TOO_LARGE', 'Filen är för stor.', { max_bytes: MAX_DOCUMENT_SIZE })
+      }
+
+      const field = (name: string) => {
+        const v = form.get(name)
+        return typeof v === 'string' ? v : undefined
+      }
+      const nullable = (name: string) => {
+        const v = field(name)?.trim()
+        return v ? v : null
+      }
+      const input = uppladdatInputSchema.safeParse({
+        svarstyp: 'uppladdat_underlag',
+        transaction_id: field('transaction_id'),
+        motpart: field('motpart'),
+        kategori: field('kategori'),
+        bas_konto: nullable('bas_konto'),
+        momstyp: nullable('momstyp'),
+        begransa_bolag: field('begransa_bolag') === 'true',
+        begransa_belopp: field('begransa_belopp') === 'true',
+      })
+      if (!input.success) {
+        return fail(400, 'VALIDATION_ERROR', 'Svaret är ofullständigt.', {
+          issues: input.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        })
+      }
+
+      const state = await loadState(ctx.settings)
+      const post = findPost(state.export, input.data.transaction_id)
+      if (!post) return fail(404, 'POST_NOT_FOUND', 'Posten finns inte i den inlästa exporten.')
+      const existing = state.svar[post.transaction_id]
+      if (existing?.levererad_at || existing?.erbjudet_at) {
+        return fail(409, 'ALREADY_DELIVERED', 'Svaret är redan erbjudet till bertil och kan inte ändras.')
+      }
+
+      let document: Awaited<ReturnType<typeof uploadDocument>>
+      try {
+        document = await uploadDocument(
+          ctx.supabase,
+          ctx.userId,
+          ctx.companyId,
+          { name: file.name, buffer: await file.arrayBuffer(), type: file.type },
+          // A retry of the same file converges on the archived original.
+          { upload_source: 'file_upload', dedupeByContent: true, extractionOwner: 'none' },
+        )
+      } catch (err) {
+        const message = err instanceof Error ? err.message : ''
+        if (/kunde inte verifieras|matchar inte den angivna filtypen/i.test(message)) {
+          return fail(400, 'UNDERLAG_INVALID_CONTENT', 'Filens innehåll stämmer inte med filtypen.')
+        }
+        ctx.log.error('underlagsjakt: uploading underlag failed', { error: message })
+        return fail(500, 'UNDERLAG_UPLOAD_FAILED', 'Dokumentet kunde inte sparas.')
+      }
+
+      const now = nowIso()
+      const beslut = buildUppladdatBeslut(
+        post,
+        input.data,
+        {
+          id: document.id,
+          filnamn: document.file_name,
+          sha256: document.sha256_hash,
+          mime_type: document.mime_type,
+          storage_path: document.storage_path,
+        },
+        `${now}:${post.transaction_id}`,
+      )
+      const recorded = recordAnswer(state.svar, post, beslut, null, ctx.userId, now)
+      if (!recorded.ok) return fail(409, recorded.code, 'Svaret är redan erbjudet till bertil och kan inte ändras.')
+      await ctx.settings.set(SVAR_KEY, recorded.svar)
+
+      // After the answer is recorded, and never fatal: the document is filed and
+      // bertil will be told either way; the pin is what makes it follow the verifikat.
+      const koppling = await kopplaTillTransaktion(ctx.supabase, ctx.companyId, post.transaction_id, document.id)
+      if (koppling === 'misslyckades') {
+        ctx.log.warn('underlagsjakt: could not pin uploaded underlag to a transaction', {
+          transaction_id: post.transaction_id,
+          document_id: document.id,
+        })
+      }
+
+      return NextResponse.json({ data: { ...recorded.svar[post.transaction_id], koppling } })
     },
   },
   {

@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** 1.4 (minimum 1.1)
+**Contract version:** export 1.4 (minimum 1.1); answer 1.4, or 1.5 for a file holding an `uppladdat_underlag`
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -169,6 +169,62 @@ A supporting document (email, invoice, receipt).
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
 
+## Answers (`beslut`)
+
+The answer file is `{ "version": "1.4", "beslut": [...] }`, or `"1.5"` when (and only when) it holds at least one `uppladdat_underlag` entry: a file without one is byte-for-byte what a 1.4 reader already ingests. Every entry carries
+`answer_id`, `transaction_id` and a `svarstyp`, one of:
+
+| `svarstyp` | Meaning |
+|---|---|
+| `val_kandidat` | The right document among the post's candidates (`vald_kandidat`/`sha256`/`kalla`), or none (`vald_kandidat: null`, "no document needed"), with `motpart`, `kategori`, `bas_konto`, `momstyp`, `bolag`, `bankkonto`, `belopp` for the learned rule. |
+| `fel_bolag` | The payment belongs to another company (`fel_bolag_mottagare`, `till_bolag`, `reglering`). |
+| `osaker` | Postponed; bertil asks again later. |
+| `uppladdat_underlag` | **New in 1.5.** bertil found no document (or none that fits), and the user uploaded the real one in Accounted. The entry carries a reference to that file instead of a choice among candidates. |
+
+### `uppladdat_underlag`
+
+```json
+{
+  "answer_id": "2026-09-21T10:15:00.000Z:tx-ocr-20260812",
+  "transaction_id": "tx-ocr-20260812",
+  "svarstyp": "uppladdat_underlag",
+  "dokument_id": "6f1c0f0e-3f4b-4c58-9a51-0d2f4a0f7b11",
+  "filnamn": "kvitto.pdf",
+  "sha256": "b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "mime_type": "application/pdf",
+  "storage_path": "documents/<company_id>/<user_id>/1789985700000_kvitto.pdf",
+  "kalla": "gnubok_uppladdning",
+  "motpart": "OCR-betalning",
+  "kategori": "leverantor",
+  "bas_konto": null,
+  "momstyp": null,
+  "bolag": null,
+  "bankkonto": null,
+  "belopp": null
+}
+```
+
+- **`dokument_id`** (string): The document's id in Accounted (`document_attachments.id`).
+- **`filnamn`** (string): The uploaded file's name.
+- **`sha256`** (string): SHA-256 of the stored bytes, lowercase hex. Computed by Accounted from the stored file, never taken from the browser; it is the same identity bertil uses for `Kandidat.sha256`.
+- **`mime_type`** (string or null): `application/pdf`, `image/jpeg`, `image/png`, `image/webp`, `image/heic` or `image/heif`.
+- **`storage_path`** (string): Key in Accounted's `documents` storage bucket.
+- **`kalla`** (string): Always `gnubok_uppladdning`.
+- **`motpart`, `kategori`, `bas_konto`, `momstyp`, `bolag`, `bankkonto`, `belopp`**: Exactly as in `val_kandidat`; they are what the rule is learned from.
+
+bertil must treat the payment as **having underlag** (`med_underlag`) from the
+next run, exactly as if the document had been a candidate chosen by the user,
+and must not keep asking about it. A reader that does not know `uppladdat_underlag`
+must refuse the whole file (an unknown `svarstyp` is never to be skipped
+silently): acknowledging an answer it did not understand would lose the document.
+`vald_kandidat` is absent from this entry.
+
+The file is stored in Accounted's archive (WORM, retained seven years) and, when
+`transaction_id` identifies exactly one Accounted bank transaction (its id or its
+`external_id`), pinned to that transaction so it follows the verifikat. When it
+does not, the document is archived and the answer is still delivered; Accounted
+never guesses a transaction from date and amount.
+
 ## Transport: the automatic delivery
 
 The export does not have to be uploaded by hand. bertil can deliver it, and
@@ -179,7 +235,7 @@ shared token, not by a session.
 | Call | Endpoint | Body |
 |---|---|---|
 | Deliver an export | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export` | The root wrapper above |
-| Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4", "beslut": [...] }` |
+| Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4" or "1.5", "beslut": [...] }` |
 | Acknowledge ingestion | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar/kvittens` | Acknowledgement request with both `transaction_id` and `answer_id` (see below) |
 
 All three calls send the token as `Authorization: Bearer <token>` (the `apikey`
@@ -201,7 +257,7 @@ Repeated acknowledgements preserve the original delivery timestamp. Unknown
 IDs (including withdrawn or reconciled answers) succeed without a write.
 Malformed JSON or a missing, blank, or non-string ID returns 400; authentication
 and configuration failures use the same 401/503 responses as the other calls.
-The answer file remains version 1.4.
+The answer file is version 1.4, or 1.5 when it holds an uploaded underlag (see "Answers" below).
 
 An unacknowledged answer stays on offer until it is acknowledged; a re-export
 does not reopen its question. Once an answer has been offered to bertil it can
@@ -279,6 +335,10 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 
 ## Version History
+
+### Answer 1.5
+- Written only to a file that holds an `uppladdat_underlag`; every other answer file stays 1.4. The upload option in Accounted is off until `UNDERLAGSJAKT_UPLOAD_ENABLED=true` is set on the box, which is done once bertil reads 1.5.
+- New `svarstyp` `uppladdat_underlag`: the user uploaded the document in Accounted (see "Answers"). The export version is unchanged (1.4).
 
 ### 1.4
 - Added `leverantor_sokord` field on posts for supplier search hints (ignored by Accounted; reserved for future use).

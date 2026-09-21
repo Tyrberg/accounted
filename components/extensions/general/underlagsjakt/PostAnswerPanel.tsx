@@ -2,7 +2,7 @@
 
 import { useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
-import { Eye, Loader2 } from 'lucide-react'
+import { Eye, Loader2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -12,10 +12,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { isAccountNumber } from '@/lib/invariants/account-number'
+import { INBOX_MAX_UPLOAD_BYTES, exceedsHostedUploadLimit, formatMegabytes, isShrinkableImage, tooLargeMessage } from '@/lib/documents/upload-size'
+import { shrinkImageForUpload } from '@/lib/documents/shrink-image'
 import {
   KATEGORIER,
   MOMSTYPER,
   REGLERINGAR,
+  UNDERLAG_UPLOAD_MIME_TYPES,
   candidatesOf,
   isValidSha256,
   type Kandidat,
@@ -39,17 +42,22 @@ import {
 
 import { suggestAnswerAccount } from './account-suggestion'
 
-type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
+type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'osaker'
+
+const UPLOAD_ACCEPT = UNDERLAG_UPLOAD_MIME_TYPES.join(',')
 
 const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
 
 export function PostAnswerPanel({
   post,
   bolagChoices,
+  uploadEnabled,
   onAnswered,
 }: {
   post: Post
   bolagChoices: string[]
+  /** Off until bertil reads answer version 1.5: the upload option is then not offered. */
+  uploadEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -57,6 +65,11 @@ export function PostAnswerPanel({
   const candidates = candidatesOf(post)
   const [mode, setMode] = useState<Mode>(post.kategori === 'fel_bolag' ? 'fel_bolag' : 'val_kandidat')
   const [saving, setSaving] = useState(false)
+
+  // uppladdat_underlag
+  const [file, setFile] = useState<File | undefined>(undefined)
+  const [preparingFile, setPreparingFile] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // val_kandidat
   const suggestedKategori = (KATEGORIER as readonly string[]).includes(post.forslag?.kategori ?? '')
@@ -95,6 +108,7 @@ export function PostAnswerPanel({
 
   const answerResult = buildAnswerInput({
     mode,
+    file,
     transactionId: post.transaction_id,
     hasCandidate: chosen !== undefined,
     sha256: chosen === NONE ? null : (chosen ?? null),
@@ -120,17 +134,135 @@ export function PostAnswerPanel({
   const disabledReason = saving || ready ? null : t('save_disabled_reason', { fields: missingReasons.map((key) => t(key)).join(', ') })
   // Derived from the same `ready` the line above reads, not from `input`, so the button and the
   // hint can never disagree even if buildAnswerInput's type ever allowed an empty `missing: []`.
-  const canSubmit = ready && !saving
+  const canSubmit = ready && !saving && !preparingFile
+
+  // A phone photo is routinely over the hosted body limit: shrink it here, and refuse with the
+  // real reason (size and ceiling) when that is not enough, instead of a bare platform 413.
+  const chooseFile = async (original: File) => {
+    setPreparingFile(true)
+    try {
+      let chosenFile = original
+      if (exceedsHostedUploadLimit(chosenFile.size) && isShrinkableImage(chosenFile.type)) {
+        chosenFile = await shrinkImageForUpload(chosenFile)
+      }
+      const problem = !(UNDERLAG_UPLOAD_MIME_TYPES as readonly string[]).includes(chosenFile.type)
+        ? t('upload_unsupported_type')
+        : chosenFile.size > INBOX_MAX_UPLOAD_BYTES
+          ? t('upload_too_large', { size: formatMegabytes(chosenFile.size), max: formatMegabytes(INBOX_MAX_UPLOAD_BYTES) })
+          : exceedsHostedUploadLimit(chosenFile.size)
+            ? tooLargeMessage(chosenFile.size)
+            : null
+      if (problem) {
+        setFile(undefined)
+        toast({ title: t('upload_rejected_title'), description: problem, variant: 'destructive' })
+        return
+      }
+      setFile(chosenFile)
+    } finally {
+      setPreparingFile(false)
+    }
+  }
 
   const submit = async () => {
     if (!input) return
     setSaving(true)
     try {
-      await submitAnswer(input, t, (outcome) => toast(outcome.toast), onAnswered)
+      await submitAnswer(input, t, (outcome) => toast(outcome.toast), onAnswered, undefined, file)
     } finally {
       setSaving(false)
     }
   }
+
+  // Shared by "choose a document" and "upload a document": both teach bertil the same rule.
+  const classificationFields = (
+    <>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="space-y-2">
+          <Label htmlFor={`motpart-${post.transaction_id}`}>{t('field_motpart')}</Label>
+          <Input
+            id={`motpart-${post.transaction_id}`}
+            value={motpart}
+            onChange={(e) => setMotpart(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">{t('field_motpart_hint')}</p>
+        </div>
+        <div className="space-y-2">
+          <Label>{t('field_kategori')}</Label>
+          <Select value={kategori} onValueChange={(v) => {
+            setKategori(v as Kategori)
+            setCategoryChanged(true)
+          }}>
+            <SelectTrigger aria-label={t('field_kategori')}>
+              <SelectValue>{kategori ? t(`kategori_${kategori}`) : t('field_kategori_choose')}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {KATEGORIER.map((k) => (
+                <SelectItem key={k} value={k}>
+                  {t(`kategori_option_${k}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')} {optionalSuffix}</Label>
+          <Input
+            id={`bas-${post.transaction_id}`}
+            inputMode="numeric"
+            maxLength={4}
+            value={basKonto}
+            onChange={(e) => setBasKontoOverride(e.target.value)}
+            aria-invalid={!basKontoValid}
+            aria-describedby={isAccountSuggestion ? `bas-suggestion-${post.transaction_id}` : undefined}
+          />
+          {isAccountSuggestion && (
+            <p id={`bas-suggestion-${post.transaction_id}`} className="text-xs text-muted-foreground">
+              {t('field_bas_konto_suggestion')}
+            </p>
+          )}
+          {!basKontoValid && <p className="text-xs text-destructive">{t('field_bas_konto_invalid')}</p>}
+        </div>
+        <div className="space-y-2">
+          <Label>{t('field_momstyp')} {optionalSuffix}</Label>
+          <Select
+            value={momstyp ?? NONE}
+            onValueChange={(v) => setMomstyp(v === NONE ? null : (v as Momstyp))}
+          >
+            <SelectTrigger aria-label={`${t('field_momstyp')} ${optionalSuffix}`}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NONE}>{t('momstyp_none')}</SelectItem>
+              {MOMSTYPER.map((m) => (
+                <SelectItem key={m} value={m}>
+                  {t(`momstyp_${m}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="space-y-2 text-[13px]">
+        <label className="flex items-center gap-3">
+          <Checkbox
+            className="border-foreground"
+            checked={begransaBolag}
+            onCheckedChange={(v) => setBegransaBolag(v === true)}
+          />
+          {t('restrict_bolag', { bolag: post.bolag })}
+        </label>
+        <label className="flex items-center gap-3">
+          <Checkbox
+            className="border-foreground"
+            checked={begransaBelopp}
+            onCheckedChange={(v) => setBegransaBelopp(v === true)}
+          />
+          {t('restrict_belopp', { belopp: formatCurrency(Math.abs(post.belopp), post.valuta) })}
+        </label>
+      </div>
+    </>
+  )
 
   return (
     <div className="space-y-6 bg-secondary/20 px-4 py-6" data-ph-mask="">
@@ -153,6 +285,7 @@ export function PostAnswerPanel({
         onChange={setMode}
         options={[
           { value: 'val_kandidat', label: t('mode_val_kandidat') },
+          ...(uploadEnabled ? [{ value: 'uppladdat_underlag' as const, label: t('mode_uppladdat_underlag') }] : []),
           { value: 'fel_bolag', label: t('mode_fel_bolag') },
           { value: 'osaker', label: t('mode_osaker') },
         ]}
@@ -163,7 +296,15 @@ export function PostAnswerPanel({
           <fieldset className="space-y-3">
             <legend className="mb-2 text-sm font-medium">{t('candidates_legend')}</legend>
             {candidates.length === 0 && (
-              <p className="text-[12.5px] text-muted-foreground">{t('candidates_none')}</p>
+              <div className="space-y-2">
+                <p className="text-[12.5px] text-muted-foreground">{t('candidates_none')}</p>
+                {uploadEnabled && (
+                  <Button variant="outline" size="sm" onClick={() => setMode('uppladdat_underlag')}>
+                    <Upload className="mr-2 h-4 w-4" />
+                    {t('candidates_none_upload')}
+                  </Button>
+                )}
+              </div>
             )}
             {candidates.map((k) => (
               <CandidateOption
@@ -186,91 +327,41 @@ export function PostAnswerPanel({
             </label>
           </fieldset>
 
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor={`motpart-${post.transaction_id}`}>{t('field_motpart')}</Label>
-              <Input
-                id={`motpart-${post.transaction_id}`}
-                value={motpart}
-                onChange={(e) => setMotpart(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">{t('field_motpart_hint')}</p>
-            </div>
-            <div className="space-y-2">
-              <Label>{t('field_kategori')}</Label>
-              <Select value={kategori} onValueChange={(v) => {
-                setKategori(v as Kategori)
-                setCategoryChanged(true)
-              }}>
-                <SelectTrigger aria-label={t('field_kategori')}>
-                  <SelectValue>{kategori ? t(`kategori_${kategori}`) : t('field_kategori_choose')}</SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {KATEGORIER.map((k) => (
-                    <SelectItem key={k} value={k}>
-                      {t(`kategori_option_${k}`)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')} {optionalSuffix}</Label>
-              <Input
-                id={`bas-${post.transaction_id}`}
-                inputMode="numeric"
-                maxLength={4}
-                value={basKonto}
-                onChange={(e) => setBasKontoOverride(e.target.value)}
-                aria-invalid={!basKontoValid}
-                aria-describedby={isAccountSuggestion ? `bas-suggestion-${post.transaction_id}` : undefined}
-              />
-              {isAccountSuggestion && (
-                <p id={`bas-suggestion-${post.transaction_id}`} className="text-xs text-muted-foreground">
-                  {t('field_bas_konto_suggestion')}
-                </p>
-              )}
-              {!basKontoValid && <p className="text-xs text-destructive">{t('field_bas_konto_invalid')}</p>}
-            </div>
-            <div className="space-y-2">
-              <Label>{t('field_momstyp')} {optionalSuffix}</Label>
-              <Select
-                value={momstyp ?? NONE}
-                onValueChange={(v) => setMomstyp(v === NONE ? null : (v as Momstyp))}
-              >
-                <SelectTrigger aria-label={`${t('field_momstyp')} ${optionalSuffix}`}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE}>{t('momstyp_none')}</SelectItem>
-                  {MOMSTYPER.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {t(`momstyp_${m}`)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
+          {classificationFields}
+        </div>
+      )}
 
-          <div className="space-y-2 text-[13px]">
-            <label className="flex items-center gap-3">
-              <Checkbox
-                className="border-foreground"
-                checked={begransaBolag}
-                onCheckedChange={(v) => setBegransaBolag(v === true)}
-              />
-              {t('restrict_bolag', { bolag: post.bolag })}
-            </label>
-            <label className="flex items-center gap-3">
-              <Checkbox
-                className="border-foreground"
-                checked={begransaBelopp}
-                onCheckedChange={(v) => setBegransaBelopp(v === true)}
-              />
-              {t('restrict_belopp', { belopp: formatCurrency(Math.abs(post.belopp), post.valuta) })}
-            </label>
-          </div>
+      {mode === 'uppladdat_underlag' && (
+        <div className="space-y-6">
+          <fieldset className="space-y-3">
+            <legend className="mb-2 text-sm font-medium">{t('upload_legend')}</legend>
+            <p className="text-[12.5px] text-muted-foreground">{t('upload_description')}</p>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={UPLOAD_ACCEPT}
+              className="hidden"
+              aria-label={t('upload_choose')}
+              onChange={(e) => {
+                const picked = e.target.files?.[0]
+                if (picked) void chooseFile(picked)
+                e.target.value = ''
+              }}
+            />
+            <div className="flex flex-wrap items-center gap-3">
+              <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()} disabled={saving}>
+                {preparingFile ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                {file ? t('upload_change') : t('upload_choose')}
+              </Button>
+              {file && (
+                <span className="min-w-0 truncate text-[13px]">
+                  {file.name} <span className="text-xs text-muted-foreground tabular-nums">({formatMegabytes(file.size)})</span>
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">{t('upload_formats')}</p>
+          </fieldset>
+          {classificationFields}
         </div>
       )}
 
@@ -379,7 +470,7 @@ export function PostAnswerPanel({
         </p>
         <Button onClick={() => void submit()} disabled={!canSubmit}>
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-          {mode === 'osaker' ? t('submit_osaker') : t('submit')}
+          {mode === 'osaker' ? t('submit_osaker') : mode === 'uppladdat_underlag' ? t('submit_uppladdat_underlag') : t('submit')}
         </Button>
       </div>
     </div>

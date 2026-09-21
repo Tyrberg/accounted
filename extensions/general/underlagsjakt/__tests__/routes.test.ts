@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { NextResponse } from 'next/server'
 import { underlagsjaktExtension } from '@/extensions/general/underlagsjakt'
 import { createMockRequest, parseJsonResponse } from '@/tests/helpers'
@@ -9,6 +9,16 @@ import fixture14 from './fixtures/export-1.4.json'
 const writePermission = vi.fn()
 vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: (...a: unknown[]) => writePermission(...a),
+}))
+
+const uploadDocument = vi.fn()
+vi.mock('@/lib/core/documents/document-service', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/core/documents/document-service')>()),
+  uploadDocument: (...a: unknown[]) => uploadDocument(...a),
+}))
+const kopplaTillTransaktion = vi.fn()
+vi.mock('../lib/koppla', () => ({
+  kopplaTillTransaktion: (...a: unknown[]) => kopplaTillTransaktion(...a),
 }))
 
 function route(method: string, path: string) {
@@ -64,6 +74,14 @@ const moankAnswer = {
   reglering: 'vidarefakturera',
 }
 
+const storedDocument = {
+  id: 'doc-1',
+  file_name: 'kvitto.pdf',
+  sha256_hash: 'b'.repeat(64),
+  mime_type: 'application/pdf',
+  storage_path: 'documents/company-1/user-1/1_kvitto.pdf',
+}
+
 interface GetBody {
   data: {
     export: { export_version: string } | null
@@ -79,6 +97,8 @@ beforeEach(() => {
   store = new Map()
   memberships = { data: [], error: null }
   writePermission.mockResolvedValue({ ok: true })
+  uploadDocument.mockResolvedValue(storedDocument)
+  kopplaTillTransaktion.mockResolvedValue('kopplad')
 })
 
 describe('auth', () => {
@@ -86,6 +106,7 @@ describe('auth', () => {
     ['GET', '/'],
     ['POST', '/export/fil'],
     ['POST', '/svar'],
+    ['POST', '/svar/underlag'],
     ['DELETE', '/svar/:transactionId'],
     ['GET', '/svarsfil'],
     ['POST', '/svarsfil/levererad'],
@@ -97,6 +118,7 @@ describe('auth', () => {
   it.each([
     ['POST', '/export/fil'],
     ['POST', '/svar'],
+    ['POST', '/svar/underlag'],
     ['DELETE', '/svar/:transactionId'],
     ['POST', '/svarsfil/levererad'],
   ])('%s %s is closed to read-only members', async (method, path) => {
@@ -378,5 +400,205 @@ describe('POST /svarsfil/levererad', () => {
     expect(body.data.pending_count).toBe(0)
     const file = (await (await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx)).json()) as { beslut: unknown[] }
     expect(file.beslut).toEqual([])
+  })
+})
+
+describe('POST /svar/underlag', () => {
+  const PDF_BYTES = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34])
+  const fields: Record<string, string> = {
+    transaction_id: 'tx-ocr-20260812',
+    motpart: 'OCR-betalning',
+    kategori: 'leverantor',
+    bas_konto: '',
+    momstyp: '',
+    begransa_bolag: 'false',
+    begransa_belopp: 'false',
+  }
+
+  function upload(over: { file?: File | null; fields?: Record<string, string | undefined> } = {}) {
+    const form = new FormData()
+    const file = over.file === undefined ? new File([PDF_BYTES], 'kvitto.pdf', { type: 'application/pdf' }) : over.file
+    if (file) form.set('file', file)
+    for (const [k, v] of Object.entries({ ...fields, ...over.fields })) if (v !== undefined) form.set(k, v)
+    return new Request('http://localhost:3000/svar/underlag', { method: 'POST', body: form })
+  }
+  const handler = () => route('POST', '/svar/underlag').handler
+
+  // Off unless bertil reads answer version 1.5; these tests are about the switched-on path.
+  beforeEach(() => {
+    process.env.UNDERLAGSJAKT_UPLOAD_ENABLED = 'true'
+  })
+  afterEach(() => {
+    delete process.env.UNDERLAGSJAKT_UPLOAD_ENABLED
+  })
+
+  it('is refused while switched off: nothing is filed and no answer is recorded', async () => {
+    delete process.env.UNDERLAGSJAKT_UPLOAD_ENABLED
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(await handler()(upload(), ctx))
+    expect(status).toBe(403)
+    expect(body.error.code).toBe('UNDERLAG_UPLOAD_DISABLED')
+    expect(uploadDocument).not.toHaveBeenCalled()
+    expect(kopplaTillTransaktion).not.toHaveBeenCalled()
+    const list = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(list.body.data.pending_count).toBe(0)
+  })
+
+  it('tells the workspace whether the upload answer is switched on', async () => {
+    const ctx = buildCtx()
+    const on = await parseJsonResponse<{ data: { underlag_upload_enabled: boolean } }>(await route('GET', '/').handler(get('/'), ctx))
+    expect(on.body.data.underlag_upload_enabled).toBe(true)
+    delete process.env.UNDERLAGSJAKT_UPLOAD_ENABLED
+    const off = await parseJsonResponse<{ data: { underlag_upload_enabled: boolean } }>(await route('GET', '/').handler(get('/'), ctx))
+    expect(off.body.data.underlag_upload_enabled).toBe(false)
+  })
+
+  it('files the document, records the answer and hands bertil the reference: the reported case', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+
+    const { status, body } = await parseJsonResponse<{ data: { koppling: string; beslut: { svarstyp: string } } }>(
+      await handler()(upload(), ctx),
+    )
+    expect(status).toBe(200)
+    expect(body.data.koppling).toBe('kopplad')
+    expect(body.data.beslut.svarstyp).toBe('uppladdat_underlag')
+
+    // The upload went to the archive under this user and company, deduplicated, without AI extraction.
+    expect(uploadDocument).toHaveBeenCalledWith(
+      ctx.supabase,
+      'user-1',
+      'company-1',
+      expect.objectContaining({ name: 'kvitto.pdf', type: 'application/pdf' }),
+      expect.objectContaining({ dedupeByContent: true, extractionOwner: 'none' }),
+    )
+    // ...and was pinned to the transaction bertil is asking about.
+    expect(kopplaTillTransaktion).toHaveBeenCalledWith(ctx.supabase, 'company-1', 'tx-ocr-20260812', 'doc-1')
+
+    // The post leaves the open list and is waiting for bertil, carrying the file reference.
+    const list = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(list.body.data.posts.map((p) => p.transaction_id)).not.toContain('tx-ocr-20260812')
+    expect(list.body.data.pending_count).toBe(1)
+    const file = await (await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx)).json()
+    expect(file.version).toBe('1.5')
+    expect(file.beslut).toEqual([
+      expect.objectContaining({
+        transaction_id: 'tx-ocr-20260812',
+        svarstyp: 'uppladdat_underlag',
+        dokument_id: 'doc-1',
+        filnamn: 'kvitto.pdf',
+        sha256: 'b'.repeat(64),
+        storage_path: 'documents/company-1/user-1/1_kvitto.pdf',
+        kalla: 'gnubok_uppladdning',
+        motpart: 'OCR-betalning',
+        kategori: 'leverantor',
+        bas_konto: null,
+        momstyp: null,
+      }),
+    ])
+  })
+
+  it('is offered to bertil by the machine path like any other answer', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    await handler()(upload(), ctx)
+    const { svar } = await (await import('../lib/store')).loadState(ctx.settings)
+    expect((await import('../lib/store')).pendingBeslut(svar).map((b) => b.svarstyp)).toEqual(['uppladdat_underlag'])
+  })
+
+  it('accepts a phone photo (HEIC) as well as a PDF', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const res = await handler()(upload({ file: new File([new Uint8Array(16)], 'IMG_1.heic', { type: 'image/heic' }) }), ctx)
+    expect(res.status).toBe(200)
+  })
+
+  it.each([
+    ['no file', { file: null }, 'UNDERLAG_FILE_MISSING'],
+    ['an empty file', { file: new File([], 'tom.pdf', { type: 'application/pdf' }) }, 'UNDERLAG_FILE_MISSING'],
+    ['a type that is not a document or photo', { file: new File(['x'], 'a.exe', { type: 'application/x-msdownload' }) }, 'UNDERLAG_UNSUPPORTED_TYPE'],
+    ['missing motpart', { fields: { motpart: '' } }, 'VALIDATION_ERROR'],
+    ['an unknown kategori', { fields: { kategori: 'nonsens' } }, 'VALIDATION_ERROR'],
+    ['an account number that is not four digits', { fields: { bas_konto: 'abc' } }, 'VALIDATION_ERROR'],
+    ['no transaction_id', { fields: { transaction_id: undefined } }, 'VALIDATION_ERROR'],
+  ])('returns 400 for %s, and stores nothing', async (_name, over, code) => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await handler()(upload(over as Parameters<typeof upload>[0]), ctx),
+    )
+    expect(status).toBe(400)
+    expect(body.error.code).toBe(code)
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 for a file over the size limit before it is read into the archive', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const big = new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'stor.pdf', { type: 'application/pdf' })
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(await handler()(upload({ file: big }), ctx))
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('UNDERLAG_TOO_LARGE')
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 for a transaction that is not in the imported export, without filing the document', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const res = await handler()(upload({ fields: { transaction_id: 'nope' } }), ctx)
+    expect(res.status).toBe(404)
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('returns 409 without filing the document when bertil already has the answer', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    expect((await handler()(upload(), ctx)).status).toBe(200)
+    // Offered answers cannot be replaced: mark this one offered directly.
+    const svar = store.get('svar') as Record<string, { erbjudet_at: string | null }>
+    svar['tx-ocr-20260812'].erbjudet_at = '2026-09-21T10:00:00.000Z'
+    store.set('svar', svar)
+    uploadDocument.mockClear()
+    const res = await handler()(upload(), ctx)
+    expect(res.status).toBe(409)
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('records no answer when the document cannot be archived, so bertil is never told about a file that is not there', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    uploadDocument.mockRejectedValue(new Error('Failed to upload document: storage down'))
+    const res = await handler()(upload(), ctx)
+    expect(res.status).toBe(500)
+    expect((await res.json()).error.code).toBe('UNDERLAG_UPLOAD_FAILED')
+    const list = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
+    expect(list.body.data.posts.map((p) => p.transaction_id)).toContain('tx-ocr-20260812')
+    expect(list.body.data.pending_count).toBe(0)
+  })
+
+  it('maps a file whose bytes do not match its declared type to 400', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    uploadDocument.mockRejectedValue(new Error('Filinnehållet matchar inte den angivna filtypen (förväntade application/pdf, hittade image/png).'))
+    const res = await handler()(upload(), ctx)
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.code).toBe('UNDERLAG_INVALID_CONTENT')
+  })
+
+  it('keeps the answer and reports it when no Accounted transaction could be pinned', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    kopplaTillTransaktion.mockResolvedValue('ingen_transaktion')
+    const { status, body } = await parseJsonResponse<{ data: { koppling: string } }>(await handler()(upload(), ctx))
+    expect(status).toBe(200)
+    expect(body.data.koppling).toBe('ingen_transaktion')
+  })
+
+  it('does not accept an uploaded-underlag answer through the JSON route', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const res = await route('POST', '/svar').handler(post('/svar', { ...fields, svarstyp: 'uppladdat_underlag', begransa_bolag: false, begransa_belopp: false }), ctx)
+    expect(res.status).toBe(400)
   })
 })

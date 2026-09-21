@@ -26,8 +26,18 @@ export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
 export const MAX_SUPPORTED_EXPORT_VERSION = '1.4'
 /** Export versions this extension has been built and tested against, for error messages. */
 export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
-/** Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only. */
+/**
+ * Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only.
+ * A file with no upload in it stays 1.4, so a reader that predates 1.5 keeps
+ * ingesting every answer it always did.
+ */
 export const ANSWER_VERSION = '1.4'
+/**
+ * 1.5 adds the `uppladdat_underlag` svarstyp (a document the user uploaded in
+ * Accounted). Written only to a file that actually holds one: that is the only
+ * file a 1.4 reader cannot understand.
+ */
+export const ANSWER_VERSION_UPLOAD = '1.5'
 
 /** `SVARSKATEGORIER` in bertil. */
 export const KATEGORIER = [
@@ -52,6 +62,22 @@ export type Momstyp = (typeof MOMSTYPER)[number]
  */
 export const REGLERINGAR = ['vidarefakturera', 'mellanhavande'] as const
 export type Reglering = (typeof REGLERINGAR)[number]
+
+/**
+ * What a person actually holds: a PDF or a photo of the receipt. HEIC/HEIF
+ * because that is what an iPhone produces by default.
+ */
+export const UNDERLAG_UPLOAD_MIME_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+] as const
+
+/** `kalla` on an uploaded underlag beslut: where the document came from, in bertil's vocabulary. */
+export const UPPLADDAT_KALLA = 'gnubok_uppladdning'
 
 export const POST_KATEGORIER = ['behover_mattias', 'tvetydig', 'fel_bolag'] as const
 
@@ -242,6 +268,27 @@ export type Beslut =
       till_bolag: string | null
       reglering?: Reglering | null
     }
+  | {
+      answer_id: string
+      transaction_id: string
+      svarstyp: 'uppladdat_underlag'
+      /** The stored document (document_attachments.id in Accounted). */
+      dokument_id: string
+      filnamn: string
+      /** sha256 of the stored bytes, computed server-side: the same hash bertil uses for candidates. */
+      sha256: string
+      mime_type: string | null
+      /** Key in Accounted's `documents` storage bucket. */
+      storage_path: string
+      kalla: typeof UPPLADDAT_KALLA
+      motpart: string
+      kategori: Kategori
+      bas_konto: string | null
+      momstyp: Momstyp | null
+      bolag: string | null
+      bankkonto: string | null
+      belopp: number | null
+    }
   | { answer_id: string; transaction_id: string; svarstyp: 'osaker' }
 
 /** What the workspace sends for one post. Validated against the stored post before it becomes a Beslut. */
@@ -278,6 +325,59 @@ export const svarInputSchema = z.discriminatedUnion('svarstyp', [
   }),
 ])
 export type SvarInput = z.infer<typeof svarInputSchema>
+
+/**
+ * "I have the document": the classification half of an uploaded-underlag
+ * answer. The file itself travels as multipart alongside these fields (see
+ * POST /svar/underlag), so this is deliberately NOT part of `svarInputSchema`:
+ * a JSON answer without a file must never be able to claim one.
+ */
+export const uppladdatInputSchema = z.object({
+  svarstyp: z.literal('uppladdat_underlag'),
+  transaction_id: z.string().min(1),
+  motpart: z.string().trim().min(1),
+  kategori: z.enum(KATEGORIER),
+  bas_konto: accountNumberSchema.nullable(),
+  momstyp: z.enum(MOMSTYPER).nullable(),
+  begransa_bolag: z.boolean(),
+  begransa_belopp: z.boolean(),
+})
+export type UppladdatInput = z.infer<typeof uppladdatInputSchema>
+
+/** The stored document an uploaded-underlag answer points at. */
+export interface UppladdatDokument {
+  id: string
+  filnamn: string
+  sha256: string
+  mime_type: string | null
+  storage_path: string
+}
+
+export function buildUppladdatBeslut(
+  post: Post,
+  input: UppladdatInput,
+  dokument: UppladdatDokument,
+  answerId: string,
+): Extract<Beslut, { svarstyp: 'uppladdat_underlag' }> {
+  return {
+    answer_id: answerId,
+    transaction_id: post.transaction_id,
+    svarstyp: 'uppladdat_underlag',
+    dokument_id: dokument.id,
+    filnamn: dokument.filnamn,
+    sha256: dokument.sha256.toLowerCase(),
+    mime_type: dokument.mime_type,
+    storage_path: dokument.storage_path,
+    kalla: UPPLADDAT_KALLA,
+    motpart: input.motpart,
+    kategori: input.kategori,
+    bas_konto: input.bas_konto,
+    momstyp: input.momstyp,
+    bolag: input.begransa_bolag ? post.bolag : null,
+    bankkonto: null,
+    belopp: input.begransa_belopp ? post.belopp : null,
+  }
+}
 
 export type BuildBeslutResult =
   | { ok: true; beslut: Beslut; reglering: Reglering | null }
@@ -348,5 +448,6 @@ export function buildBeslut(
 export function buildAnswerFile(
   beslut: Beslut[],
 ): { version: string; beslut: Beslut[] } {
-  return { version: ANSWER_VERSION, beslut }
+  const hasUpload = beslut.some((b) => b.svarstyp === 'uppladdat_underlag')
+  return { version: hasUpload ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION, beslut }
 }
