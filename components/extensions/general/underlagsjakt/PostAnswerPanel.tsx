@@ -37,6 +37,8 @@ import {
   interpretSaveResult,
 } from './shared'
 
+import { suggestAnswerAccount } from './account-suggestion'
+
 type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
 
 const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
@@ -66,7 +68,12 @@ export function PostAnswerPanel({
   const [chosen, setChosen] = useState<string | undefined>(undefined)
   const [motpart, setMotpart] = useState(post.motpart)
   const [kategori, setKategori] = useState<Kategori | undefined>(suggestedKategori)
-  const [basKonto, setBasKonto] = useState(post.forslag?.bas_konto ?? '')
+  const [basKontoOverride, setBasKontoOverride] = useState<string | undefined>(undefined)
+  const suggestedAccount = suggestAnswerAccount(kategori, post.belopp, post.motpart)
+  const [categoryChanged, setCategoryChanged] = useState(false)
+  const basKonto = basKontoOverride ?? (!categoryChanged ? post.forslag?.bas_konto : null) ?? suggestedAccount
+  const isAccountSuggestion = basKontoOverride === undefined && basKonto !== ''
+  const optionalSuffix = useTranslations('settings_booking_templates')('optional_suffix')
   const [momstyp, setMomstyp] = useState<Momstyp | null>(suggestedMomstyp)
   const [begransaBolag, setBegransaBolag] = useState(false)
   const [begransaBelopp, setBegransaBelopp] = useState(false)
@@ -204,38 +211,47 @@ export function PostAnswerPanel({
             </div>
             <div className="space-y-2">
               <Label>{t('field_kategori')}</Label>
-              <Select value={kategori} onValueChange={(v) => setKategori(v as Kategori)}>
+              <Select value={kategori} onValueChange={(v) => {
+                setKategori(v as Kategori)
+                setCategoryChanged(true)
+              }}>
                 <SelectTrigger aria-label={t('field_kategori')}>
                   <SelectValue>{kategori ? t(`kategori_${kategori}`) : t('field_kategori_choose')}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {KATEGORIER.map((k) => (
                     <SelectItem key={k} value={k}>
-                      {t(`kategori_${k}`)}
+                      {t(`kategori_option_${k}`)}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')}</Label>
+              <Label htmlFor={`bas-${post.transaction_id}`}>{t('field_bas_konto')} {optionalSuffix}</Label>
               <Input
                 id={`bas-${post.transaction_id}`}
                 inputMode="numeric"
                 maxLength={4}
                 value={basKonto}
-                onChange={(e) => setBasKonto(e.target.value)}
+                onChange={(e) => setBasKontoOverride(e.target.value)}
                 aria-invalid={!basKontoValid}
+                aria-describedby={isAccountSuggestion ? `bas-suggestion-${post.transaction_id}` : undefined}
               />
+              {isAccountSuggestion && (
+                <p id={`bas-suggestion-${post.transaction_id}`} className="text-xs text-muted-foreground">
+                  {t('field_bas_konto_suggestion')}
+                </p>
+              )}
               {!basKontoValid && <p className="text-xs text-destructive">{t('field_bas_konto_invalid')}</p>}
             </div>
             <div className="space-y-2">
-              <Label>{t('field_momstyp')}</Label>
+              <Label>{t('field_momstyp')} {optionalSuffix}</Label>
               <Select
                 value={momstyp ?? NONE}
                 onValueChange={(v) => setMomstyp(v === NONE ? null : (v as Momstyp))}
               >
-                <SelectTrigger aria-label={t('field_momstyp')}>
+                <SelectTrigger aria-label={`${t('field_momstyp')} ${optionalSuffix}`}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

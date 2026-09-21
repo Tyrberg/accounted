@@ -36,7 +36,7 @@ export interface WorkspaceData {
   bolag_choices: string[]
 }
 
-type T = (key: string, values?: Record<string, string | number>) => string
+export type T = (key: string, values?: Record<string, string | number>) => string
 
 const KNOWN_ERROR_CODES = new Set([
   'INVALID_JSON',

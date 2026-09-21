@@ -1,3 +1,6 @@
+import { createTranslator } from 'next-intl'
+import sv from '@/messages/sv.json'
+import en from '@/messages/en.json'
 import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -11,6 +14,7 @@ import {
   buildAnswerInput,
   deriveTillBolag,
   interpretSaveResult,
+  type T,
 } from '../shared'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
@@ -221,6 +225,14 @@ const t = (key: string, values?: Record<string, string | number>) =>
   key === 'kategori_bankavgift' ? 'Bankavgift' : `${key}:${JSON.stringify(values ?? {})}`
 
 describe('answerSummary', () => {
+  it.each(['sv', 'en'] as const)('keeps option examples out of summaries and toasts in %s', (locale) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    const summary = answerSummary(translate, SVAR_RECORD)
+    expect(summary).toContain(`(${messages.underlagsjakt.kategori_bankavgift})`)
+    expect(summary).not.toContain(messages.underlagsjakt.kategori_option_bankavgift)
+    expect(interpretSaveResult(translate, true, { data: SVAR_RECORD }).toast.description).toBe(summary)
+  })
   it('describes a val_kandidat save without a chosen document', () => {
     expect(answerSummary(t, SVAR_RECORD)).toContain('Banken')
   })
