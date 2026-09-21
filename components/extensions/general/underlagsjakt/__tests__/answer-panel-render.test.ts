@@ -1,5 +1,5 @@
-import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { createElement } from 'react'
 import { NextIntlClientProvider } from 'next-intl'
 import { describe, expect, it } from 'vitest'
 import sv from '@/messages/sv.json'
@@ -14,10 +14,17 @@ function renderPanel(locale: 'sv' | 'en', account: string | null = null) {
     kategori: 'behover_mattias',
     forslag: { kategori: 'bankavgift', bas_konto: account, momstyp: null, varfor: '' },
   }
-  return renderToStaticMarkup(createElement(NextIntlClientProvider, {
-    locale, messages: locale === 'sv' ? sv : en, timeZone: 'Europe/Stockholm',
-    children: createElement(PostAnswerPanel, { post, bolagChoices: [], onAnswered: async () => {} }),
-  }))
+  return renderToStaticMarkup(
+    createElement(
+      NextIntlClientProvider,
+      {
+        locale,
+        messages: locale === 'sv' ? sv : en,
+        timeZone: 'Europe/Stockholm',
+      } as unknown as Parameters<typeof NextIntlClientProvider>[0],
+      createElement(PostAnswerPanel, { post, bolagChoices: [], onAnswered: async () => {} })
+    )
+  )
 }
 
 describe('answer panel initial render', () => {

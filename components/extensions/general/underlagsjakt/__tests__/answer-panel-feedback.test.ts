@@ -14,6 +14,7 @@ import {
   buildAnswerInput,
   deriveTillBolag,
   interpretSaveResult,
+  type T,
 } from '../shared'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
@@ -223,7 +224,7 @@ const t = (key: string, values?: Record<string, string | number>) =>
 describe('answerSummary', () => {
   it.each(['sv', 'en'] as const)('keeps option examples out of summaries and toasts in %s', (locale) => {
     const messages = locale === 'sv' ? sv : en
-    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' })
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
     const summary = answerSummary(translate, SVAR_RECORD)
     expect(summary).toContain(`(${messages.underlagsjakt.kategori_bankavgift})`)
     expect(summary).not.toContain(messages.underlagsjakt.kategori_option_bankavgift)
