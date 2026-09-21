@@ -101,7 +101,7 @@ npm run skills:generate  # Regenerate agent_atom_registry seed after editing an 
 
 ## Testing
 
-Vitest 4, `node` env, tests in `__tests__/`, scope `lib/` + `app/api/` (no component/E2E tests). Helpers in `tests/helpers.ts`: `createMockSupabase()`, `createQueuedMockSupabase()`, `createMockRequest()`, `parseJsonResponse()`, plus fixture factories (`makeTransaction`, `makeJournalEntry`, `makeInvoice`, …). `vi.clearAllMocks()` + `eventBus.clear()` in `beforeEach`. Trigger/RPC/RLS behavior is tested in `*.pg.test.ts` against real Postgres, not with mocks.
+Vitest 4, `node` env, tests in `__tests__/`, scope `lib/` + `app/api/` + component rendering. Rendering tests use `renderToStaticMarkup` from react-dom/server (no browser environment needed); no E2E tests. Helpers in `tests/helpers.ts`: `createMockSupabase()`, `createQueuedMockSupabase()`, `createMockRequest()`, `parseJsonResponse()`, plus fixture factories (`makeTransaction`, `makeJournalEntry`, `makeInvoice`, …). `vi.clearAllMocks()` + `eventBus.clear()` in `beforeEach`. Trigger/RPC/RLS behavior is tested in `*.pg.test.ts` against real Postgres, not with mocks.
 
 ## Detail Loads On Demand
 

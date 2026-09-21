@@ -34,7 +34,7 @@ import {
   UNKNOWN,
   buildAnswerInput,
   deriveTillBolag,
-  interpretSaveResult,
+  submitAnswer,
 } from './shared'
 
 import { suggestAnswerAccount } from './account-suggestion'
@@ -126,20 +126,7 @@ export function PostAnswerPanel({
     if (!input) return
     setSaving(true)
     try {
-      const res = await fetch('/api/extensions/ext/underlagsjakt/svar', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
-      })
-      const json: unknown = await res.json().catch(() => null)
-      const outcome = interpretSaveResult(t, res.ok, json)
-      toast(outcome.toast)
-      if (outcome.refresh) await onAnswered()
-    } catch {
-      // fetch rejected (offline, connection reset, ...) or the success body was
-      // malformed: no response reached interpretSaveResult, so treat it the same
-      // as a failed save rather than leaving the user without any feedback.
-      toast(interpretSaveResult(t, false, null).toast)
+      await submitAnswer(input, t, (outcome) => toast(outcome.toast), onAnswered)
     } finally {
       setSaving(false)
     }
