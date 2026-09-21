@@ -217,3 +217,26 @@ export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutco
     refresh: true,
   }
 }
+
+/** Submit an answer to the API and handle the outcome. Extracted for testability. */
+export async function submitAnswer(
+  input: SvarInput,
+  t: T,
+  onOutcome: (outcome: SaveOutcome) => void,
+  onAnswered: () => Promise<void>,
+  fetchFn?: typeof fetch,
+): Promise<void> {
+  try {
+    const res = await (fetchFn || fetch)('/api/extensions/ext/underlagsjakt/svar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    const json: unknown = await res.json().catch(() => null)
+    const outcome = interpretSaveResult(t, res.ok, json)
+    onOutcome(outcome)
+    if (outcome.refresh) await onAnswered()
+  } catch {
+    onOutcome(interpretSaveResult(t, false, null))
+  }
+}
