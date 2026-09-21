@@ -17,7 +17,7 @@ const unitProject = {
     name: 'unit',
     globals: true,
     environment: 'node' as const,
-    include: ['**/*.test.ts'],
+    include: ['**/*.test.ts', '**/*.test.tsx'],
     // `.claude/worktrees/*` are ephemeral agent checkouts whose `@/*` imports
     // resolve back to this root: never part of the suite.
     // Two additions to the exclude list, both learned the hard way:

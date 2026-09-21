@@ -1613,3 +1613,4 @@ One line per decision: `[YYYY-MM-DD] <decision>: <why>`. Appended by agents and 
 - Withdrawal guarded on `erbjudet_at === null`: answers that have been offered to bertil cannot be withdrawn, even if not yet acknowledged (state: answered→offered→(in flight)→delivered).
 - Added `status_offered` UI state to distinguish "answered but not yet offered" from "offered and waiting for bertil to acknowledge."
 - Production test data (vakten's test answer for d7533061..., HI3G rule) already cleaned up by vakten 2026-09-20; extension_data key='svar' is {} and rule is removed from knowledge_cache.json.
+[2026-09-21] Answer panel tested by rendering in jsdom (RTL + user-event, declared with @testing-library/dom and jsdom as devDependencies), not by Playwright and not by source-text matching: a browser driver is too large a fork deviation, and the Save-button behavior only needs a DOM. jest-dom was not added; plain DOM assertions avoid one more dependency.
