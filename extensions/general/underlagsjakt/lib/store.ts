@@ -11,7 +11,7 @@
  * `loadState` / `saveSvar` / `saveExport` are the only I/O.
  */
 import type { ExtensionSettings } from '@/lib/extensions/types'
-import type { Beslut, ParsedExport, Post, Reglering, Sammanstallning } from './contract'
+import { motpartRegelNyckel, type Beslut, type ParsedExport, type Post, type Reglering, type Sammanstallning } from './contract'
 
 export const EXPORT_KEY = 'export'
 export const SVAR_KEY = 'svar'
@@ -104,6 +104,27 @@ export function findPost(exp: StoredExport | null, transactionId: string): Post 
 /** Unanswered posts: no answer record exists. */
 export function openPosts(exp: StoredExport | null, svar: SvarMap): Post[] {
   return allPosts(exp).filter((p) => !svar[p.transaction_id])
+}
+
+/**
+ * The posts one "I will deliver it myself" answer covers when applied to a whole
+ * motpart, given the currently open posts and the post being answered.
+ *
+ * The single definition, called by the browser (to show the count) and by the
+ * server (to recount before writing): a post is covered when its motpart has
+ * the same rule key (`motpartRegelNyckel`) as the anchor's. A `fel_bolag` post
+ * is never swept in, and a blank motpart matches nothing but the anchor.
+ * Undercounting is safe, clearing a post the rule does not cover is not. The
+ * anchor itself counts when it is still open.
+ */
+export function bulkTargets(open: Post[], anchor: Post): Post[] {
+  const key = motpartRegelNyckel(anchor.motpart)
+  const blank = anchor.motpart.trim() === ''
+  return open.filter(
+    (p) =>
+      p.transaction_id === anchor.transaction_id ||
+      (!blank && p.kategori !== 'fel_bolag' && motpartRegelNyckel(p.motpart) === key),
+  )
 }
 
 /**
@@ -250,6 +271,55 @@ export function felBolagRows(svar: SvarMap): FelBolagRow[] {
       reglering: rec.reglering,
       besvarad_at: rec.besvarad_at,
       levererad_at: rec.levererad_at,
+    })
+  }
+  return rows.sort((a, b) => b.besvarad_at.localeCompare(a.besvarad_at))
+}
+
+/**
+ * How long a promised document may stay unfound before it counts as overdue
+ * (the alarm in leverans-status.ts and the marking in the workspace). One
+ * constant on purpose: the right limit is still an open question, and it is
+ * changed here and nowhere else.
+ */
+export const MAX_WAITING_DAYS = 14
+
+/**
+ * bertil found the documents of these posts on the usual place: a promised
+ * (`levererar_sjalv`) post moves from waiting to "with document" by stamping
+ * `underlag_hittat_at` on its answer, nobody is asked again. Ids without a
+ * waiting answer, and answers already stamped, are left untouched.
+ */
+export function markUnderlagHittat(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
+  const next = { ...svar }
+  for (const id of transactionIds) {
+    const rec = next[id]
+    if (rec && rec.beslut.svarstyp === 'levererar_sjalv' && rec.beslut.underlag_hittat_at === null) {
+      next[id] = { ...rec, beslut: { ...rec.beslut, underlag_hittat_at: now } }
+    }
+  }
+  return next
+}
+
+export interface WaitingRow {
+  transaction_id: string
+  post: PostSnapshot
+  motpart: string
+  besvarad_at: string
+  underlag_hittat_at: string | null
+}
+
+/** Posts where the user promised to deliver the document themselves, waiting for bertil to confirm receipt. */
+export function waitingRows(svar: SvarMap): WaitingRow[] {
+  const rows: WaitingRow[] = []
+  for (const [id, rec] of Object.entries(svar)) {
+    if (rec.beslut.svarstyp !== 'levererar_sjalv') continue
+    rows.push({
+      transaction_id: id,
+      post: rec.post,
+      motpart: rec.beslut.motpart,
+      besvarad_at: rec.besvarad_at,
+      underlag_hittat_at: rec.beslut.underlag_hittat_at,
     })
   }
   return rows.sort((a, b) => b.besvarad_at.localeCompare(a.besvarad_at))

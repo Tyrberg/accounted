@@ -1,5 +1,5 @@
 import type { Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
-import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
+import type { FelBolagRow, SvarRecord, WaitingRow } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
 export interface WorkspaceData {
@@ -7,6 +7,8 @@ export interface WorkspaceData {
   answer_version: string
   /** Whether the "I have the document" answer is switched on (bertil reads answer version 1.5). */
   underlag_upload_enabled: boolean
+  /** Whether the "I'll deliver it myself" answer is switched on (bertil understands levererar_sjalv). */
+  levererar_sjalv_enabled: boolean
   /** Whether bertil's delivery lands in the company being viewed, not merely somewhere on this box. */
   leverans: { till_detta_bolag: boolean }
   export: {
@@ -35,6 +37,7 @@ export interface WorkspaceData {
   answered: (SvarRecord & { transaction_id: string })[]
   pending_count: number
   fel_bolag: FelBolagRow[]
+  waiting: WaitingRow[]
   bolag_choices: string[]
 }
 
@@ -55,6 +58,8 @@ const KNOWN_ERROR_CODES = new Set([
   'UNDERLAG_UPLOAD_FAILED',
   'ALREADY_DELIVERED',
   'NOT_FOUND',
+  'COUNT_CHANGED',
+  'FEATURE_DISABLED',
 ])
 
 /** Map an API error body to a translated sentence. */
@@ -100,7 +105,7 @@ export function deriveTillBolag(tillBolagChoice: string | undefined, externalBol
 }
 
 export interface AnswerFormState {
-  mode: 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'osaker'
+  mode: 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'osaker'
   transactionId: string
   /** The file chosen in uppladdat_underlag mode; undefined until one is picked. */
   file?: File
@@ -113,6 +118,8 @@ export interface AnswerFormState {
   momstyp: Momstyp | null
   begransaBolag: boolean
   begransaBelopp: boolean
+  /** Apply the levererar_sjalv answer to all posts from this vendor. Only relevant in levererar_sjalv mode. */
+  applyToAllVendor?: boolean
   /** Raw radio choice for "which company": a company name, EXTERNAL, UNKNOWN, or undefined (nothing picked). Only relevant in fel_bolag mode. */
   tillBolagChoice?: string
   externalBolag?: string
@@ -139,6 +146,17 @@ export type AnswerFormResult =
 export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
   const transaction_id = state.transactionId
   if (state.mode === 'osaker') return { input: { svarstyp: 'osaker', transaction_id } }
+
+  if (state.mode === 'levererar_sjalv') {
+    if (!state.motpart.trim()) return { missing: ['missing_motpart'] }
+    return {
+      input: {
+        svarstyp: 'levererar_sjalv',
+        transaction_id,
+        motpart: state.motpart.trim(),
+      },
+    }
+  }
 
   if (state.mode === 'fel_bolag') {
     const tillBolag = deriveTillBolag(state.tillBolagChoice, state.externalBolag ?? '')
@@ -215,6 +233,11 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
 export function answerSummary(t: T, rec: SvarRecord): string {
   const b = rec.beslut
   if (b.svarstyp === 'osaker') return t('answer_osaker')
+  if (b.svarstyp === 'levererar_sjalv') {
+    return b.underlag_hittat_at
+      ? t('answer_levererar_sjalv_delivered', { motpart: b.motpart })
+      : t('answer_levererar_sjalv_waiting', { motpart: b.motpart })
+  }
   if (b.svarstyp === 'fel_bolag') {
     return t('answer_fel_bolag', { bolag: b.till_bolag ?? t('unknown_company'), mottagare: b.fel_bolag_mottagare })
   }
@@ -259,6 +282,7 @@ export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutco
 }
 
 const SVAR_URL = '/api/extensions/ext/underlagsjakt/svar'
+const BULK_SVAR_URL = '/api/extensions/ext/underlagsjakt/svar/bulk'
 
 /**
  * An uploaded underlag travels as multipart, the file next to the answer's own
@@ -275,6 +299,44 @@ export function buildUppladdatForm(input: UppladdatInput, file: File): FormData 
   form.set('begransa_bolag', String(input.begransa_bolag))
   form.set('begransa_belopp', String(input.begransa_belopp))
   return form
+}
+
+/**
+ * Apply "I will deliver it myself" to every payment from the answered post's
+ * motpart. `promisedCount` is the number the user saw and confirmed
+ * (`bulkTargets(...).length`); the server recounts and refuses on a mismatch,
+ * in which case the list is reloaded so the new count can be confirmed again.
+ */
+export async function submitBulkAnswer(
+  input: Extract<SvarInput, { svarstyp: 'levererar_sjalv' }>,
+  promisedCount: number,
+  t: T,
+  onOutcome: (outcome: SaveOutcome) => void,
+  onAnswered: () => Promise<void>,
+  fetchFn?: typeof fetch,
+): Promise<void> {
+  try {
+    const res = await (fetchFn || fetch)(BULK_SVAR_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...input, bekrafta_antal: promisedCount }),
+    })
+    const json: unknown = await res.json().catch(() => null)
+    if (res.ok) {
+      const recorded = (json as { data?: { recorded?: number } } | null)?.data?.recorded ?? promisedCount
+      onOutcome({
+        toast: { title: t('save_success'), description: t('levererar_sjalv_bulk_saved', { count: recorded, motpart: input.motpart }) },
+        refresh: true,
+      })
+      await onAnswered()
+      return
+    }
+    onOutcome(interpretSaveResult(t, false, json))
+    const code = (json as { error?: { code?: unknown } } | null)?.error?.code
+    if (code === 'COUNT_CHANGED') await onAnswered()
+  } catch {
+    onOutcome(interpretSaveResult(t, false, null))
+  }
 }
 
 /**

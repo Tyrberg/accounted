@@ -19,6 +19,7 @@ import {
   deriveTillBolag,
   interpretSaveResult,
   submitAnswer,
+  submitBulkAnswer,
   type SaveOutcome,
   type T,
 } from '../shared'
@@ -240,6 +241,94 @@ describe('submitAnswer: uppladdat_underlag', () => {
   })
 })
 
+describe('levererar_sjalv: "I will deliver the underlag myself"', () => {
+  const BASE = { ...BASE_VAL_KANDIDAT, mode: 'levererar_sjalv' as const }
+  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'HI3G' }
+
+  it('needs only a motpart: no candidate, kategori or BAS account', () => {
+    expect(buildAnswerInput({ ...BASE, hasCandidate: false, motpart: 'HI3G' })).toEqual({ input })
+    expect(buildAnswerInput({ ...BASE, motpart: '  ' })).toEqual({ missing: ['missing_motpart'] })
+  })
+
+  it.each(['sv', 'en'] as const)('is summarized as waiting, never as "no underlag needed", and as found once bertil says so, in %s', (locale) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    const rec = (hittat: string | null) =>
+      ({ ...SVAR_RECORD, beslut: { answer_id: 'a', transaction_id: 't1', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: hittat } }) as SvarRecord
+    const waiting = answerSummary(translate, rec(null))
+    const found = answerSummary(translate, rec('2026-09-30T00:00:00Z'))
+    expect(waiting).toContain('HI3G')
+    expect(found).toContain('HI3G')
+    expect(waiting).not.toBe(found)
+    expect(waiting).toBe(translate('answer_levererar_sjalv_waiting', { motpart: 'HI3G' }))
+    expect(waiting).not.toBe(answerSummary(translate, { ...SVAR_RECORD, beslut: { answer_id: 'a', transaction_id: 't1', svarstyp: 'osaker' } } as SvarRecord))
+  })
+})
+
+describe('the count shown before the user confirms', () => {
+  it.each([
+    ['sv', 1, '1 post'],
+    ['sv', 7, '7 poster'],
+    ['en', 1, '1 item'],
+    ['en', 7, '7 items'],
+  ] as const)('says how many posts it removes in %s for %i', (locale, count, expected) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    expect(translate('levererar_sjalv_count', { count })).toContain(expected)
+  })
+})
+
+describe('submitBulkAnswer', () => {
+  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'HI3G' }
+  const respond = (ok: boolean, body: unknown) => vi.fn().mockResolvedValue({ ok, json: async () => body })
+
+  it('posts the anchor answer and the promised count to /svar/bulk, and names no other post', async () => {
+    const mockFetch = respond(true, { data: { recorded: 7, transaction_ids: [] } })
+    const onAnswered = vi.fn(async () => {})
+    const outcomes: SaveOutcome[] = []
+
+    await submitBulkAnswer(input, 7, t, (o) => outcomes.push(o), onAnswered, mockFetch as unknown as typeof fetch)
+
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(url).toBe('/api/extensions/ext/underlagsjakt/svar/bulk')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ ...input, bekrafta_antal: 7 })
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0].toast.variant).toBeUndefined()
+    expect(outcomes[0].toast.description).toBe('levererar_sjalv_bulk_saved:{"count":7,"motpart":"HI3G"}')
+    expect(outcomes[0].refresh).toBe(true)
+    expect(onAnswered).toHaveBeenCalledTimes(1)
+  })
+
+  it('reloads the list on COUNT_CHANGED so the new count can be confirmed, and says so as an error', async () => {
+    const mockFetch = respond(false, { error: { code: 'COUNT_CHANGED', antal: 6 } })
+    const onAnswered = vi.fn(async () => {})
+    const outcomes: SaveOutcome[] = []
+    await submitBulkAnswer(input, 7, t, (o) => outcomes.push(o), onAnswered, mockFetch as unknown as typeof fetch)
+    expect(outcomes[0].toast.variant).toBe('destructive')
+    expect(outcomes[0].toast.description).toBe('error_COUNT_CHANGED:{}')
+    expect(onAnswered).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the list as it is on any other refusal', async () => {
+    const mockFetch = respond(false, { error: { code: 'FEATURE_DISABLED' } })
+    const onAnswered = vi.fn()
+    const outcomes: SaveOutcome[] = []
+    await submitBulkAnswer(input, 7, t, (o) => outcomes.push(o), onAnswered, mockFetch as unknown as typeof fetch)
+    expect(outcomes[0].toast.description).toBe('error_FEATURE_DISABLED:{}')
+    expect(outcomes[0].refresh).toBe(false)
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('treats a network error as a failed save', async () => {
+    const onAnswered = vi.fn()
+    const outcomes: SaveOutcome[] = []
+    await submitBulkAnswer(input, 7, t, (o) => outcomes.push(o), onAnswered, vi.fn().mockRejectedValue(new Error('offline')) as unknown as typeof fetch)
+    expect(outcomes[0].toast.variant).toBe('destructive')
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+})
+
 describe('deriveTillBolag', () => {
   it('is undefined when nothing is chosen yet', () => {
     expect(deriveTillBolag(undefined, '')).toBeUndefined()
@@ -408,7 +497,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
     tvetydiga_alternativ: [],
   }
 
-  function renderPanel(postOverride?: Partial<Post>, bolagChoices?: string[], uploadEnabled = true) {
+  function renderPanel(postOverride?: Partial<Post>, bolagChoices?: string[], uploadEnabled = true, leverarSjalvEnabled = false) {
     let finalPost: Post = post
     if (postOverride?.forslag) {
       const baseForslag = post.forslag || { kategori: '', varfor: '', bas_konto: null, momstyp: null }
@@ -435,7 +524,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
           messages: sv,
           timeZone: 'Europe/Stockholm',
         } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-        createElement(PostAnswerPanel, { post: finalPost, bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, onAnswered: async () => {} })
+        createElement(PostAnswerPanel, { post: finalPost, posts: [finalPost], bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, leverarSjalvEnabled, onAnswered: async () => {} })
       )
     )
   }
@@ -468,6 +557,17 @@ describe('PostAnswerPanel: rendered correctly', () => {
     expect(html).not.toContain('Ladda upp dokumentet här')
     expect(html).not.toContain('Ladda upp underlag')
     expect(html).toContain('Gäller annat bolag')
+  })
+
+  it('offers "I will deliver it myself" only once it is switched on, next to (not instead of) the other answers', () => {
+    const off = renderPanel()
+    expect(off).not.toContain(sv.underlagsjakt.mode_levererar_sjalv)
+    const on = renderPanel(undefined, undefined, true, true)
+    expect(on).toContain(sv.underlagsjakt.mode_levererar_sjalv)
+    expect(on).toContain(sv.underlagsjakt.mode_osaker)
+    expect(on).toContain(sv.underlagsjakt.mode_uppladdat_underlag)
+    // Two answers that look alike but mean opposite things in the books stay distinct.
+    expect(sv.underlagsjakt.mode_levererar_sjalv).not.toBe(sv.underlagsjakt.mode_osaker)
   })
 
   it('preserves an exported BAS account in the input value', () => {
@@ -613,6 +713,20 @@ describe('translations for the new copy exist in both locales', () => {
     'error_UNDERLAG_TOO_LARGE',
     'error_UNDERLAG_INVALID_CONTENT',
     'error_UNDERLAG_UPLOAD_FAILED',
+    'mode_levererar_sjalv',
+    'levererar_sjalv_description',
+    'levererar_sjalv_apply_to_all',
+    'levererar_sjalv_count',
+    'levererar_sjalv_bulk_saved',
+    'submit_levererar_sjalv',
+    'answer_levererar_sjalv_waiting',
+    'answer_levererar_sjalv_delivered',
+    'tab_vantar',
+    'vantar_empty_title',
+    'vantar_empty_description',
+    'status_underlag_hittat',
+    'error_COUNT_CHANGED',
+    'error_FEATURE_DISABLED',
   ]
 
   it.each(keys)('%s exists in sv.json and en.json', (key) => {

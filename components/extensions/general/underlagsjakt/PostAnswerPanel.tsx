@@ -28,6 +28,7 @@ import {
   type Reglering,
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
+import { bulkTargets } from '@/extensions/general/underlagsjakt/lib/store'
 import {
   EXTERNAL,
   NONE,
@@ -38,11 +39,12 @@ import {
   buildAnswerInput,
   deriveTillBolag,
   submitAnswer,
+  submitBulkAnswer,
 } from './shared'
 
 import { suggestAnswerAccount } from './account-suggestion'
 
-type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'osaker'
+type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'osaker'
 
 const UPLOAD_ACCEPT = UNDERLAG_UPLOAD_MIME_TYPES.join(',')
 
@@ -50,14 +52,19 @@ const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
 
 export function PostAnswerPanel({
   post,
+  posts,
   bolagChoices,
   uploadEnabled,
+  leverarSjalvEnabled,
   onAnswered,
 }: {
   post: Post
+  posts: Post[]
   bolagChoices: string[]
   /** Off until bertil reads answer version 1.5: the upload option is then not offered. */
   uploadEnabled: boolean
+  /** Off until bertil understands levererar_sjalv: the "I'll deliver it" option is then not offered. */
+  leverarSjalvEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -70,6 +77,11 @@ export function PostAnswerPanel({
   const [file, setFile] = useState<File | undefined>(undefined)
   const [preparingFile, setPreparingFile] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // levererar_sjalv
+  const [applyToAllVendor, setApplyToAllVendor] = useState(false)
+  // The same function the server recounts with, so the promised number is the one enforced.
+  const bulkCount = bulkTargets(posts, post).length
 
   // val_kandidat
   const suggestedKategori = (KATEGORIER as readonly string[]).includes(post.forslag?.kategori ?? '')
@@ -119,6 +131,7 @@ export function PostAnswerPanel({
     momstyp,
     begransaBolag,
     begransaBelopp,
+    applyToAllVendor,
     tillBolagChoice,
     externalBolag,
     mottagareChoice,
@@ -167,7 +180,11 @@ export function PostAnswerPanel({
     if (!input) return
     setSaving(true)
     try {
-      await submitAnswer(input, t, (outcome) => toast(outcome.toast), onAnswered, undefined, file)
+      if (applyToAllVendor && input.svarstyp === 'levererar_sjalv') {
+        await submitBulkAnswer(input, bulkCount, t, (outcome) => toast(outcome.toast), onAnswered)
+      } else {
+        await submitAnswer(input, t, (outcome) => toast(outcome.toast), onAnswered, undefined, file)
+      }
     } finally {
       setSaving(false)
     }
@@ -286,6 +303,7 @@ export function PostAnswerPanel({
         options={[
           { value: 'val_kandidat', label: t('mode_val_kandidat') },
           ...(uploadEnabled ? [{ value: 'uppladdat_underlag' as const, label: t('mode_uppladdat_underlag') }] : []),
+          ...(leverarSjalvEnabled ? [{ value: 'levererar_sjalv' as const, label: t('mode_levererar_sjalv') }] : []),
           { value: 'fel_bolag', label: t('mode_fel_bolag') },
           { value: 'osaker', label: t('mode_osaker') },
         ]}
@@ -462,6 +480,23 @@ export function PostAnswerPanel({
         </div>
       )}
 
+      {mode === 'levererar_sjalv' && (
+        <div className="space-y-4">
+          <p className="text-[13px] text-muted-foreground">{t('levererar_sjalv_description')}</p>
+          <label className="flex items-center gap-3 text-[13px]">
+            <Checkbox
+              className="border-foreground"
+              checked={applyToAllVendor}
+              onCheckedChange={(v) => setApplyToAllVendor(v === true)}
+            />
+            {t('levererar_sjalv_apply_to_all', { motpart: post.motpart })}
+          </label>
+          {applyToAllVendor && (
+            <p className="ml-8 text-xs text-muted-foreground">{t('levererar_sjalv_count', { count: bulkCount })}</p>
+          )}
+        </div>
+      )}
+
       {mode === 'osaker' && <p className="text-[13px] text-muted-foreground">{t('osaker_description')}</p>}
 
       <div className="flex flex-col items-end gap-2">
@@ -470,7 +505,7 @@ export function PostAnswerPanel({
         </p>
         <Button onClick={() => void submit()} disabled={!canSubmit}>
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-          {mode === 'osaker' ? t('submit_osaker') : mode === 'uppladdat_underlag' ? t('submit_uppladdat_underlag') : t('submit')}
+          {mode === 'osaker' ? t('submit_osaker') : mode === 'uppladdat_underlag' ? t('submit_uppladdat_underlag') : mode === 'levererar_sjalv' ? t('submit_levererar_sjalv') : t('submit')}
         </Button>
       </div>
     </div>
