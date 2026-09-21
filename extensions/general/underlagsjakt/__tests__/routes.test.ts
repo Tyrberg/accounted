@@ -118,7 +118,7 @@ describe('GET /', () => {
     expect(status).toBe(200)
     expect(body.data.export).toBeNull()
     expect(body.data.posts).toEqual([])
-    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4'])
+    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4', '1.5'])
   })
 })
 
@@ -140,7 +140,7 @@ describe('POST /export/fil', () => {
     expect(status).toBe(400)
     expect(body.error).toMatchObject({ code: 'UNSUPPORTED_VERSION', version: '1.0' })
     expect(body.error.message).toContain('Exportversion 1.0 stöds inte')
-    expect(body.error.message).toContain('Stödda versioner: 1.1, 1.2, 1.3, 1.4')
+    expect(body.error.message).toContain('Stödda versioner: 1.1, 1.2, 1.3, 1.4, 1.5')
     expect(store.size).toBe(0)
   })
 
@@ -267,7 +267,7 @@ describe('POST /svar', () => {
     const file = await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx)
     expect(file.headers.get('Content-Disposition')).toMatch(/attachment; filename="underlagsjakt-svar-.*\.json"/)
     const fileJson = await file.json()
-    expect(fileJson.version).toBe('1.4')
+    expect(fileJson.version).toBe('1.5')
     expect(fileJson.beslut).toEqual([
       expect.objectContaining({
         answer_id: expect.any(String),

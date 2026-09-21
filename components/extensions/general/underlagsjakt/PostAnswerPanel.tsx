@@ -5,6 +5,7 @@ import { useTranslations } from 'next-intl'
 import { Eye, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SegmentedControl } from '@/components/ui/segmented-control'
@@ -25,6 +26,7 @@ import {
   type Reglering,
 } from '@/extensions/general/underlagsjakt/lib/contract'
 import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
+import { bulkTargets } from '@/extensions/general/underlagsjakt/lib/store'
 import {
   EXTERNAL,
   NONE,
@@ -39,17 +41,20 @@ import {
 
 import { suggestAnswerAccount } from './account-suggestion'
 
-type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker'
+type Mode = 'val_kandidat' | 'fel_bolag' | 'osaker' | 'levererar_sjalv'
 
 const RADIO_CLASS = 'mt-1 h-4 w-4 shrink-0 accent-foreground'
 
 export function PostAnswerPanel({
   post,
   bolagChoices,
+  openPosts,
   onAnswered,
 }: {
   post: Post
   bolagChoices: string[]
+  /** Every post still on the to-do list: what a bulk "I deliver it myself" answer would clear. */
+  openPosts: Post[]
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -78,6 +83,10 @@ export function PostAnswerPanel({
   const [begransaBolag, setBegransaBolag] = useState(false)
   const [begransaBelopp, setBegransaBelopp] = useState(false)
 
+  // levererar_sjalv
+  const [gallerAlla, setGallerAlla] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
+
   // fel_bolag: nothing preselected; the user must state each of the three facts.
   const [tillBolagChoice, setTillBolagChoice] = useState<string | undefined>(undefined)
   const [externalBolag, setExternalBolag] = useState('')
@@ -90,6 +99,9 @@ export function PostAnswerPanel({
   // Same derivation buildAnswerInput uses for validation, so what's rendered (the "same
   // company" recipient option, the settlement fieldset) can never drift from what's required.
   const tillBolag = deriveTillBolag(tillBolagChoice, externalBolag)
+
+  // The count the user confirms is the count the server recomputes and must match.
+  const berordaAntal = bulkTargets(openPosts, post, motpart, gallerAlla).length
 
   const otherCompanies = bolagChoices.filter((b) => b.toLowerCase() !== post.bolag.toLowerCase())
 
@@ -111,6 +123,8 @@ export function PostAnswerPanel({
     otherMottagare,
     payerBolag: post.bolag,
     reglering,
+    gallerAlla,
+    berordaAntal,
   })
   const input = answerResult.input ?? null
   const missingReasons = answerResult.missing ?? []
@@ -153,6 +167,7 @@ export function PostAnswerPanel({
         onChange={setMode}
         options={[
           { value: 'val_kandidat', label: t('mode_val_kandidat') },
+          { value: 'levererar_sjalv', label: t('mode_levererar_sjalv') },
           { value: 'fel_bolag', label: t('mode_fel_bolag') },
           { value: 'osaker', label: t('mode_osaker') },
         ]}
@@ -371,17 +386,94 @@ export function PostAnswerPanel({
         </div>
       )}
 
+      {mode === 'levererar_sjalv' && (
+        <LevererarSjalvFields
+          idSuffix={post.transaction_id}
+          motpart={motpart}
+          onMotpartChange={setMotpart}
+          fallbackMotpart={post.motpart}
+          gallerAlla={gallerAlla}
+          onGallerAllaChange={setGallerAlla}
+          berordaAntal={berordaAntal}
+        />
+      )}
+
       {mode === 'osaker' && <p className="text-[13px] text-muted-foreground">{t('osaker_description')}</p>}
 
       <div className="flex flex-col items-end gap-2">
         <p className={cn('text-xs', disabledReason ? 'text-attn' : 'text-muted-foreground')} aria-live="polite">
           {disabledReason ?? t('save_ready')}
         </p>
-        <Button onClick={() => void submit()} disabled={!canSubmit}>
+        <Button
+          onClick={() => (mode === 'levererar_sjalv' && gallerAlla ? setConfirmOpen(true) : void submit())}
+          disabled={!canSubmit}
+        >
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-          {mode === 'osaker' ? t('submit_osaker') : t('submit')}
+          {mode === 'osaker' ? t('submit_osaker') : mode === 'levererar_sjalv' ? t('submit_levererar_sjalv') : t('submit')}
         </Button>
       </div>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t('levererar_sjalv_confirm_title')}
+        description={t('levererar_sjalv_confirm_description', {
+          count: berordaAntal,
+          motpart: motpart.trim() || post.motpart,
+        })}
+        confirmLabel={t('submit_levererar_sjalv')}
+        cancelLabel={t('levererar_sjalv_confirm_cancel')}
+        onConfirm={submit}
+      />
+    </div>
+  )
+}
+
+/**
+ * "I deliver the document myself", with the optional bulk tick and the number of
+ * posts it would clear. Kept apart from the panel so the count line can be
+ * rendered on its own.
+ */
+export function LevererarSjalvFields({
+  idSuffix,
+  motpart,
+  onMotpartChange,
+  fallbackMotpart,
+  gallerAlla,
+  onGallerAllaChange,
+  berordaAntal,
+}: {
+  idSuffix: string
+  motpart: string
+  onMotpartChange: (value: string) => void
+  fallbackMotpart: string
+  gallerAlla: boolean
+  onGallerAllaChange: (value: boolean) => void
+  berordaAntal: number
+}) {
+  const t = useTranslations('underlagsjakt')
+  return (
+    <div className="space-y-4">
+      <p className="text-[13px]">{t('levererar_sjalv_description')}</p>
+      <p className="text-xs text-muted-foreground">{t('levererar_sjalv_not_no_document')}</p>
+      <div className="max-w-sm space-y-2">
+        <Label htmlFor={`motpart-${idSuffix}`}>{t('field_motpart')}</Label>
+        <Input id={`motpart-${idSuffix}`} value={motpart} onChange={(e) => onMotpartChange(e.target.value)} />
+      </div>
+      <label className="flex items-center gap-3 text-[13px]">
+        <Checkbox
+          className="border-foreground"
+          checked={gallerAlla}
+          onCheckedChange={(v) => onGallerAllaChange(v === true)}
+        />
+        {t('levererar_sjalv_alla', { motpart: motpart.trim() || fallbackMotpart })}
+      </label>
+      {gallerAlla && (
+        <p className="text-[13px] font-medium" aria-live="polite">
+          {t('levererar_sjalv_antal', { count: berordaAntal })}
+        </p>
+      )}
+      <p className="text-xs text-muted-foreground">{t('levererar_sjalv_one_document_per_payment')}</p>
     </div>
   )
 }

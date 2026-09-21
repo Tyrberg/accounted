@@ -1,5 +1,5 @@
 import type { Kategori, Momstyp, Post, Reglering, SvarInput } from '@/extensions/general/underlagsjakt/lib/contract'
-import type { FelBolagRow, SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
+import type { FelBolagRow, SvarRecord, WaitingRow } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
 export interface WorkspaceData {
@@ -33,6 +33,9 @@ export interface WorkspaceData {
   answered: (SvarRecord & { transaction_id: string })[]
   pending_count: number
   fel_bolag: FelBolagRow[]
+  /** "Väntar på underlag från dig": promised documents bertil has not found yet, oldest first. */
+  vantar: WaitingRow[]
+  vantar_max_dagar: number
   bolag_choices: string[]
 }
 
@@ -48,6 +51,7 @@ const KNOWN_ERROR_CODES = new Set([
   'CANDIDATE_WITHOUT_HASH',
   'ALREADY_DELIVERED',
   'NOT_FOUND',
+  'COUNT_CHANGED',
 ])
 
 /** Map an API error body to a translated sentence. */
@@ -93,7 +97,7 @@ export function deriveTillBolag(tillBolagChoice: string | undefined, externalBol
 }
 
 export interface AnswerFormState {
-  mode: 'val_kandidat' | 'fel_bolag' | 'osaker'
+  mode: 'val_kandidat' | 'fel_bolag' | 'osaker' | 'levererar_sjalv'
   transactionId: string
   hasCandidate: boolean
   sha256: string | null
@@ -113,6 +117,10 @@ export interface AnswerFormState {
   /** The company that paid, used when mottagareChoice === PAYER. Only relevant in fel_bolag mode. */
   payerBolag?: string
   reglering?: Reglering
+  /** levererar_sjalv: apply to every open payment with the same counterparty. */
+  gallerAlla?: boolean
+  /** levererar_sjalv: how many posts the user is shown as affected (the same number the server recomputes). */
+  berordaAntal?: number
 }
 
 export type AnswerFormResult = { input: SvarInput; missing?: undefined } | { input?: undefined; missing: string[] }
@@ -128,6 +136,20 @@ export type AnswerFormResult = { input: SvarInput; missing?: undefined } | { inp
 export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
   const transaction_id = state.transactionId
   if (state.mode === 'osaker') return { input: { svarstyp: 'osaker', transaction_id } }
+
+  if (state.mode === 'levererar_sjalv') {
+    if (!state.motpart.trim()) return { missing: ['missing_motpart'] }
+    const gallerAlla = state.gallerAlla === true
+    return {
+      input: {
+        svarstyp: 'levererar_sjalv',
+        transaction_id,
+        motpart: state.motpart.trim(),
+        galler_alla: gallerAlla,
+        bekrafta_antal: gallerAlla ? Math.max(1, state.berordaAntal ?? 1) : null,
+      },
+    }
+  }
 
   if (state.mode === 'fel_bolag') {
     const tillBolag = deriveTillBolag(state.tillBolagChoice, state.externalBolag ?? '')
@@ -187,6 +209,9 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
 export function answerSummary(t: T, rec: SvarRecord): string {
   const b = rec.beslut
   if (b.svarstyp === 'osaker') return t('answer_osaker')
+  if (b.svarstyp === 'levererar_sjalv') {
+    return t(b.galler_alla ? 'answer_levererar_sjalv_alla' : 'answer_levererar_sjalv', { motpart: b.motpart })
+  }
   if (b.svarstyp === 'fel_bolag') {
     return t('answer_fel_bolag', { bolag: b.till_bolag ?? t('unknown_company'), mottagare: b.fel_bolag_mottagare })
   }
@@ -211,9 +236,13 @@ export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutco
   if (!ok) {
     return { toast: { title: t('save_failed'), description: errorText(t, body), variant: 'destructive' }, refresh: false }
   }
-  const data = (body as { data?: SvarRecord } | null)?.data
+  const { data, antal } = (body as { data?: SvarRecord; antal?: number } | null) ?? {}
+  // A bulk answer says how many posts it moved, in the same toast that confirms it.
+  const summary = data ? answerSummary(t, data) : undefined
+  const description =
+    typeof antal === 'number' && antal > 1 && summary ? `${summary}. ${t('save_bulk_moved', { count: antal })}` : summary
   return {
-    toast: { title: t('save_success'), description: data ? answerSummary(t, data) : undefined },
+    toast: { title: t('save_success'), description },
     refresh: true,
   }
 }

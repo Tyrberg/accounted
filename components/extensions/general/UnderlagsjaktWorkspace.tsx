@@ -16,7 +16,7 @@ import { cn, formatCurrency, formatDate, formatDateLong } from '@/lib/utils'
 import { PostAnswerPanel } from './underlagsjakt/PostAnswerPanel'
 import { answerSummary, errorText, type WorkspaceData } from './underlagsjakt/shared'
 
-type Tab = 'open' | 'answered' | 'fel_bolag'
+type Tab = 'open' | 'vantar' | 'answered' | 'fel_bolag'
 
 const API = '/api/extensions/ext/underlagsjakt'
 
@@ -178,6 +178,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
           onChange={setTab}
           options={[
             { value: 'open', label: t('tab_open'), count: data.posts.length },
+            { value: 'vantar', label: t('tab_vantar'), count: data.vantar.length },
             { value: 'answered', label: t('tab_answered'), count: pendingCount },
             { value: 'fel_bolag', label: t('tab_fel_bolag'), count: data.fel_bolag.length },
           ]}
@@ -193,6 +194,15 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
           </Button>
         </div>
       </div>
+
+      {data.vantar.some((r) => r.forsenad) && (
+        <p className="text-[12.5px] text-attn">
+          {t('vantar_overdue', {
+            count: data.vantar.filter((r) => r.forsenad).length,
+            days: data.vantar_max_dagar,
+          })}
+        </p>
+      )}
 
       <div className="space-y-1 text-[12.5px] text-muted-foreground">
         <p>
@@ -250,6 +260,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                       onToggle={() => setExpandedId(expanded ? null : post.transaction_id)}
                       post={post}
                       bolagChoices={data.bolag_choices}
+                      openPosts={data.posts}
                       onAnswered={async () => {
                         setExpandedId(null)
                         await load()
@@ -259,6 +270,45 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                 })}
               </tbody>
             </table>
+          </div>
+        ))}
+
+      {tab === 'vantar' &&
+        (data.vantar.length === 0 ? (
+          <EmptyState icon={FileSearch} title={t('vantar_empty_title')} description={t('vantar_empty_description')} />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr>
+                  <th className={TH_CLASS}>{t('col_date')}</th>
+                  <th className={TH_CLASS}>{t('col_counterparty')}</th>
+                  <th className={cn(TH_CLASS, 'text-right')}>{t('col_amount')}</th>
+                  <th className={TH_CLASS}>{t('col_promised')}</th>
+                  <th className={TH_CLASS}>{t('col_waiting')}</th>
+                </tr>
+              </thead>
+              <tbody className="stagger-enter">
+                {data.vantar.map((row) => (
+                  <tr key={row.transaction_id} className="hover:bg-secondary/35" data-ph-mask="">
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap tabular-nums')}>{formatDate(row.post.datum)}</td>
+                    <td className={TD_CLASS}>{row.motpart}</td>
+                    <td className={cn(TD_CLASS, 'text-right whitespace-nowrap tabular-nums')}>
+                      {formatCurrency(row.post.belopp, row.post.valuta)}
+                    </td>
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap tabular-nums')}>{formatDate(row.besvarad_at)}</td>
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap')}>
+                      {row.forsenad ? (
+                        <Badge variant="warning">{t('vantar_days_overdue', { count: row.dagar })}</Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">{t('vantar_days', { count: row.dagar })}</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="mt-3 text-[12.5px] text-muted-foreground">{t('vantar_footnote')}</p>
           </div>
         ))}
 
@@ -380,12 +430,14 @@ function PostRows({
   expanded,
   onToggle,
   bolagChoices,
+  openPosts,
   onAnswered,
 }: {
   post: WorkspaceData['posts'][number]
   expanded: boolean
   onToggle: () => void
   bolagChoices: string[]
+  openPosts: WorkspaceData['posts']
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -428,7 +480,7 @@ function PostRows({
         <tr>
           <td colSpan={6} className="border-b border-border p-0">
             <RowFoldout>
-              <PostAnswerPanel post={post} bolagChoices={bolagChoices} onAnswered={onAnswered} />
+              <PostAnswerPanel post={post} bolagChoices={bolagChoices} openPosts={openPosts} onAnswered={onAnswered} />
             </RowFoldout>
           </td>
         </tr>

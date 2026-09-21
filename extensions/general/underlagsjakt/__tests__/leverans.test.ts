@@ -392,7 +392,7 @@ describe('the delivery routes', () => {
       await route('GET', '/svar').handler(request()),
     )
     expect(first.status).toBe(200)
-    expect(first.body.version).toBe('1.4')
+    expect(first.body.version).toBe('1.5')
     expect(first.body.beslut.map((b) => b.transaction_id)).toEqual(['tx-moank-20260821'])
 
     const svar = storedValue('svar') as Record<string, { levererad_at: string | null }>
@@ -556,6 +556,7 @@ describe('describeLeveransStatus', () => {
     pendingAnswers: 0,
     lastAcknowledgedAt: recently,
     oldestPendingAt: null,
+    waiting: { count: 0, overdue: 0, oldestAt: null },
     ...overrides,
   })
 
@@ -711,6 +712,28 @@ describe('describeLeveransStatus', () => {
     expect(describeLeveransStatus(evidence({
       pendingAnswers: 1, oldestPendingAt: boundary,
     }), new Date(NOW.getTime() + 1)).exitCode).toBe(2)
+  })
+
+  it('reports the whole promised-documents backlog as ONE line, however many posts are in it', () => {
+    const report = describeLeveransStatus(evidence({
+      waiting: { count: 40, overdue: 25, oldestAt: '2026-08-01T00:00:00Z' },
+    }), NOW)
+    const lines = report.checks.filter((c) => c.label === 'promised documents')
+    expect(lines).toHaveLength(1)
+    expect(lines[0].state).toBe('alarm')
+    expect(lines[0].line).toContain('25 of 40')
+    expect(report.exitCode).toBe(2)
+    // The delivery itself is healthy: the headline must not say it is broken.
+    expect(report.headline).toBe('The automatic delivery works, but 25 promised document(s) are overdue.')
+  })
+
+  it('keeps a promised-documents backlog inside its limit quiet', () => {
+    const report = describeLeveransStatus(evidence({
+      waiting: { count: 7, overdue: 0, oldestAt: '2026-09-20T00:00:00Z' },
+    }), NOW)
+    expect(report.exitCode).toBe(0)
+    expect(labels(report, 'alarm')).toEqual([])
+    expect(report.checks.find((c) => c.label === 'promised documents')?.state).toBe('ok')
   })
 
   it('does not treat repeated offers as acknowledgement evidence', () => {

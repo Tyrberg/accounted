@@ -294,8 +294,8 @@ describe('buildBeslut', () => {
 
 describe('buildAnswerFile', () => {
   it('writes the answer version with reglering support', () => {
-    expect(ANSWER_VERSION).toBe('1.4')
-    expect(buildAnswerFile([])).toEqual({ version: '1.4', beslut: [] })
+    expect(ANSWER_VERSION).toBe('1.5')
+    expect(buildAnswerFile([])).toEqual({ version: '1.5', beslut: [] })
   })
 
   it('includes reglering in fel_bolag beslut', () => {

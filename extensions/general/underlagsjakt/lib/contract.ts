@@ -23,11 +23,14 @@ import { accountNumberSchema } from '@/lib/invariants/zod'
  * before this file has ever seen it. A different major is refused outright.
  */
 export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
-export const MAX_SUPPORTED_EXPORT_VERSION = '1.4'
+export const MAX_SUPPORTED_EXPORT_VERSION = '1.5'
 /** Export versions this extension has been built and tested against, for error messages. */
-export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
-/** Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only. */
-export const ANSWER_VERSION = '1.4'
+export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4', '1.5'] as const
+/**
+ * Answer version this extension writes. 1.4 added reglering to fel_bolag beslut;
+ * 1.5 adds the `levererar_sjalv` svarstyp ("the document exists, I deliver it myself").
+ */
+export const ANSWER_VERSION = '1.5'
 
 /** `SVARSKATEGORIER` in bertil. */
 export const KATEGORIER = [
@@ -125,6 +128,13 @@ const sammanstallningSchema = z
     generated_at: z.string(),
     sammanfattning: sammanfattningSchema,
     posts: z.array(postSchema),
+    /**
+     * Optional (a 1.5 addition, absent in older exports): transaction_ids that
+     * were answered `levererar_sjalv` and whose document bertil has since found
+     * in the ordinary place. Read only to move those posts from "waiting" to
+     * "with document"; an export without it changes nothing.
+     */
+    underlag_hittat: z.array(z.string()).optional(),
   })
   .passthrough()
 export type Sammanstallning = z.infer<typeof sammanstallningSchema>
@@ -242,6 +252,27 @@ export type Beslut =
       till_bolag: string | null
       reglering?: Reglering | null
     }
+  | {
+      answer_id: string
+      transaction_id: string
+      /**
+       * "The document exists and I will leave it in the ordinary place." NOT the
+       * same as "no document needed": bertil must keep looking for the document
+       * and must not book the payment as documented-by-nothing.
+       */
+      svarstyp: 'levererar_sjalv'
+      motpart: string
+      /**
+       * True: a rule for every payment matching `motpart`, i.e. the rule key
+       * `motpart|bolag=|bankkonto=|belopp=` with bolag, bankkonto and belopp all
+       * empty (null). False: this transaction only; bolag and belopp then carry
+       * the post's own values for reference and bertil must not widen them.
+       */
+      galler_alla: boolean
+      bolag: string | null
+      bankkonto: null
+      belopp: number | null
+    }
   | { answer_id: string; transaction_id: string; svarstyp: 'osaker' }
 
 /** What the workspace sends for one post. Validated against the stored post before it becomes a Beslut. */
@@ -272,6 +303,25 @@ export const svarInputSchema = z.discriminatedUnion('svarstyp', [
       message: 'reglering krävs när till_bolag är satt',
       path: ['reglering'],
     }),
+  z
+    .object({
+      svarstyp: z.literal('levererar_sjalv'),
+      transaction_id: z.string().min(1),
+      /** The pattern the rule recognises the counterparty by. */
+      motpart: z.string().trim().min(1),
+      /** Apply to every open payment with the same counterparty, not just this one. */
+      galler_alla: z.boolean(),
+      /**
+       * How many posts the user was shown and confirmed ("this removes N posts").
+       * Required for a bulk answer: the server refuses when the count it computes
+       * has moved, so a bulk never clears a different set than the one confirmed.
+       */
+      bekrafta_antal: z.number().int().min(1).nullable(),
+    })
+    .refine((v) => !v.galler_alla || v.bekrafta_antal !== null, {
+      message: 'bekrafta_antal krävs när galler_alla är satt',
+      path: ['bekrafta_antal'],
+    }),
   z.object({
     svarstyp: z.literal('osaker'),
     transaction_id: z.string().min(1),
@@ -298,6 +348,22 @@ export function buildBeslut(
     return {
       ok: true,
       beslut: { answer_id: answerId, transaction_id, svarstyp: 'osaker' },
+      reglering: null,
+    }
+  }
+  if (input.svarstyp === 'levererar_sjalv') {
+    return {
+      ok: true,
+      beslut: {
+        answer_id: answerId,
+        transaction_id,
+        svarstyp: 'levererar_sjalv',
+        motpart: input.motpart,
+        galler_alla: input.galler_alla,
+        bolag: input.galler_alla ? null : post.bolag,
+        bankkonto: null,
+        belopp: input.galler_alla ? null : post.belopp,
+      },
       reglering: null,
     }
   }

@@ -51,9 +51,11 @@ import {
 } from './lib/leverans'
 import {
   KVITTENS_KEY,
+  MAX_WAITING_DAYS,
   loadLeveransJournal,
   loadState,
   pendingBeslut,
+  waitingSummary,
   type ImportKalla,
   type LeveransJournal,
 } from './lib/store'
@@ -90,6 +92,8 @@ export interface LeveransEvidence {
   /** Last confirmed machine ingestion, independent of retained answers. */
   lastAcknowledgedAt: string | null
   oldestPendingAt: string | null
+  /** Payments the user answered "I deliver the document myself" that bertil has not yet found a document for. */
+  waiting: { count: number; overdue: number; oldestAt: string | null }
 }
 
 export type CheckState = 'ok' | 'alarm' | 'blocked'
@@ -98,6 +102,12 @@ export interface LeveransCheck {
   label: string
   state: CheckState
   line: string
+  /**
+   * Marks a check about the user's own backlog, not the delivery's health. It
+   * still raises the exit code (something has to be looked at), but the
+   * headline must not claim the delivery is broken because of it.
+   */
+  backlog?: boolean
 }
 
 export interface LeveransStatusReport {
@@ -297,13 +307,30 @@ export function describeLeveransStatus(evidence: LeveransEvidence, now: Date): L
     })
   }
 
+  // ONE line for the whole backlog, however many payments are in it: the same
+  // shape as every other check here, never one alarm per post.
+  if (evidence.waiting.count > 0) {
+    const overdue = evidence.waiting.overdue > 0
+    checks.push({
+      label: 'promised documents',
+      state: overdue ? 'alarm' : 'ok',
+      backlog: true,
+      line: overdue
+        ? `${evidence.waiting.overdue} of ${evidence.waiting.count} payment(s) answered "I deliver the document myself" have waited more than ${MAX_WAITING_DAYS} days, oldest promised ${evidence.waiting.oldestAt}. The user has to leave the documents where bertil looks, or answer the posts differently.`
+        : `${evidence.waiting.count} payment(s) are waiting for a document the user promised, oldest promised ${evidence.waiting.oldestAt}; none past ${MAX_WAITING_DAYS} days.`,
+    })
+  }
+
   const alarms = checks.filter((check) => check.state === 'alarm')
+  const deliveryAlarms = alarms.filter((check) => !check.backlog)
   return {
     exitCode: alarms.length === 0 ? 0 : 2,
     headline:
       alarms.length === 0
         ? 'The automatic delivery has received an export and recorded an acknowledged answer; polls are recent and no acknowledgement is overdue.'
-        : `The automatic delivery is not working: ${alarms.length} of ${checks.length} checks failed.`,
+        : deliveryAlarms.length === 0
+          ? `The automatic delivery works, but ${evidence.waiting.overdue} promised document(s) are overdue.`
+          : `The automatic delivery is not working: ${alarms.length} of ${checks.length} checks failed.`,
     checks,
   }
 }
@@ -356,6 +383,7 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     pendingAnswers: 0,
     lastAcknowledgedAt: null,
     oldestPendingAt: null,
+    waiting: { count: 0, overdue: 0, oldestAt: null },
   }
 
   const inspected = inspectLeveransConfig()
@@ -385,6 +413,7 @@ export async function gatherEvidence(envFile: string | null = null): Promise<Lev
     lastAcknowledgedAt: lastAcknowledgedAt ?? null,
     oldestPendingAt: Object.values(state.svar).filter((r) => r.levererad_at === null)
       .map((r) => r.besvarad_at).sort()[0] ?? null,
+    waiting: waitingSummary(state.svar, new Date()),
   }
 }
 

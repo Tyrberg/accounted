@@ -311,7 +311,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
           messages: sv,
           timeZone: 'Europe/Stockholm',
         } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-        createElement(PostAnswerPanel, { post: finalPost, bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], onAnswered: async () => {} })
+        createElement(PostAnswerPanel, { post: finalPost, bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], openPosts: [], onAnswered: async () => {} })
       )
     )
   }

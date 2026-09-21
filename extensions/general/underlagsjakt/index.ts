@@ -6,9 +6,11 @@
  * exports what it could not decide under a versioned contract (see
  * lib/contract.ts). This extension reads that export, shows one row per
  * payment with the readable account name, the candidates and their evidence,
- * and collects one of three answers per row: the right document (or none,
- * with motpart/kategori/BAS-konto/momstyp as the CLI's --svara), "gäller
- * annat bolag", or "osäker". The answers go back to bertil as the contract's
+ * and collects one of four answers per row: the right document (or none,
+ * with motpart/kategori/BAS-konto/momstyp as the CLI's --svara), "jag
+ * levererar underlaget själv" (the document exists and comes by the ordinary
+ * route; the payment waits, visibly, until bertil finds it), "gäller annat
+ * bolag", or "osäker". The answers go back to bertil as the contract's
  * answer file, where they become rules.
  *
  * Nothing here books anything. Wrong-company payments are collected as a
@@ -34,7 +36,9 @@ import {
   LEVERANS_KEY,
   KVITTENS_KEY,
   SVAR_KEY,
+  MAX_WAITING_DAYS,
   bolagChoices,
+  bulkTargets,
   felBolagRows,
   findPost,
   loadLeveransJournal,
@@ -45,7 +49,9 @@ import {
   openPosts,
   pendingBeslut,
   reconcileWithExport,
+  waitingRows,
   recordAnswer,
+  recordAnswers,
   recordSvarHandover,
   withdrawAnswer,
   type ImportKalla,
@@ -154,6 +160,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         leveransTargetsCompany(ctx.companyId),
       ])
       const pending = pendingBeslut(svar)
+      const waiting = waitingRows(svar, new Date())
       return NextResponse.json({
         data: {
           supported_export_versions: SUPPORTED_EXPORT_VERSIONS,
@@ -180,6 +187,8 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
             .sort((a, b) => b.besvarad_at.localeCompare(a.besvarad_at)),
           pending_count: pending.length,
           fel_bolag: felBolagRows(svar),
+          vantar: waiting,
+          vantar_max_dagar: MAX_WAITING_DAYS,
           bolag_choices: bolagChoices(exp, svar, members),
         },
       })
@@ -313,6 +322,30 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
             ? 'Dokumentet finns inte bland postens kandidater.'
             : 'Kandidaten saknar giltig kontrollsumma och kan inte väljas.',
         )
+      }
+
+      if (input.data.svarstyp === 'levererar_sjalv') {
+        // One user decision, possibly many posts: the set is recomputed here and
+        // must match the count the user confirmed, then written in one save.
+        const targets = bulkTargets(
+          openPosts(state.export, state.svar),
+          post,
+          input.data.motpart,
+          input.data.galler_alla,
+        )
+        if (input.data.galler_alla && targets.length !== input.data.bekrafta_antal) {
+          return fail(409, 'COUNT_CHANGED', 'Antalet berörda poster har ändrats sedan du bekräftade.', {
+            antal: targets.length,
+          })
+        }
+        const resolved = targets.flatMap((target) => {
+          const one = buildBeslut(target, input.data, `${now}:${target.transaction_id}`)
+          return one.ok ? [{ post: target, beslut: one.beslut }] : []
+        })
+        const bulk = recordAnswers(state.svar, resolved, ctx.userId, now)
+        if (!bulk.ok) return fail(409, bulk.code, 'Svaret är redan erbjudet till bertil och kan inte ändras.')
+        await ctx.settings.set(SVAR_KEY, bulk.svar)
+        return NextResponse.json({ data: bulk.svar[post.transaction_id], antal: resolved.length })
       }
 
       const recorded = recordAnswer(state.svar, post, built.beslut, built.reglering, ctx.userId, now)

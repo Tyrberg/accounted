@@ -46,6 +46,12 @@ export interface SvarRecord {
   erbjudet_at: string | null
   /** When bertil acknowledged receiving and ingesting the answer via POST /svar/kvittens. */
   levererad_at: string | null
+  /**
+   * Only for `levererar_sjalv` answers: when bertil reported finding the promised
+   * document in the ordinary place. Null or absent while the payment is still
+   * waiting for it. Absent on records stored before the state existed.
+   */
+  underlag_hittat_at?: string | null
 }
 
 export type SvarMap = Record<string, SvarRecord>
@@ -118,14 +124,57 @@ export function openPosts(exp: StoredExport | null, svar: SvarMap): Post[] {
 export function reconcileWithExport(svar: SvarMap, exp: ParsedExport): SvarMap {
   const generated = Date.parse(exp.generated_at)
   const asked = new Set(exp.sammanstallningar.flatMap((s) => s.posts.map((p) => p.transaction_id)))
+  const found = new Set(exp.sammanstallningar.flatMap((s) => s.underlag_hittat ?? []))
   const next: SvarMap = {}
   for (const [id, rec] of Object.entries(svar)) {
     const deliveredBefore =
       rec.levererad_at !== null && !Number.isNaN(generated) && Date.parse(rec.levererad_at) < generated
-    if (asked.has(id) && deliveredBefore) continue
+    const promised = rec.beslut.svarstyp === 'levererar_sjalv'
+    // A promised document that bertil has now found moves from "waiting" to
+    // "with document" without asking the user again. Once set it stays set.
+    // Applied before the drop below, so an export listing the id in both
+    // `posts` and `underlag_hittat` still records the transition.
+    if (promised && found.has(id) && !rec.underlag_hittat_at) {
+      next[id] = { ...rec, underlag_hittat_at: exp.generated_at }
+      continue
+    }
+    // bertil is told to keep looking for a promised document, so it may list
+    // the post again until it finds it. That is not a rejection: the promise
+    // stays waiting, or the post would return to the to-do list unnoticed.
+    if (asked.has(id) && deliveredBefore && !(promised && !rec.underlag_hittat_at)) continue
     next[id] = rec
   }
   return next
+}
+
+/** Case and spacing do not make a new counterparty. */
+export function normalizeMotpart(motpart: string): string {
+  return motpart.toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * The posts a "levererar själv" answer clears: the answered post itself first,
+ * then, for a bulk answer, every other open post with the same counterparty.
+ *
+ * The same function decides the count the user confirms in the browser and the
+ * set the server clears, so the two cannot disagree about "this removes N".
+ * Matching is exact on the normalised counterparty text on purpose: it never
+ * clears a post the rule might not cover. It therefore undercounts when the
+ * counterparty differs per payment (a reference number as counterparty, task
+ * 1438), where a bulk answer honestly reports 1. Posts bertil flagged as
+ * possibly another company's payment are never swept in: whether their
+ * document is the user's to deliver is exactly what is in question.
+ */
+export function bulkTargets(open: Post[], primary: Post, motpart: string, gallerAlla: boolean): Post[] {
+  if (!gallerAlla) return [primary]
+  const key = normalizeMotpart(motpart)
+  const siblings = open.filter(
+    (p) =>
+      p.transaction_id !== primary.transaction_id &&
+      p.kategori !== 'fel_bolag' &&
+      normalizeMotpart(p.motpart) === key,
+  )
+  return [primary, ...siblings]
 }
 
 export type RecordAnswerResult = { ok: true; svar: SvarMap } | { ok: false; code: 'ALREADY_DELIVERED' }
@@ -168,6 +217,26 @@ export function recordAnswer(
       },
     },
   }
+}
+
+/**
+ * Record one `levererar_sjalv` answer per target post, all or nothing. Each
+ * post gets its own beslut and answer_id (the acknowledgement protocol is per
+ * transaction); they share one rule key, so bertil learns one rule.
+ */
+export function recordAnswers(
+  svar: SvarMap,
+  targets: Array<{ post: Post; beslut: Beslut }>,
+  userId: string,
+  now: string,
+): RecordAnswerResult {
+  let next = svar
+  for (const { post, beslut } of targets) {
+    const recorded = recordAnswer(next, post, beslut, null, userId, now)
+    if (!recorded.ok) return recorded
+    next = recorded.svar
+  }
+  return { ok: true, svar: next }
 }
 
 export type WithdrawResult =
@@ -288,4 +357,59 @@ export function bolagChoices(exp: StoredExport | null, svar: SvarMap, memberComp
   }
   for (const name of memberCompanies) add(name)
   return [...seen.values()].sort((a, b) => a.localeCompare(b, 'sv'))
+}
+
+/** How long a promised document may wait before it is reported as overdue. */
+export const MAX_WAITING_DAYS = 14
+
+export interface WaitingRow {
+  transaction_id: string
+  post: PostSnapshot
+  motpart: string
+  /** Whether the answer covered every payment from the counterparty. */
+  galler_alla: boolean
+  besvarad_at: string
+  dagar: number
+  forsenad: boolean
+}
+
+function wholeDaysSince(iso: string, now: Date): number {
+  const then = Date.parse(iso)
+  return Number.isNaN(then) ? 0 : Math.max(0, Math.floor((now.getTime() - then) / 86_400_000))
+}
+
+/**
+ * "Väntar på underlag från dig": payments answered `levererar_sjalv` whose
+ * document bertil has not yet found. Not on the to-do list, but never out of
+ * sight: oldest first, so what was promised longest ago comes first.
+ */
+export function waitingRows(svar: SvarMap, now: Date): WaitingRow[] {
+  const rows: WaitingRow[] = []
+  for (const [id, rec] of Object.entries(svar)) {
+    if (rec.beslut.svarstyp !== 'levererar_sjalv' || rec.underlag_hittat_at) continue
+    const dagar = wholeDaysSince(rec.besvarad_at, now)
+    rows.push({
+      transaction_id: id,
+      post: rec.post,
+      motpart: rec.beslut.motpart,
+      galler_alla: rec.beslut.galler_alla,
+      besvarad_at: rec.besvarad_at,
+      dagar,
+      forsenad: dagar > MAX_WAITING_DAYS,
+    })
+  }
+  return rows.sort((a, b) => a.besvarad_at.localeCompare(b.besvarad_at))
+}
+
+/** One aggregate for the alarm: never a line per post. */
+export function waitingSummary(
+  svar: SvarMap,
+  now: Date,
+): { count: number; overdue: number; oldestAt: string | null } {
+  const rows = waitingRows(svar, now)
+  return {
+    count: rows.length,
+    overdue: rows.filter((r) => r.forsenad).length,
+    oldestAt: rows[0]?.besvarad_at ?? null,
+  }
 }

@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** 1.4 (minimum 1.1)
+**Contract version:** 1.5 (minimum 1.1)
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -45,6 +45,7 @@ One Sammanstallning is the analysis for a single bolag and period.
 - **`generated_at`** (ISO8601 string, required): Export timestamp.
 - **`sammanfattning`** (object, required): Summary counts (see Sammanfattning).
 - **`posts`** (array, required): Payment/transaction posts.
+- **`underlag_hittat`** (array of strings, optional, 1.5): `transaction_id`s that were answered `levererar_sjalv` and whose document bertil has since found in the ordinary place. Accounted moves those posts from "waiting for a document from you" to "with document" without asking again. Absent or empty changes nothing. Ids Accounted does not know are ignored. A post answered `levererar_sjalv` whose document is not yet found stays waiting even if a later export still lists it in `posts`; only `underlag_hittat` moves it on.
 
 ## Sammanfattning
 
@@ -169,6 +170,30 @@ A supporting document (email, invoice, receipt).
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
 
+## Answers: `levererar_sjalv` (answer version 1.5)
+
+The answer file is `{ "version": "1.5", "beslut": [...] }`. 1.5 adds one `svarstyp`, `levererar_sjalv`: **the document exists and the user will leave it in the ordinary place.** It is the opposite of "no document needed": bertil must keep looking for the document, must not record the payment as not requiring one, and must not bind any document to it.
+
+```json
+{
+  "answer_id": "2026-09-21T10:00:00.000Z:tx-hi3g-1",
+  "transaction_id": "tx-hi3g-1",
+  "svarstyp": "levererar_sjalv",
+  "motpart": "HI3G ACCESS AB",
+  "galler_alla": true,
+  "bolag": null,
+  "bankkonto": null,
+  "belopp": null
+}
+```
+
+- **`motpart`**: the counterparty pattern, as in `val_kandidat`.
+- **`galler_alla`**: `true` means the user answered for every payment from `motpart`. Then `bolag`, `bankkonto` and `belopp` are all `null`: the rule key is `motpart|bolag=|bankkonto=|belopp=`, the existing rule mechanism with an empty bank account and amount. `false` means this transaction only; `bolag` and `belopp` carry the post's own values for reference and the rule must not be wider than them.
+- Accounted sends **one beslut per affected post**, each with its own `transaction_id` and `answer_id`, all sharing the same rule key. bertil learns one rule and acknowledges each transaction as usual through `/svar/kvittens`.
+- No `sha256`, `vald_kandidat` or `kalla` is ever present: one document is never bound to several payments (task 1435), and a bulk answer says "I deliver the documents", not "the same document applies to all".
+- bertil's `mottak_svar_fran_ui` must understand the type before the 1.5 answer version is switched on. An older bertil rejecting it must not acknowledge it.
+- Accounted matches "every payment from the same counterparty" on the exact, case- and spacing-normalised `motpart` text of open posts, so it never clears a post the rule might not cover. Where the counterparty differs on every payment (a reference number, task 1438), a bulk answer clears one post and says so.
+
 ## Transport: the automatic delivery
 
 The export does not have to be uploaded by hand. bertil can deliver it, and
@@ -279,6 +304,10 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 
 ## Version History
+
+### 1.5
+- Answer file: new `svarstyp` `levererar_sjalv` (see above); answer version 1.5.
+- Sammanstallning: optional `underlag_hittat` (array of transaction_ids), so a promised document bertil later finds moves its post from waiting to with-document by itself. bertil must emit it for the transition to happen; without it, posts stay in the waiting list.
 
 ### 1.4
 - Added `leverantor_sokord` field on posts for supplier search hints (ignored by Accounted; reserved for future use).
