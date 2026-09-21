@@ -185,11 +185,12 @@ describe('buildBeslut', () => {
       momstyp: 'eu_reverse_charge',
       begransa_bolag: true,
       begransa_belopp: false,
-    })
+    }, 'test-answer-id')
     expect(result).toEqual({
       ok: true,
       reglering: null,
       beslut: {
+        answer_id: 'test-answer-id',
         transaction_id: 'tx-google-20260803',
         svarstyp: 'val_kandidat',
         vald_kandidat: 'google_workspace_augusti.pdf',
@@ -218,10 +219,10 @@ describe('buildBeslut', () => {
       momstyp: null,
       begransa_bolag: false,
       begransa_belopp: true,
-    })
+    }, 'test-answer-id')
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.beslut).toMatchObject({ vald_kandidat: null, belopp: -3120, bolag: null })
+    expect(result.beslut).toMatchObject({ vald_kandidat: null, belopp: -3120, bolag: null, answer_id: 'test-answer-id' })
     expect(result.beslut).not.toHaveProperty('sha256')
   })
 
@@ -237,7 +238,7 @@ describe('buildBeslut', () => {
       momstyp: null,
       begransa_bolag: false,
       begransa_belopp: false,
-    })
+    }, 'test-answer-id')
     expect(result).toEqual({ ok: false, code: 'CANDIDATE_NOT_FOUND' })
   })
 
@@ -254,7 +255,7 @@ describe('buildBeslut', () => {
       momstyp: null,
       begransa_bolag: false,
       begransa_belopp: false,
-    })
+    }, 'test-answer-id')
     expect(result).toEqual({ ok: false, code: 'CANDIDATE_WITHOUT_HASH' })
   })
 
@@ -266,11 +267,12 @@ describe('buildBeslut', () => {
       fel_bolag_mottagare: 'Villa Viola AB',
       till_bolag: 'Villa Viola',
       reglering: 'mellanhavande',
-    })
+    }, 'test-answer-id')
     expect(result).toEqual({
       ok: true,
       reglering: 'mellanhavande',
       beslut: {
+        answer_id: 'test-answer-id',
         transaction_id: 'tx-moank-20260821',
         svarstyp: 'fel_bolag',
         fel_bolag_mottagare: 'Villa Viola AB',
@@ -282,10 +284,10 @@ describe('buildBeslut', () => {
 
   it('builds osaker with nothing but id and type', () => {
     const p = post('tx-ocr-20260812')
-    expect(buildBeslut(p, { svarstyp: 'osaker', transaction_id: p.transaction_id })).toEqual({
+    expect(buildBeslut(p, { svarstyp: 'osaker', transaction_id: p.transaction_id }, 'test-answer-id')).toEqual({
       ok: true,
       reglering: null,
-      beslut: { transaction_id: 'tx-ocr-20260812', svarstyp: 'osaker' },
+      beslut: { answer_id: 'test-answer-id', transaction_id: 'tx-ocr-20260812', svarstyp: 'osaker' },
     })
   })
 })
@@ -304,10 +306,11 @@ describe('buildAnswerFile', () => {
       fel_bolag_mottagare: 'Villa Viola AB',
       till_bolag: 'Villa Viola',
       reglering: 'mellanhavande',
-    })
+    }, 'test-answer-id')
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.beslut).toEqual({
+      answer_id: 'test-answer-id',
       transaction_id: 'tx-moank-20260821',
       svarstyp: 'fel_bolag',
       fel_bolag_mottagare: 'Villa Viola AB',
@@ -324,10 +327,11 @@ describe('buildAnswerFile', () => {
       fel_bolag_mottagare: 'Villa Viola AB',
       till_bolag: null,
       reglering: null,
-    })
+    }, 'test-answer-id')
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.beslut).toEqual({
+      answer_id: 'test-answer-id',
       transaction_id: 'tx-moank-20260821',
       svarstyp: 'fel_bolag',
       fel_bolag_mottagare: 'Villa Viola AB',

@@ -5707,7 +5707,8 @@
     "error_CANDIDATE_NOT_FOUND": "Dokumentet finns inte bland postens kandidater.",
     "error_CANDIDATE_WITHOUT_HASH": "Dokumentet saknar kontrollsumma och kan inte väljas.",
     "error_ALREADY_DELIVERED": "Svaret är redan inläst i bertil och kan inte ändras här.",
-    "error_NOT_FOUND": "Svaret finns inte."
+    "error_NOT_FOUND": "Svaret finns inte.",
+    "status_offered": "Erbjudet bertil"
   },
   "extensions": {
     "page_title": "Tillägg",
@@ -8708,5 +8709,5 @@
     "attn_create": "Skapa förslag",
     "auto_created_title": "{count} förslag skapade från bokföringen",
     "auto_created_description": "Motparter som dina verifikat namnger men som inte finns i registret. Lägg upp dem, eller dölj de som inte hör hemma här."
-}
+  }
 }

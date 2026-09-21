@@ -292,12 +292,14 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                         <span className="text-xs text-muted-foreground">
                           {t('status_delivered', { date: formatDate(a.levererad_at) })}
                         </span>
+                      ) : a.erbjudet_at ? (
+                        <Badge variant="warning">{t('status_offered')}</Badge>
                       ) : (
                         <Badge variant="warning">{t('status_pending')}</Badge>
                       )}
                     </td>
                     <td className={cn(TD_CLASS, 'text-right')}>
-                      {!a.levererad_at && (
+                      {!a.erbjudet_at && (
                         <Button
                           variant="ghost"
                           size="sm"

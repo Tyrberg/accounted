@@ -40,6 +40,8 @@ import {
   loadLeveransJournal,
   loadState,
   markDelivered,
+  markDeliveredManual,
+  markOffered,
   openPosts,
   pendingBeslut,
   reconcileWithExport,
@@ -213,7 +215,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
   },
   /**
    * Fetching never acknowledges consumption. Keep offering every pending answer
-   * until bertil successfully ingests it and posts its transaction_id to
+   * until bertil successfully ingests it and posts its transaction_id and answer_id to
    * /svar/kvittens. Failed ingestion or a lost response can safely be retried.
    */
   {
@@ -230,11 +232,14 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         loadState(ctx.settings),
         loadLeveransJournal(ctx.settings),
       ])
-      const beslut = pendingBeslut(svar)
+      const pendingIds = pendingBeslut(svar).map((b) => b.transaction_id)
+      const updatedSvar = markOffered(svar, pendingIds, now)
+      const beslut = pendingBeslut(updatedSvar)
       // Written on every call, including the ones carrying nothing: a poll is
       // the only evidence the box has that bertil is still running. See
       // LeveransJournal and extensions/general/underlagsjakt/leverans-status.ts.
       await ctx.settings.set(LEVERANS_KEY, recordSvarHandover(journal, beslut.length, now))
+      await ctx.settings.set(SVAR_KEY, updatedSvar)
       ctx.log.info('underlagsjakt answers offered', { count: beslut.length })
       return NextResponse.json(buildAnswerFile(beslut))
     },
@@ -253,18 +258,24 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       const id = json.body && typeof json.body === 'object'
         ? (json.body as { transaction_id?: unknown }).transaction_id
         : undefined
+      const answerId = json.body && typeof json.body === 'object'
+        ? (json.body as { answer_id?: unknown }).answer_id
+        : undefined
       if (typeof id !== 'string' || !id.trim()) {
         return fail(400, 'VALIDATION_ERROR', 'transaction_id krävs.')
       }
+      if (typeof answerId !== 'string' || !answerId.trim()) {
+        return fail(400, 'VALIDATION_ERROR', 'answer_id krävs.')
+      }
       const { svar } = await loadState(ctx.settings)
-      // Withdrawn or reconciled answers are successful no-ops on retry.
+      // Withdrawn, mismatched, or reconciled answers are successful no-ops on retry.
       // Retrying a lost acknowledgement response preserves the original timestamp.
-      if (Object.hasOwn(svar, id) && svar[id].levererad_at === null) {
+      if (Object.hasOwn(svar, id) && svar[id].levererad_at === null && svar[id].answer_id === answerId) {
         const now = nowIso()
         // Persist machine evidence before marking delivered so a failed write
         // leaves the answer pending and the acknowledgement safe to retry.
         await ctx.settings.set(KVITTENS_KEY, now)
-        await ctx.settings.set(SVAR_KEY, markDelivered(svar, [id], now))
+        await ctx.settings.set(SVAR_KEY, markDelivered(svar, [{ id, answerId }], now))
       }
       ctx.log.info('underlagsjakt answer acknowledged', { transaction_id: id })
       return NextResponse.json({ data: { transaction_id: id } })
@@ -287,11 +298,13 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         })
       }
 
+      const now = nowIso()
       const state = await loadState(ctx.settings)
       const post = findPost(state.export, input.data.transaction_id)
       if (!post) return fail(404, 'POST_NOT_FOUND', 'Posten finns inte i den inlästa exporten.')
 
-      const built = buildBeslut(post, input.data)
+      const answerId = `${now}:${post.transaction_id}`
+      const built = buildBeslut(post, input.data, answerId)
       if (!built.ok) {
         return fail(
           400,
@@ -302,8 +315,8 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         )
       }
 
-      const recorded = recordAnswer(state.svar, post, built.beslut, built.reglering, ctx.userId, nowIso())
-      if (!recorded.ok) return fail(409, recorded.code, 'Svaret är redan skickat till bertil.')
+      const recorded = recordAnswer(state.svar, post, built.beslut, built.reglering, ctx.userId, now)
+      if (!recorded.ok) return fail(409, recorded.code, 'Svaret är redan erbjudet till bertil och kan inte ändras.')
       await ctx.settings.set(SVAR_KEY, recorded.svar)
 
       return NextResponse.json({ data: recorded.svar[post.transaction_id] })
@@ -323,7 +336,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       if (!result.ok) {
         return result.code === 'NOT_FOUND'
           ? fail(404, 'NOT_FOUND', 'Svaret finns inte.')
-          : fail(409, 'ALREADY_DELIVERED', 'Svaret är redan skickat till bertil.')
+          : fail(409, 'ALREADY_DELIVERED', 'Svaret är redan erbjudet till bertil och kan inte återtas.')
       }
       await ctx.settings.set(SVAR_KEY, result.svar)
       return NextResponse.json({ data: { transaction_id: transactionId } })
@@ -369,7 +382,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       }
 
       const state = await loadState(ctx.settings)
-      const svar = markDelivered(state.svar, ids, nowIso())
+      const svar = markDeliveredManual(state.svar, ids, nowIso())
       await ctx.settings.set(SVAR_KEY, svar)
       return NextResponse.json({ data: { pending_count: pendingBeslut(svar).length } })
     },

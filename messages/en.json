@@ -5707,7 +5707,8 @@
     "error_CANDIDATE_NOT_FOUND": "The document is not among the item's candidates.",
     "error_CANDIDATE_WITHOUT_HASH": "The document has no checksum and cannot be chosen.",
     "error_ALREADY_DELIVERED": "The answer has already been imported into bertil and cannot be changed here.",
-    "error_NOT_FOUND": "The answer does not exist."
+    "error_NOT_FOUND": "The answer does not exist.",
+    "status_offered": "Offered to bertil"
   },
   "extensions": {
     "page_title": "Extensions",
@@ -8708,5 +8709,5 @@
     "attn_create": "Create suggestions",
     "auto_created_title": "{count} suggestions created from the books",
     "auto_created_description": "Counterparts your vouchers name that are not in the register. Add them, or hide the ones that do not belong here."
-}
+  }
 }

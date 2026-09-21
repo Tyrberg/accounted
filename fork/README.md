@@ -648,7 +648,9 @@ GNUBOK_API_URL=https://bokforing.bohed.com
 GNUBOK_API_KEY=<the same value from step 1>
 ```
 
-Install a client that posts `{ "transaction_id": "<id>" }` to
+Install a client that posts
+`{ "transaction_id": "<id>", "answer_id": "<answer_id>" }` (both copied from
+the answer it ingested; a body without `answer_id` is rejected with 400) to
 `POST /svar/kvittens` after successful durable ingestion (including an
 already-ingested no-op). Use the same bearer token. Retry failed acknowledgements;
 never acknowledge failed ingestion. Update `fetch_svar`'s docstring to describe

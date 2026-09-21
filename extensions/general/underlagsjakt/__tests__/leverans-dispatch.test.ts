@@ -136,6 +136,7 @@ describe('bertil delivering through the extension dispatcher', () => {
       machineRequest(['underlagsjakt', 'export'], { method: 'POST', body: fixture }),
       pathParams('underlagsjakt', 'export'),
     )
+    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
@@ -143,6 +144,8 @@ describe('bertil delivering through the extension dispatcher', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
@@ -158,7 +161,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     // No acknowledgement after a failed consumer: the next poll must retry.
     const retry = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
     expect(await retry.json()).toEqual(body)
-    // A later export reopens the question without consuming its saved answer.
+    // A later export: the answered question stays answered (no 7-day reopen).
     const reexport = await POST(
       machineRequest(['underlagsjakt', 'export'], {
         method: 'POST', body: { ...fixture, generated_at: '2026-09-27T08:00:00.000Z' },
@@ -166,12 +169,12 @@ describe('bertil delivering through the extension dispatcher', () => {
       pathParams('underlagsjakt', 'export'),
     )
     expect(reexport.status).toBe(200)
-    expect((await reexport.json()).data.posts).toBe(3)
+    expect((await reexport.json()).data.posts).toBe(2)
     const retained = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
     expect(await retained.json()).toEqual(body)
     const ack = await POST(
       machineRequest(['underlagsjakt', 'svar', 'kvittens'], {
-        method: 'POST', body: { transaction_id: 'tx-moank-20260821' },
+        method: 'POST', body: { transaction_id: 'tx-moank-20260821', answer_id: answerId },
       }),
       pathParams('underlagsjakt', 'svar', 'kvittens'),
     )

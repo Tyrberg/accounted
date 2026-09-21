@@ -180,17 +180,21 @@ shared token, not by a session.
 |---|---|---|
 | Deliver an export | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export` | The root wrapper above |
 | Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4", "beslut": [...] }` |
-| Acknowledge ingestion | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar/kvittens` | `{ "transaction_id": "<id>" }` |
+| Acknowledge ingestion | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar/kvittens` | Acknowledgement request with both `transaction_id` and `answer_id` (see below) |
 
 All three calls send the token as `Authorization: Bearer <token>` (the `apikey`
 header is accepted as well, since bertil's client sets both).
 
 `GET /svar` offers every unacknowledged answer on every fetch. It never sets
 `levererad_at`. After successfully persisting each answer through
-`mottak_svar_fran_ui`, bertil must POST its transaction ID to
+`mottak_svar_fran_ui`, bertil must POST both the transaction ID and the answer ID to
 `/svar/kvittens`. An already-ingested no-op is also safe to acknowledge.
 Never acknowledge failed ingestion. Retry after network or server errors,
 including a lost acknowledgement response.
+
+Acknowledgement request body must include both fields:
+- **`transaction_id`** (string, required): The transaction ID from the answer.
+- **`answer_id`** (string, required): The answer ID from the answer. This ensures the acknowledgement matches the exact version that was ingested.
 
 Acknowledgement returns HTTP 200 with `{ "data": { "transaction_id": "<id>" } }`.
 Repeated acknowledgements preserve the original delivery timestamp. Unknown
@@ -199,9 +203,10 @@ Malformed JSON or a missing, blank, or non-string ID returns 400; authentication
 and configuration failures use the same 401/503 responses as the other calls.
 The answer file remains version 1.4.
 
-A question re-exported more than seven days after an unacknowledged answer
-reopens for the user. The stored answer remains available for retries until
-replaced or withdrawn. The standing check alarms after two days without an
+An unacknowledged answer stays on offer until it is acknowledged; a re-export
+does not reopen its question. Once an answer has been offered to bertil it can
+no longer be withdrawn or replaced in the UI (it shows as "Offered to bertil"
+until acknowledged). The standing check alarms after two days without an
 acknowledgement even when polling continues. Poll counts are not proof of ingestion.
 
 To check the configuration without writing anything, post a body the contract

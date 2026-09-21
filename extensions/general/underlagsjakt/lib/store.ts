@@ -40,6 +40,11 @@ export interface SvarRecord {
   post: PostSnapshot
   besvarad_at: string
   besvarad_av: string
+  /** Unique identity for this version of the answer. Used to match acknowledgements. */
+  answer_id: string
+  /** When the answer was first offered to bertil via GET /svar. Blocks withdrawal if set. */
+  erbjudet_at: string | null
+  /** When bertil acknowledged receiving and ingesting the answer via POST /svar/kvittens. */
   levererad_at: string | null
 }
 
@@ -63,8 +68,6 @@ export interface LeveransJournal {
   senast_hamtad_at: string
   /** How many answers that call carried. */
   senast_antal: number
-  /** Total answers offered over the machine path, including retries; not acknowledgements. */
-  totalt_antal: number
 }
 
 export function recordSvarHandover(
@@ -75,7 +78,6 @@ export function recordSvarHandover(
   return {
     senast_hamtad_at: now,
     senast_antal: count,
-    totalt_antal: (journal?.totalt_antal ?? 0) + count,
   }
 }
 
@@ -99,13 +101,9 @@ export function findPost(exp: StoredExport | null, transactionId: string): Post 
   return allPosts(exp).find((p) => p.transaction_id === transactionId) ?? null
 }
 
-/** Re-ask after seven days without acknowledgement, retaining the answer for retries. */
+/** Unanswered posts: no answer record exists. */
 export function openPosts(exp: StoredExport | null, svar: SvarMap): Post[] {
-  return allPosts(exp).filter((p) => {
-    const rec = svar[p.transaction_id]
-    return !rec || (rec.levererad_at === null &&
-      Date.parse(exp!.generated_at) - Date.parse(rec.besvarad_at) > 7 * 86_400_000)
-  })
+  return allPosts(exp).filter((p) => !svar[p.transaction_id])
 }
 
 /**
@@ -141,7 +139,10 @@ export function recordAnswer(
   now: string,
 ): RecordAnswerResult {
   const existing = svar[post.transaction_id]
-  if (existing?.levererad_at) return { ok: false, code: 'ALREADY_DELIVERED' }
+  if (existing?.levererad_at || existing?.erbjudet_at) {
+    return { ok: false, code: 'ALREADY_DELIVERED' }
+  }
+  const answerId = `${now}:${post.transaction_id}`
   return {
     ok: true,
     svar: {
@@ -161,6 +162,8 @@ export function recordAnswer(
         },
         besvarad_at: now,
         besvarad_av: userId,
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     },
@@ -175,6 +178,9 @@ export function withdrawAnswer(svar: SvarMap, transactionId: string): WithdrawRe
   const existing = svar[transactionId]
   if (!existing) return { ok: false, code: 'NOT_FOUND' }
   if (existing.levererad_at) return { ok: false, code: 'ALREADY_DELIVERED' }
+  if (existing.erbjudet_at !== null) {
+    return { ok: false, code: 'ALREADY_DELIVERED' }
+  }
   const next = { ...svar }
   delete next[transactionId]
   return { ok: true, svar: next }
@@ -188,7 +194,31 @@ export function pendingBeslut(svar: SvarMap): Beslut[] {
     .map((r) => r.beslut)
 }
 
-export function markDelivered(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
+export function markOffered(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
+  const next = { ...svar }
+  for (const id of transactionIds) {
+    const rec = next[id]
+    if (rec && rec.erbjudet_at === null) next[id] = { ...rec, erbjudet_at: now }
+  }
+  return next
+}
+
+export function markDelivered(
+  svar: SvarMap,
+  transactionIds: Array<{ id: string; answerId: string }>,
+  now: string,
+): SvarMap {
+  const next = { ...svar }
+  for (const entry of transactionIds) {
+    const rec = next[entry.id]
+    if (rec && rec.levererad_at === null && rec.answer_id === entry.answerId) {
+      next[entry.id] = { ...rec, levererad_at: now }
+    }
+  }
+  return next
+}
+
+export function markDeliveredManual(svar: SvarMap, transactionIds: string[], now: string): SvarMap {
   const next = { ...svar }
   for (const id of transactionIds) {
     const rec = next[id]

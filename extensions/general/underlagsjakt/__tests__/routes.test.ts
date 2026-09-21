@@ -266,18 +266,18 @@ describe('POST /svar', () => {
 
     const file = await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx)
     expect(file.headers.get('Content-Disposition')).toMatch(/attachment; filename="underlagsjakt-svar-.*\.json"/)
-    expect(await file.json()).toEqual({
-      version: '1.4',
-      beslut: [
-        {
-          transaction_id: 'tx-moank-20260821',
-          svarstyp: 'fel_bolag',
-          fel_bolag_mottagare: 'Villa Viola AB',
-          till_bolag: 'Villa Viola',
-          reglering: 'vidarefakturera',
-        },
-      ],
-    })
+    const fileJson = await file.json()
+    expect(fileJson.version).toBe('1.4')
+    expect(fileJson.beslut).toEqual([
+      expect.objectContaining({
+        answer_id: expect.any(String),
+        transaction_id: 'tx-moank-20260821',
+        svarstyp: 'fel_bolag',
+        fel_bolag_mottagare: 'Villa Viola AB',
+        till_bolag: 'Villa Viola',
+        reglering: 'vidarefakturera',
+      }),
+    ])
   })
 
   it('all answer types: chosen document, none of them, osaker', async () => {
@@ -309,12 +309,17 @@ describe('POST /svar', () => {
     }
     expect(file.beslut).toEqual([
       expect.objectContaining({
+        answer_id: expect.any(String),
         svarstyp: 'val_kandidat',
         vald_kandidat: 'google_workspace_juli.pdf',
         sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
         kalla: 'gmail:bohed',
       }),
-      { transaction_id: 'tx-ocr-20260812', svarstyp: 'osaker' },
+      expect.objectContaining({
+        answer_id: expect.any(String),
+        transaction_id: 'tx-ocr-20260812',
+        svarstyp: 'osaker',
+      }),
     ])
 
     const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))

@@ -374,6 +374,7 @@ describe('the delivery routes', () => {
   it('GET /svar retries failed ingestion until an explicit, idempotent acknowledgement', async () => {
     await route('POST', '/export').handler(request({ body: fixture }))
     // The import writes an (empty) svar row of its own; answer one post in it.
+    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
       'tx-moank-20260821': {
         beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
@@ -381,6 +382,8 @@ describe('the delivery routes', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: answerId,
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
@@ -402,7 +405,7 @@ describe('the delivery routes', () => {
     expect(second.body).toEqual(first.body)
     expect((await gatherEvidence()).lastAcknowledgedAt).toBeNull()
     const acknowledge = () => route('POST', '/svar/kvittens').handler(
-      request({ body: { transaction_id: 'tx-moank-20260821' } }),
+      request({ body: { transaction_id: 'tx-moank-20260821', answer_id: answerId } }),
     )
     expect((await acknowledge()).status).toBe(200)
     const acknowledged = structuredClone(storedValue('svar')) as Record<string, { levererad_at: string | null }>
@@ -475,10 +478,14 @@ describe('the delivery routes', () => {
       method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` }, body: '{',
     })
     expect((await route('POST', '/svar/kvittens').handler(malformed)).status).toBe(400)
-    const missing = await route('POST', '/svar/kvittens').handler(request({ body: { transaction_id: 'missing' } }))
+    const missing = await route('POST', '/svar/kvittens').handler(
+      request({ body: { transaction_id: 'missing', answer_id: 'missing-answer-id' } }),
+    )
     expect(missing.status).toBe(200)
     expect(await missing.json()).toEqual({ data: { transaction_id: 'missing' } })
-    const retry = await route('POST', '/svar/kvittens').handler(request({ body: { transaction_id: 'missing' } }))
+    const retry = await route('POST', '/svar/kvittens').handler(
+      request({ body: { transaction_id: 'missing', answer_id: 'missing-answer-id' } }),
+    )
     expect(retry.status).toBe(200)
     expect(slice.dataRows).toEqual([])
   })
@@ -502,9 +509,8 @@ describe('the delivery routes', () => {
     // A poll with no answers waiting: the only evidence the box gets that
     // bertil is still running at all.
     await route('GET', '/svar').handler(request())
-    const empty = storedValue('leverans') as { senast_antal: number; totalt_antal: number; senast_hamtad_at: string }
+    const empty = storedValue('leverans') as { senast_antal: number; senast_hamtad_at: string }
     expect(empty.senast_antal).toBe(0)
-    expect(empty.totalt_antal).toBe(0)
     expect(Date.parse(empty.senast_hamtad_at)).not.toBeNaN()
 
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
@@ -514,15 +520,17 @@ describe('the delivery routes', () => {
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
+        answer_id: '2026-09-19T08:00:00.000Z:tx-moank-20260821',
+        erbjudet_at: null,
         levererad_at: null,
       },
     }
     await route('GET', '/svar').handler(request())
-    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1, totalt_antal: 1 })
+    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1 })
 
     // Poll statistics count repeated offers, not confirmed consumption.
     await route('GET', '/svar').handler(request())
-    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1, totalt_antal: 2 })
+    expect(storedValue('leverans')).toMatchObject({ senast_antal: 1 })
   })
 })
 
@@ -544,7 +552,7 @@ describe('describeLeveransStatus', () => {
     companyProblem: null,
     companyId: 'company-1',
     export: { imported_at: recently, via: 'leverans' },
-    journal: { senast_hamtad_at: recently, senast_antal: 1, totalt_antal: 3 },
+    journal: { senast_hamtad_at: recently, senast_antal: 1 },
     pendingAnswers: 0,
     lastAcknowledgedAt: recently,
     oldestPendingAt: null,
@@ -676,7 +684,7 @@ describe('describeLeveransStatus', () => {
 
   it('fails while no answer has ever gone the other way, even though exports arrive', () => {
     const report = describeLeveransStatus(
-      evidence({ lastAcknowledgedAt: null, journal: { senast_hamtad_at: recently, senast_antal: 0, totalt_antal: 0 } }),
+      evidence({ lastAcknowledgedAt: null, journal: { senast_hamtad_at: recently, senast_antal: 0 } }),
       NOW,
     )
     expect(report.exitCode).toBe(2)
@@ -688,7 +696,7 @@ describe('describeLeveransStatus', () => {
   it('alarms on overdue unacknowledged answers despite fresh repeated polls and past acknowledgements', () => {
     const report = describeLeveransStatus(evidence({
       pendingAnswers: 1, oldestPendingAt: stale,
-      journal: { senast_hamtad_at: recently, senast_antal: 1, totalt_antal: 999 },
+      journal: { senast_hamtad_at: recently, senast_antal: 1 },
     }), NOW)
     expect(report.exitCode).toBe(2)
     expect(labels(report, 'alarm')).toContain('waiting')
@@ -713,7 +721,7 @@ describe('describeLeveransStatus', () => {
     const report = describeLeveransStatus(
       evidence({
         export: { imported_at: stale, via: 'leverans' },
-        journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 },
+        journal: { senast_hamtad_at: stale, senast_antal: 1 },
       }),
       NOW,
     )
@@ -742,7 +750,7 @@ describe('describeLeveransStatus', () => {
 
   it('alarms when bertil stopped collecting, even though exports still arrive daily', () => {
     const report = describeLeveransStatus(
-      evidence({ journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 } }),
+      evidence({ journal: { senast_hamtad_at: stale, senast_antal: 1 } }),
       NOW,
     )
     expect(report.exitCode).toBe(2)
@@ -756,7 +764,7 @@ describe('describeLeveransStatus', () => {
     const report = describeLeveransStatus(
       evidence({
         export: { imported_at: stale, via: 'leverans' },
-        journal: { senast_hamtad_at: stale, senast_antal: 1, totalt_antal: 3 },
+        journal: { senast_hamtad_at: stale, senast_antal: 1 },
       }),
       NOW,
     )
