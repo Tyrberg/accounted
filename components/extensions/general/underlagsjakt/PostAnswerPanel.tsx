@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { useTranslations } from 'next-intl'
 import { Eye, Loader2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -106,18 +106,23 @@ export function PostAnswerPanel({
   const [viewerFilnamn, setViewerFilnamn] = useState<string | null>(null)
   const [viewerUrl, setViewerUrl] = useState<string | null>(null)
   const [viewerMimeType, setViewerMimeType] = useState<string | null>(null)
+  const [isNarrowScreen, setIsNarrowScreen] = useState(true)
   const blobUrlRef = useRef<string | null>(null)
 
-  const checkScreenWidth = () => {
-    if (typeof window !== 'undefined') {
-      return window.innerWidth < 1024 // lg breakpoint from Tailwind
+  // Listen for window resize and update layout mode dynamically
+  useEffect(() => {
+    const handleResize = () => {
+      setIsNarrowScreen(window.innerWidth < 1024) // lg breakpoint from Tailwind
     }
-    return true // Default to modal on SSR
-  }
+    handleResize()
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
 
   const handleCloseViewer = () => {
     setShowViewer(false)
     setViewerFilnamn(null)
+    setViewerUrl(null)
     // Revoke blob URL when viewer closes
     if (blobUrlRef.current) {
       URL.revokeObjectURL(blobUrlRef.current)
@@ -126,6 +131,10 @@ export function PostAnswerPanel({
   }
 
   const showBlob = (data: ArrayBuffer, filnamn: string, mimeType: string) => {
+    // Revoke previous blob URL before creating new one to avoid leaks
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current)
+    }
     const url = URL.createObjectURL(new Blob([data], { type: mimeType || 'application/pdf' }))
     blobUrlRef.current = url
     setViewerFilnamn(filnamn)
@@ -135,13 +144,9 @@ export function PostAnswerPanel({
 
   const openViewerForStoredDocument = async (candidate: Kandidat) => {
     if (!(candidate.storage_path && candidate.mime_type)) return
-    setViewerFilnamn(candidate.filnamn)
-    setViewerMimeType(candidate.mime_type)
-    setShowViewer(true)
     const result = await getDocumentSignedUrl(candidate.storage_path)
     if (!result.signedUrl) {
       toast({ title: t('document_loading_error'), variant: 'destructive' })
-      setShowViewer(false)
       return
     }
     // Never trust the export's storage_path blindly: only the bytes actually
@@ -160,10 +165,11 @@ export function PostAnswerPanel({
       } else {
         toast({ title: t('document_loading_error'), variant: 'destructive' })
       }
-      setShowViewer(false)
       return
     }
+    // Only show the viewer after the blob is ready, never with a missing or stale URL
     showBlob(verified.data, candidate.filnamn, candidate.mime_type)
+    setShowViewer(true)
   }
 
   const openViewerForDiskFile = async (file: File, candidate: Kandidat) => {
@@ -842,11 +848,12 @@ export function PostAnswerPanel({
       </div>
       {showViewer && viewerUrl && viewerFilnamn && (
         <DocumentViewer
+          key={viewerFilnamn}
           filnamn={viewerFilnamn}
           mimeType={viewerMimeType}
           signedUrl={viewerUrl}
           onClose={handleCloseViewer}
-          isModal={checkScreenWidth()}
+          isModal={isNarrowScreen}
         />
       )}
     </div>

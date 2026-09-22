@@ -635,6 +635,47 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
     },
   },
   {
+    method: 'POST',
+    path: '/documents/signed-url',
+    handler: async (request, ctx) => {
+      if (!ctx) return unauthorized()
+
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return fail(400, 'INVALID_JSON', 'Ogiltig JSON.')
+      }
+
+      const storagePath = body && typeof body === 'object'
+        ? (body as { storagePath?: unknown }).storagePath
+        : undefined
+      if (!storagePath || typeof storagePath !== 'string') {
+        return fail(400, 'INVALID_STORAGE_PATH', 'Sökvägen är obligatorisk och måste vara en sträng.')
+      }
+
+      const pathParts = storagePath.split('/')
+      if (pathParts.length < 3 || pathParts[0] !== 'documents') {
+        return fail(400, 'INVALID_STORAGE_PATH', 'Sökvägen följer inte det förväntade formatet.')
+      }
+
+      const companyIdFromPath = pathParts[1]
+      if (ctx.companyId !== companyIdFromPath) {
+        return fail(403, 'ACCESS_DENIED', 'Du har inte åtkomst till denna fil.')
+      }
+
+      const { data, error } = await ctx.supabase.storage
+        .from('documents')
+        .createSignedUrl(storagePath, 3600)
+
+      if (error || !data?.signedUrl) {
+        return fail(500, 'SIGNED_URL_FAILED', 'Kunde inte generera signerad URL.')
+      }
+
+      return NextResponse.json({ signedUrl: data.signedUrl })
+    },
+  },
+  {
     method: 'GET',
     path: '/svarsfil',
     handler: async (_request, ctx) => {

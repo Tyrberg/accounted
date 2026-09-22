@@ -42,8 +42,21 @@ export function DocumentViewer({
   isModal = false,
 }: DocumentViewerProps) {
   const t = useTranslations('underlagsjakt')
-  const [error, setError] = useState<'unsupported' | 'loading' | null>(() => getInitialError(signedUrl, mimeType))
-  const [isLoading, setIsLoading] = useState(true)
+  const [state, setState] = useState(() => ({
+    error: getInitialError(signedUrl, mimeType),
+    isLoading: true,
+  }))
+
+  // Reset error and loading state when signedUrl or mimeType changes (e.g., opening a different document)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setState({
+      error: getInitialError(signedUrl, mimeType),
+      isLoading: true,
+    })
+  }, [signedUrl, mimeType])
+
+  const { error, isLoading } = state
 
   const handleClose = useCallback(() => {
     if (onClose) onClose()
@@ -97,8 +110,8 @@ export function DocumentViewer({
               src={`${signedUrl}#toolbar=0`}
               className="flex-1 border border-border rounded-lg w-full"
               title={filnamn}
-              onLoad={() => setIsLoading(false)}
-              onError={() => setError('loading')}
+              onLoad={() => setState((s) => ({ ...s, isLoading: false }))}
+              onError={() => setState((s) => ({ ...s, error: 'loading' }))}
             />
           ) : mimeType?.startsWith('image/') ? (
             <div className="flex-1 overflow-auto flex items-center justify-center bg-muted/30 rounded-lg border border-border">
@@ -107,8 +120,8 @@ export function DocumentViewer({
                 src={signedUrl}
                 alt={filnamn}
                 className="max-w-full max-h-full object-contain"
-                onLoad={() => setIsLoading(false)}
-                onError={() => setError('loading')}
+                onLoad={() => setState((s) => ({ ...s, isLoading: false }))}
+                onError={() => setState((s) => ({ ...s, error: 'loading' }))}
               />
             </div>
           ) : (

@@ -147,4 +147,133 @@ describe('DocumentViewer', () => {
     expect(html).toContain('invoice.pdf')
     expect(html).toContain('iframe')
   })
+
+  it('clears error state when signed URL becomes available', () => {
+    const mockOnClose = () => {}
+
+    // First render with no signed URL (error state)
+    const htmlError = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="photo.jpg"
+          mimeType="image/jpeg"
+          signedUrl={undefined}
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(htmlError).toContain('kunde inte')
+
+    // Then render with signed URL (error should clear)
+    const html = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="photo.jpg"
+          mimeType="image/jpeg"
+          signedUrl="https://example.com/photo.jpg"
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(html).toContain('img')
+    expect(html).not.toContain('kunde inte')
+  })
+
+  it('renders different documents when key changes (simulating close/reopen)', () => {
+    const mockOnClose = () => {}
+    const html1 = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          key="photo1.jpg"
+          filnamn="photo1.jpg"
+          mimeType="image/jpeg"
+          signedUrl="https://example.com/photo1.jpg"
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(html1).toContain('photo1.jpg')
+
+    const html2 = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          key="photo2.jpg"
+          filnamn="photo2.jpg"
+          mimeType="image/jpeg"
+          signedUrl="https://example.com/photo2.jpg"
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(html2).toContain('photo2.jpg')
+    expect(html2).not.toContain('photo1.jpg')
+  })
+
+  it('switches from sidebar to modal layout on narrow screens', () => {
+    const mockOnClose = () => {}
+
+    // Wide screen: sidebar layout
+    const htmlWide = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="receipt.pdf"
+          mimeType="application/pdf"
+          signedUrl="https://example.com/receipt.pdf"
+          onClose={mockOnClose}
+          isModal={false}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(htmlWide).toContain('lg:flex')
+    expect(htmlWide).not.toContain('fixed inset-0')
+
+    // Narrow screen: modal layout
+    const htmlNarrow = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="receipt.pdf"
+          mimeType="application/pdf"
+          signedUrl="https://example.com/receipt.pdf"
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(htmlNarrow).toContain('fixed inset-0')
+    expect(htmlNarrow).not.toContain('lg:flex')
+  })
+
+  it('supports both PDF and image MIME types in modal and sidebar modes', () => {
+    const mockOnClose = () => {}
+
+    const pdfModal = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="invoice.pdf"
+          mimeType="application/pdf"
+          signedUrl="https://example.com/invoice.pdf"
+          onClose={mockOnClose}
+          isModal={true}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(pdfModal).toContain('iframe')
+
+    const imageSidebar = renderToStaticMarkup(
+      <NextIntlClientProvider locale="sv" messages={{ underlagsjakt: sv.underlagsjakt }}>
+        <DocumentViewer
+          filnamn="photo.jpg"
+          mimeType="image/jpeg"
+          signedUrl="https://example.com/photo.jpg"
+          onClose={mockOnClose}
+          isModal={false}
+        />
+      </NextIntlClientProvider>,
+    )
+    expect(imageSidebar).toContain('img')
+  })
 })
