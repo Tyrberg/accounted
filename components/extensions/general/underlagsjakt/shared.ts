@@ -1,4 +1,5 @@
-import type { Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
+import { roundOre } from '@/lib/money'
+import type { Kandidat, Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord, WaitingRow } from '@/extensions/general/underlagsjakt/lib/store'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
@@ -231,6 +232,32 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
       begransa_bolag: state.begransaBolag,
       begransa_belopp: state.begransaBelopp,
     },
+  }
+}
+
+export interface CandidateSumSummary {
+  /** Sum of every chosen candidate's `belopp` that carries one, öre-rounded. Same sign convention as the payment: negative for outgoing (docs/underlagsjakt-export-schema.md). */
+  sum: number
+  /** Chosen candidates with no `belopp` yet: excluded from `sum` rather than treated as zero. */
+  missingBeloppCount: number
+  /** `paymentBelopp - sum`, öre-rounded, same sign convention as both operands. Zero once the chosen documents fully cover the payment. */
+  diff: number
+}
+
+/**
+ * Compares what's chosen against what the payment moved, in the payment's own
+ * sign convention throughout (never `Math.abs` on one side only): a payment
+ * of -35000 fully covered by candidates of -15000 and -20000 must net to a
+ * diff of 0, not a spurious 70000. Pure and separately tested so the sign
+ * handling can be verified without going through the component's render.
+ */
+export function summarizeSelectedCandidates(paymentBelopp: number, selected: Kandidat[]): CandidateSumSummary {
+  const known = selected.filter((k): k is Kandidat & { belopp: number } => typeof k.belopp === 'number')
+  const sum = roundOre(known.reduce((total, k) => total + k.belopp, 0))
+  return {
+    sum,
+    missingBeloppCount: selected.length - known.length,
+    diff: roundOre(paymentBelopp - sum),
   }
 }
 

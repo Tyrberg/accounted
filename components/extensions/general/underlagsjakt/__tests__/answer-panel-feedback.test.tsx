@@ -20,10 +20,11 @@ import {
   interpretSaveResult,
   submitAnswer,
   submitBulkAnswer,
+  summarizeSelectedCandidates,
   type SaveOutcome,
   type T,
 } from '../shared'
-import type { Post } from '@/extensions/general/underlagsjakt/lib/contract'
+import type { Kandidat, Post } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
 /**
@@ -275,6 +276,46 @@ describe('the count shown before the user confirms', () => {
     const messages = locale === 'sv' ? sv : en
     const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
     expect(translate('levererar_sjalv_count', { count })).toContain(expected)
+  })
+})
+
+describe('summarizeSelectedCandidates', () => {
+  const kandidat = (belopp: number | null): Kandidat => ({
+    filnamn: 'lon.pdf',
+    kalla: 'gmail:löner',
+    datum: '2026-09-20',
+    bevisgrund: 'belopp matchar',
+    sha256: 'a'.repeat(64),
+    belopp,
+  })
+
+  it('nets a same-sign payment and candidates to zero: the reported salary case (payment -35000, löneunderlag -15000 and -20000)', () => {
+    const result = summarizeSelectedCandidates(-35000, [kandidat(-15000), kandidat(-20000)])
+    expect(result).toEqual({ sum: -35000, missingBeloppCount: 0, diff: 0 })
+  })
+
+  it('reports a real shortfall, not a doubled one, when the candidates only partly cover an outgoing payment', () => {
+    const result = summarizeSelectedCandidates(-35000, [kandidat(-15000), kandidat(-10000)])
+    expect(result.sum).toBe(-25000)
+    expect(result.diff).toBe(-10000)
+  })
+
+  it('excludes candidates without a belopp from the sum instead of treating them as zero', () => {
+    const result = summarizeSelectedCandidates(-35000, [kandidat(-15000), kandidat(null)])
+    expect(result.sum).toBe(-15000)
+    expect(result.missingBeloppCount).toBe(1)
+    expect(result.diff).toBe(-20000)
+  })
+
+  it('rounds the sum to the nearest öre instead of letting float drift show through', () => {
+    const result = summarizeSelectedCandidates(-0.3, [kandidat(-0.1), kandidat(-0.2)])
+    expect(result.sum).toBe(-0.3)
+    expect(result.diff).toBe(0)
+  })
+
+  it('nets a same-sign incoming payment to zero as well', () => {
+    const result = summarizeSelectedCandidates(35000, [kandidat(15000), kandidat(20000)])
+    expect(result).toEqual({ sum: 35000, missingBeloppCount: 0, diff: 0 })
   })
 })
 

@@ -168,7 +168,7 @@ A supporting document (email, invoice, receipt).
 - **`datum`** (ISO8601 date string or null, required): Document date.
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
-- **`belopp`** (number or null, optional): The amount this specific document covers, when known (e.g. one person's löneunderlag out of a payment covering several). Absent on every export version to date; used only to sharpen the chosen-vs-payment sum Accounted shows once more than one candidate is chosen. A missing or null value never blocks a selection.
+- **`belopp`** (number or null, optional): The amount this specific document covers, when known (e.g. one person's löneunderlag out of a payment covering several). Same sign convention as the post's own `belopp` (negative for outgoing): the sum of every chosen candidate's `belopp` is compared to the post's `belopp` directly, not by absolute value, so a payment of -35000 covered exactly by candidates of -15000 and -20000 nets to a difference of zero. Absent on every export version to date; used only to sharpen the chosen-vs-payment sum Accounted shows once more than one candidate is chosen. A missing or null value never blocks a selection.
 
 ## Answers (`beslut`)
 

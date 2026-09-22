@@ -11,7 +11,6 @@ import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
-import { roundOre } from '@/lib/money'
 import { isAccountNumber } from '@/lib/invariants/account-number'
 import { INBOX_MAX_UPLOAD_BYTES, exceedsHostedUploadLimit, formatMegabytes, isShrinkableImage, tooLargeMessage } from '@/lib/documents/upload-size'
 import { shrinkImageForUpload } from '@/lib/documents/shrink-image'
@@ -41,6 +40,7 @@ import {
   deriveTillBolag,
   submitAnswer,
   submitBulkAnswer,
+  summarizeSelectedCandidates,
 } from './shared'
 
 import { suggestAnswerAccount } from './account-suggestion'
@@ -116,10 +116,10 @@ export function PostAnswerPanel({
   const selectedCandidates = candidates.filter((k) => chosen.has(k.sha256))
   // bertil does not send belopp on every candidate (or any, yet): sum what it knows and say
   // plainly when a chosen document is not part of the sum, instead of a confidently wrong total.
-  const knownBeloppCandidates = selectedCandidates.filter((k) => typeof k.belopp === 'number')
-  const selectedSum = knownBeloppCandidates.reduce((sum, k) => sum + (k.belopp as number), 0)
-  const missingBeloppCount = selectedCandidates.length - knownBeloppCandidates.length
-  const selectedDiff = roundOre(Math.abs(post.belopp) - selectedSum)
+  // summarizeSelectedCandidates keeps the payment's own sign throughout (both belopp fields are
+  // negative for outgoing), so the diff is never computed by mixing a signed sum against an
+  // absolute-valued payment.
+  const { sum: selectedSum, missingBeloppCount, diff: selectedDiff } = summarizeSelectedCandidates(post.belopp, selectedCandidates)
   const [motpart, setMotpart] = useState(post.motpart)
   const [kategori, setKategori] = useState<Kategori | undefined>(suggestedKategori)
   const [basKontoOverride, setBasKontoOverride] = useState<string | undefined>(undefined)
@@ -385,7 +385,7 @@ export function PostAnswerPanel({
             {selectedCandidates.length > 1 && (
               <p className="text-[12.5px] text-muted-foreground" aria-live="polite">
                 {t('candidates_selected_sum', {
-                  sum: formatCurrency(selectedSum, post.valuta),
+                  sum: formatCurrency(Math.abs(selectedSum), post.valuta),
                   belopp: formatCurrency(Math.abs(post.belopp), post.valuta),
                 })}
                 {missingBeloppCount > 0

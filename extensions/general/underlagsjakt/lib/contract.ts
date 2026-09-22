@@ -130,8 +130,11 @@ const kandidatSchema = z
     sha256: z.string(),
     /**
      * Optional: the amount this specific document covers, when bertil knows
-     * it (e.g. a löneunderlag's net pay). Absent on every export version to
-     * date, so a selection is never blocked on it; it only sharpens the
+     * it (e.g. a löneunderlag's net pay). Same sign convention as the post's
+     * own `belopp` (negative for outgoing): summing every chosen candidate's
+     * `belopp` and comparing it to the post's `belopp` is a same-sign
+     * subtraction, not an absolute-value one. Absent on every export version
+     * to date, so a selection is never blocked on it; it only sharpens the
      * chosen-vs-payment sum shown when more than one candidate is chosen.
      */
     belopp: z.number().nullable().optional(),
