@@ -40,7 +40,7 @@ const BASE_VAL_KANDIDAT = {
   mode: 'val_kandidat' as const,
   transactionId: 't1',
   hasCandidate: true,
-  sha256: null,
+  sha256: [] as string[],
   kategori: 'bankavgift' as const,
   motpart: 'Banken',
   basKonto: '',
@@ -278,6 +278,26 @@ describe('the count shown before the user confirms', () => {
   })
 })
 
+describe('the sum shown against selected underlag', () => {
+  it.each([
+    ['sv', 1, 'Ett valt dokument saknar belopp'],
+    ['sv', 2, '2 valda dokument saknar belopp'],
+    ['en', 1, 'One selected document has no amount'],
+    ['en', 2, '2 selected documents have no amount'],
+  ] as const)('pluralizes the missing-belopp note correctly in %s for count %i', (locale, count, expected) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    expect(translate('candidates_selected_sum_missing_belopp', { count })).toContain(expected)
+  })
+
+  it.each(['sv', 'en'] as const)('names the selected sum against the payment amount in %s', (locale) => {
+    const messages = locale === 'sv' ? sv : en
+    const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
+    expect(translate('candidates_selected_sum', { sum: '20 000 kr', belopp: '35 000 kr' })).toContain('20 000 kr')
+    expect(translate('candidates_selected_sum', { sum: '20 000 kr', belopp: '35 000 kr' })).toContain('35 000 kr')
+  })
+})
+
 describe('submitBulkAnswer', () => {
   const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'HI3G' }
   const respond = (ok: boolean, body: unknown) => vi.fn().mockResolvedValue({ ok, json: async () => body })
@@ -385,6 +405,7 @@ const SVAR_RECORD: SvarRecord = {
     transaction_id: 't1',
     svarstyp: 'val_kandidat',
     vald_kandidat: null,
+    vald_kandidater: [],
     motpart: 'Banken',
     kategori: 'bankavgift',
     bas_konto: null,
@@ -447,6 +468,30 @@ describe('answerSummary', () => {
   it('describes a val_kandidat save without a chosen document', () => {
     expect(answerSummary(t, SVAR_RECORD)).toContain('Banken')
   })
+
+  it('summarizes a val_kandidat save with more than one chosen document by count, not by naming just the first', () => {
+    const multi = {
+      ...SVAR_RECORD,
+      beslut: {
+        ...SVAR_RECORD.beslut,
+        vald_kandidat: 'lon_mattias.pdf',
+        vald_kandidater: [
+          { filnamn: 'lon_mattias.pdf', sha256: 'a'.repeat(64), kalla: 'gmail:löner' },
+          { filnamn: 'lon_jennie.pdf', sha256: 'b'.repeat(64), kalla: 'gmail:löner' },
+        ],
+      },
+    } as SvarRecord
+    expect(answerSummary(t, multi)).toBe('answer_val_kandidat_multi:{"count":2,"kategori":"Bankavgift"}')
+  })
+
+  it('does not throw for a val_kandidat answer stored before vald_kandidater existed', () => {
+    const { vald_kandidater: _omit, ...preDeployBeslut } = SVAR_RECORD.beslut as typeof SVAR_RECORD.beslut & {
+      vald_kandidater: unknown
+    }
+    const preDeploy = { ...SVAR_RECORD, beslut: { ...preDeployBeslut, vald_kandidat: 'kvitto.pdf' } } as SvarRecord
+    expect(() => answerSummary(t, preDeploy)).not.toThrow()
+    expect(answerSummary(t, preDeploy)).toContain('kvitto.pdf')
+  })
 })
 
 describe('interpretSaveResult', () => {
@@ -497,7 +542,13 @@ describe('PostAnswerPanel: rendered correctly', () => {
     tvetydiga_alternativ: [],
   }
 
-  function renderPanel(postOverride?: Partial<Post>, bolagChoices?: string[], uploadEnabled = true, leverarSjalvEnabled = false) {
+  function renderPanel(
+    postOverride?: Partial<Post>,
+    bolagChoices?: string[],
+    uploadEnabled = true,
+    leverarSjalvEnabled = false,
+    multiKandidatEnabled = false,
+  ) {
     let finalPost: Post = post
     if (postOverride?.forslag) {
       const baseForslag = post.forslag || { kategori: '', varfor: '', bas_konto: null, momstyp: null }
@@ -524,7 +575,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
           messages: sv,
           timeZone: 'Europe/Stockholm',
         } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-        createElement(PostAnswerPanel, { post: finalPost, posts: [finalPost], bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, leverarSjalvEnabled, onAnswered: async () => {} })
+        createElement(PostAnswerPanel, { post: finalPost, posts: [finalPost], bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, leverarSjalvEnabled, multiKandidatEnabled, onAnswered: async () => {} })
       )
     )
   }
@@ -549,6 +600,34 @@ describe('PostAnswerPanel: rendered correctly', () => {
     // Nothing found is no longer a dead end: the upload path is offered next to it.
     expect(html).toContain('Ladda upp dokumentet här')
     expect(html).toContain('Ladda upp underlag')
+  })
+
+  const TWO_CANDIDATES: Partial<Post> = {
+    kandidater: [
+      { filnamn: 'lon_mattias.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'a'.repeat(64) },
+      { filnamn: 'lon_jennie.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'b'.repeat(64) },
+    ],
+  }
+
+  it('renders candidates as radio buttons while multi-select is off, even with several candidates', () => {
+    const html = renderPanel(TWO_CANDIDATES, undefined, true, false, false)
+    expect(html).toContain('type="radio"')
+    expect(html).not.toContain(msg.candidates_legend_multi_hint)
+  })
+
+  it('renders candidates as checkboxes (no radio input left in val_kandidat mode) once multi-select is on and there is more than one candidate', () => {
+    const html = renderPanel(TWO_CANDIDATES, undefined, true, false, true)
+    expect(html).toContain(msg.candidates_legend_multi_hint)
+    expect(html).toContain('lon_mattias.pdf')
+    expect(html).toContain('lon_jennie.pdf')
+    // val_kandidat is the default (and only rendered) mode here, so no radio group of any
+    // kind (candidates, "none of them", fel_bolag) should remain in the markup.
+    expect(html).not.toContain('type="radio"')
+  })
+
+  it('keeps a single candidate on a radio button even with multi-select on: one choice never gets harder', () => {
+    const html = renderPanel(undefined, undefined, true, false, true)
+    expect(html).not.toContain(msg.candidates_legend_multi_hint)
   })
 
   it('does not offer the upload path while it is switched off', () => {
@@ -620,7 +699,7 @@ describe('PostAnswerPanel: submit handler behavior', () => {
     const input = {
       svarstyp: 'val_kandidat' as const,
       transaction_id: 't1',
-      sha256: null,
+      sha256: [],
       motpart: 'Banken',
       kategori: 'bankavgift' as const,
       bas_konto: null,
@@ -644,7 +723,7 @@ describe('PostAnswerPanel: submit handler behavior', () => {
       mode: 'val_kandidat' as const,
       transactionId: 't1',
       hasCandidate: true, // User has chosen "none" or selected a document
-      sha256: null, // User chose "no document"
+      sha256: [], // User chose "no document"
       kategori: 'bankavgift' as const,
       motpart: 'Banken',
       basKonto: '', // Empty is OK
@@ -661,7 +740,7 @@ describe('PostAnswerPanel: submit handler behavior', () => {
       mode: 'val_kandidat' as const,
       transactionId: 't1',
       hasCandidate: true,
-      sha256: null,
+      sha256: [],
       kategori: 'bankavgift' as const,
       motpart: 'Banken',
       basKonto: 'invalid-not-a-number',
@@ -727,6 +806,11 @@ describe('translations for the new copy exist in both locales', () => {
     'status_underlag_hittat',
     'error_COUNT_CHANGED',
     'error_FEATURE_DISABLED',
+    'answer_val_kandidat_multi',
+    'candidates_legend_multi_hint',
+    'candidates_selected_sum',
+    'candidates_selected_sum_diff',
+    'candidates_selected_sum_missing_belopp',
   ]
 
   it.each(keys)('%s exists in sv.json and en.json', (key) => {

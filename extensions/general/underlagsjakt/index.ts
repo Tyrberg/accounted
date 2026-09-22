@@ -32,6 +32,7 @@ import {
   buildUppladdatBeslut,
   bulkSvarInputSchema,
   leverarSjalvEnabled,
+  multiKandidatEnabled,
   parseExport,
   svarInputSchema,
   uppladdatInputSchema,
@@ -184,6 +185,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
           answer_version: ANSWER_VERSION,
           underlag_upload_enabled: uploadEnabled(),
           levererar_sjalv_enabled: leverarSjalvEnabled(),
+          multi_kandidat_enabled: multiKandidatEnabled(),
           leverans: { till_detta_bolag: leveransHit },
           export: exp
             ? {
@@ -327,6 +329,9 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
 
       if (input.data.svarstyp === 'levererar_sjalv' && !leverarSjalvEnabled()) {
         return fail(403, 'FEATURE_DISABLED', 'Svarstypen "jag levererar underlaget själv" är inte påslagen.')
+      }
+      if (input.data.svarstyp === 'val_kandidat' && input.data.sha256.length > 1 && !multiKandidatEnabled()) {
+        return fail(403, 'FEATURE_DISABLED', 'Att välja flera dokument till samma betalning är inte påslaget.')
       }
 
       const now = nowIso()

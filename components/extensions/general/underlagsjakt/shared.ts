@@ -9,6 +9,8 @@ export interface WorkspaceData {
   underlag_upload_enabled: boolean
   /** Whether the "I'll deliver it myself" answer is switched on (bertil understands levererar_sjalv). */
   levererar_sjalv_enabled: boolean
+  /** Whether a val_kandidat answer may choose more than one document (bertil understands vald_kandidater). */
+  multi_kandidat_enabled: boolean
   /** Whether bertil's delivery lands in the company being viewed, not merely somewhere on this box. */
   leverans: { till_detta_bolag: boolean }
   export: {
@@ -109,8 +111,10 @@ export interface AnswerFormState {
   transactionId: string
   /** The file chosen in uppladdat_underlag mode; undefined until one is picked. */
   file?: File
+  /** Whether the user has made an explicit choice: some candidate(s), or "none of them". */
   hasCandidate: boolean
-  sha256: string | null
+  /** sha256 of every chosen candidate. Empty when nothing is chosen yet, or "none of them" is chosen. */
+  sha256: string[]
   kategori?: Kategori
   motpart: string
   basKonto: string
@@ -243,6 +247,10 @@ export function answerSummary(t: T, rec: SvarRecord): string {
   }
   const kategori = t(`kategori_${b.kategori}`)
   if (b.svarstyp === 'uppladdat_underlag') return t('answer_uppladdat_underlag', { filnamn: b.filnamn, kategori })
+  const valdKandidater = b.vald_kandidater ?? []
+  if (valdKandidater.length > 1) {
+    return t('answer_val_kandidat_multi', { count: valdKandidater.length, kategori })
+  }
   return b.vald_kandidat
     ? t('answer_val_kandidat', { filnamn: b.vald_kandidat, kategori })
     : t('answer_ingen_kandidat', { motpart: b.motpart, kategori })

@@ -260,7 +260,7 @@ describe('POST /svar', () => {
         post('/svar', {
           svarstyp: 'val_kandidat',
           transaction_id: 'tx-google-20260803',
-          sha256: 'f'.repeat(64),
+          sha256: ['f'.repeat(64)],
           motpart: 'GOOGLE*WORKSPACE',
           kategori: 'leverantor',
           bas_konto: null,
@@ -315,7 +315,7 @@ describe('POST /svar', () => {
           post('/svar', {
             svarstyp: 'val_kandidat',
             transaction_id: 'tx-google-20260803',
-            sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            sha256: ['a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'],
             motpart: 'GOOGLE*WORKSPACE',
             kategori: 'leverantor',
             bas_konto: '5420',
@@ -339,6 +339,13 @@ describe('POST /svar', () => {
         vald_kandidat: 'google_workspace_juli.pdf',
         sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
         kalla: 'gmail:bohed',
+        vald_kandidater: [
+          {
+            filnamn: 'google_workspace_juli.pdf',
+            sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            kalla: 'gmail:bohed',
+          },
+        ],
       }),
       expect.objectContaining({
         answer_id: expect.any(String),
@@ -685,6 +692,71 @@ describe('levererar_sjalv', () => {
     await importFixture(ctx)
     const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
     expect(body.data.waiting.map((w) => w.underlag_hittat_at)).toEqual([null])
+  })
+})
+
+describe('val_kandidat: choosing more than one document', () => {
+  const twoDocuments = {
+    svarstyp: 'val_kandidat',
+    transaction_id: 'tx-google-20260803',
+    sha256: [
+      'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    ],
+    motpart: 'GOOGLE*WORKSPACE',
+    kategori: 'leverantor',
+    bas_konto: null,
+    momstyp: null,
+    begransa_bolag: false,
+    begransa_belopp: false,
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('a single choice is unaffected: still stored as before, whatever the flag says', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const res = await route('POST', '/svar').handler(post('/svar', { ...twoDocuments, sha256: [twoDocuments.sha256[0]] }), ctx)
+    expect(res.status).toBe(200)
+  })
+
+  it('refuses a second document with 403 FEATURE_DISABLED while the flag is off, and stores nothing', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const before = JSON.stringify([...store.entries()])
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar').handler(post('/svar', twoDocuments), ctx),
+    )
+    expect(status).toBe(403)
+    expect(body.error.code).toBe('FEATURE_DISABLED')
+    expect(JSON.stringify([...store.entries()])).toBe(before)
+  })
+
+  it('records every chosen document once the flag is on, and the file is stamped 1.6', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    expect((await route('POST', '/svar').handler(post('/svar', twoDocuments), ctx)).status).toBe(200)
+
+    const file = await parseJsonResponse<{ version: string; beslut: { vald_kandidater?: unknown[] }[] }>(
+      await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx),
+    )
+    expect(file.body.version).toBe('1.6')
+    expect(file.body.beslut[0].vald_kandidater).toHaveLength(2)
+  })
+
+  it('GET / tells the workspace whether choosing several documents is switched on', async () => {
+    const off = await parseJsonResponse<{ data: { multi_kandidat_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(off.body.data.multi_kandidat_enabled).toBe(false)
+    vi.stubEnv('UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED', 'true')
+    const on = await parseJsonResponse<{ data: { multi_kandidat_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(on.body.data.multi_kandidat_enabled).toBe(true)
   })
 })
 

@@ -3,11 +3,12 @@
  * docs/underlagsjakt-export-schema.md (version 1.1), with the MOANK/Avizion
  * wrong-company case from Mattias's decision 2026-09-17.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import fixture from './fixtures/export-1.1.json'
 import fixture14 from './fixtures/export-1.4.json'
 import {
   ANSWER_VERSION,
+  ANSWER_VERSION_MULTI_KANDIDAT,
   ANSWER_VERSION_UPLOAD,
   buildAnswerFile,
   buildBeslut,
@@ -15,6 +16,7 @@ import {
   bulkSvarInputSchema,
   candidatesOf,
   motpartRegelNyckel,
+  multiKandidatEnabled,
   parseExport,
   svarInputSchema,
   uppladdatInputSchema,
@@ -122,6 +124,21 @@ describe('candidatesOf', () => {
       'google_workspace_augusti.pdf',
     ])
   })
+
+  it('reads an optional belopp on a candidate, and leaves it undefined when bertil has not sent it (every export version to date)', () => {
+    const p = post('tx-google-20260803')
+    expect(candidatesOf(p).every((k) => k.belopp === undefined)).toBe(true)
+    const raw = clone(fixture) as unknown as {
+      sammanstallningar: { posts: { transaction_id: string; tvetydiga_alternativ: Record<string, unknown>[] }[] }[]
+    }
+    const rawPost = raw.sammanstallningar[0].posts.find((x) => x.transaction_id === 'tx-google-20260803')!
+    rawPost.tvetydiga_alternativ[0].belopp = -1249
+    const parsed = parseExport(raw)
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    const reparsed = candidatesOf(parsed.export.sammanstallningar[0].posts.find((x) => x.transaction_id === 'tx-google-20260803')!)
+    expect(reparsed[0].belopp).toBe(-1249)
+  })
 })
 
 describe('svarInputSchema', () => {
@@ -162,7 +179,7 @@ describe('svarInputSchema', () => {
     const base = {
       svarstyp: 'val_kandidat',
       transaction_id: 'tx',
-      sha256: null,
+      sha256: [],
       motpart: 'X',
       kategori: 'leverantor',
       bas_konto: '5420',
@@ -175,6 +192,21 @@ describe('svarInputSchema', () => {
     expect(svarInputSchema.safeParse({ ...base, kategori: 'okand' }).success).toBe(false)
     expect(svarInputSchema.safeParse({ ...base, momstyp: 'moms_12' }).success).toBe(false)
   })
+
+  it('refuses a single sha256 string: it must be an array, even for one document', () => {
+    const base = {
+      svarstyp: 'val_kandidat',
+      transaction_id: 'tx',
+      sha256: 'a'.repeat(64),
+      motpart: 'X',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }
+    expect(svarInputSchema.safeParse(base).success).toBe(false)
+  })
 })
 
 describe('buildBeslut', () => {
@@ -183,7 +215,7 @@ describe('buildBeslut', () => {
     const result = buildBeslut(p, {
       svarstyp: 'val_kandidat',
       transaction_id: p.transaction_id,
-      sha256: 'B1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90',
+      sha256: ['B1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90'],
       motpart: 'GOOGLE*WORKSPACE',
       kategori: 'leverantor',
       bas_konto: '5420',
@@ -201,6 +233,13 @@ describe('buildBeslut', () => {
         vald_kandidat: 'google_workspace_augusti.pdf',
         sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
         kalla: 'gmail:bohed',
+        vald_kandidater: [
+          {
+            filnamn: 'google_workspace_augusti.pdf',
+            sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            kalla: 'gmail:bohed',
+          },
+        ],
         motpart: 'GOOGLE*WORKSPACE',
         kategori: 'leverantor',
         bas_konto: '5420',
@@ -212,12 +251,70 @@ describe('buildBeslut', () => {
     })
   })
 
-  it('answers "none of them" with vald_kandidat null and no sha256 (the CLI --svara case)', () => {
+  it('resolves every chosen document, in the order chosen, when the answer picks more than one (task: one payment, several löneunderlag)', () => {
+    const p = post('tx-google-20260803')
+    const result = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: [
+        'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      ],
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: '5420',
+      momstyp: 'eu_reverse_charge',
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'test-answer-id')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    // vald_kandidat/sha256/kalla keep naming only the first chosen document, for a 1.4/1.5 reader.
+    expect(result.beslut).toMatchObject({
+      vald_kandidat: 'google_workspace_augusti.pdf',
+      sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    })
+    expect((result.beslut as { vald_kandidater: unknown[] }).vald_kandidater).toEqual([
+      {
+        filnamn: 'google_workspace_augusti.pdf',
+        sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        kalla: 'gmail:bohed',
+      },
+      {
+        filnamn: 'google_workspace_juli.pdf',
+        sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        kalla: 'gmail:bohed',
+      },
+    ])
+  })
+
+  it('dedupes a hash chosen twice instead of fabricating a second document', () => {
+    const p = post('tx-google-20260803')
+    const result = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: [
+        'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        'B1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90',
+      ],
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'test-answer-id')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.beslut as { vald_kandidater: unknown[] }).vald_kandidater).toHaveLength(1)
+  })
+
+  it('answers "none of them" with vald_kandidat null, no sha256, and an empty vald_kandidater (the CLI --svara case)', () => {
     const p = post('tx-ocr-20260812')
     const result = buildBeslut(p, {
       svarstyp: 'val_kandidat',
       transaction_id: p.transaction_id,
-      sha256: null,
+      sha256: [],
       motpart: '100003645765',
       kategori: 'skatt',
       bas_konto: null,
@@ -227,7 +324,13 @@ describe('buildBeslut', () => {
     }, 'test-answer-id')
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.beslut).toMatchObject({ vald_kandidat: null, belopp: -3120, bolag: null, answer_id: 'test-answer-id' })
+    expect(result.beslut).toMatchObject({
+      vald_kandidat: null,
+      vald_kandidater: [],
+      belopp: -3120,
+      bolag: null,
+      answer_id: 'test-answer-id',
+    })
     expect(result.beslut).not.toHaveProperty('sha256')
   })
 
@@ -236,7 +339,23 @@ describe('buildBeslut', () => {
     const result = buildBeslut(p, {
       svarstyp: 'val_kandidat',
       transaction_id: p.transaction_id,
-      sha256: 'f'.repeat(64),
+      sha256: ['f'.repeat(64)],
+      motpart: 'X',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'test-answer-id')
+    expect(result).toEqual({ ok: false, code: 'CANDIDATE_NOT_FOUND' })
+  })
+
+  it('refuses the whole answer when the second of two chosen hashes is not a candidate', () => {
+    const p = post('tx-google-20260803')
+    const result = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: ['b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90', 'f'.repeat(64)],
       motpart: 'X',
       kategori: 'leverantor',
       bas_konto: null,
@@ -253,7 +372,7 @@ describe('buildBeslut', () => {
     const result = buildBeslut(p, {
       svarstyp: 'val_kandidat',
       transaction_id: p.transaction_id,
-      sha256: 'not-a-hash',
+      sha256: ['not-a-hash'],
       motpart: 'X',
       kategori: 'leverantor',
       bas_konto: null,
@@ -503,6 +622,82 @@ describe('answer file version', () => {
   it('is 1.5 for a file that holds a levererar_sjalv answer, the only file a 1.4 reader cannot take', () => {
     expect(buildAnswerFile([osaker, sjalv]).version).toBe('1.5')
     expect(buildAnswerFile([sjalv]).version).toBe(ANSWER_VERSION_UPLOAD)
+  })
+
+  it('stays 1.4 for a val_kandidat with a single chosen document', () => {
+    const p = post('tx-google-20260803')
+    const single = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: ['b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'],
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'a1')
+    if (!single.ok) throw new Error('unreachable')
+    expect(buildAnswerFile([single.beslut]).version).toBe('1.4')
+  })
+
+  it('is 1.6 for a file where a val_kandidat beslut chose more than one document, the only file a 1.4/1.5 reader cannot take', () => {
+    const p = post('tx-google-20260803')
+    const multi = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: [
+        'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      ],
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'a1')
+    if (!multi.ok) throw new Error('unreachable')
+    expect(buildAnswerFile([osaker, multi.beslut]).version).toBe('1.6')
+    expect(buildAnswerFile([multi.beslut]).version).toBe(ANSWER_VERSION_MULTI_KANDIDAT)
+  })
+
+  it('does not throw for a val_kandidat beslut stored before vald_kandidater existed', () => {
+    const preDeploy = {
+      answer_id: 'a1',
+      transaction_id: 'tx-google-20260803',
+      svarstyp: 'val_kandidat',
+      vald_kandidat: 'kvitto.pdf',
+      sha256: 'a'.repeat(64),
+      kalla: 'inlard_regel',
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      bolag: null,
+      bankkonto: null,
+      belopp: null,
+    } as const
+    expect(() => buildAnswerFile([preDeploy])).not.toThrow()
+    expect(buildAnswerFile([preDeploy]).version).toBe('1.4')
+  })
+})
+
+describe('multiKandidatEnabled', () => {
+  const ORIGINAL = process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED
+    else process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED = ORIGINAL
+  })
+
+  it('is off unless the env var is exactly "true"', () => {
+    delete process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED
+    expect(multiKandidatEnabled()).toBe(false)
+    process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED = 'yes'
+    expect(multiKandidatEnabled()).toBe(false)
+    process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED = 'true'
+    expect(multiKandidatEnabled()).toBe(true)
   })
 })
 

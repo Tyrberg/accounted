@@ -40,6 +40,17 @@ export const ANSWER_VERSION = '1.4'
  * 1.5 file is never produced before then.
  */
 export const ANSWER_VERSION_UPLOAD = '1.5'
+/**
+ * 1.6 adds `vald_kandidater` to a `val_kandidat` beslut: every chosen
+ * document, not only the first (task: a payment can back several underlag,
+ * e.g. one bank payment covering two people's löneunderlag). A single choice
+ * or "none of them" stays at whatever 1.4/1.5 rule already applied, so a
+ * 1.4/1.5 reader loses nothing it did not already lose today: it is only the
+ * second and later chosen document a reader stuck on `vald_kandidat` would
+ * silently drop, which is exactly why this needs its own version and its own
+ * flag rather than being written unconditionally.
+ */
+export const ANSWER_VERSION_MULTI_KANDIDAT = '1.6'
 
 /**
  * Whether the `levererar_sjalv` answer type is available: the option is hidden
@@ -50,6 +61,16 @@ export const ANSWER_VERSION_UPLOAD = '1.5'
  */
 export function leverarSjalvEnabled(): boolean {
   return process.env.UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED === 'true'
+}
+
+/**
+ * Whether a `val_kandidat` answer may choose more than one document: choosing
+ * a second candidate is refused with 403 and the checkbox UI stays a single
+ * choice until UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true, set only once
+ * bertil's mottak_svar_fran_ui reads `vald_kandidater` (answer version 1.6).
+ */
+export function multiKandidatEnabled(): boolean {
+  return process.env.UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED === 'true'
 }
 
 /** `SVARSKATEGORIER` in bertil. */
@@ -107,6 +128,13 @@ const kandidatSchema = z
     datum: z.string().nullable(),
     bevisgrund: z.string(),
     sha256: z.string(),
+    /**
+     * Optional: the amount this specific document covers, when bertil knows
+     * it (e.g. a löneunderlag's net pay). Absent on every export version to
+     * date, so a selection is never blocked on it; it only sharpens the
+     * chosen-vs-payment sum shown when more than one candidate is chosen.
+     */
+    belopp: z.number().nullable().optional(),
   })
   .passthrough()
 export type Kandidat = z.infer<typeof kandidatSchema>
@@ -295,9 +323,19 @@ export type Beslut =
       answer_id: string
       transaction_id: string
       svarstyp: 'val_kandidat'
+      /** The first chosen document, for a 1.4/1.5 reader. */
       vald_kandidat: string | null
       sha256?: string
       kalla?: string
+      /**
+       * Every chosen document, in the order chosen. New in answer 1.6: a
+       * 1.4/1.5 reader does not know this field and only sees the first
+       * (vald_kandidat/sha256/kalla), so it is only populated with more than
+       * one entry when multiKandidatEnabled() gates the file to 1.6.
+       * Optional because it did not exist before this change: a `val_kandidat`
+       * beslut stored before the deploy has no `vald_kandidater` on disk.
+       */
+      vald_kandidater?: { filnamn: string; sha256: string; kalla: string }[]
       motpart: string
       kategori: Kategori
       bas_konto: string | null
@@ -361,8 +399,8 @@ export const svarInputSchema = z.discriminatedUnion('svarstyp', [
   z.object({
     svarstyp: z.literal('val_kandidat'),
     transaction_id: z.string().min(1),
-    /** sha256 of the chosen candidate, or null for "none of them". */
-    sha256: z.string().nullable(),
+    /** sha256 of every chosen candidate, in the order chosen. Empty for "none of them". */
+    sha256: z.array(z.string()),
     motpart: z.string().trim().min(1),
     kategori: z.enum(KATEGORIER),
     bas_konto: accountNumberSchema.nullable(),
@@ -496,13 +534,17 @@ export function buildBeslut(
     }
   }
 
-  let chosen: Kandidat | null = null
-  if (input.sha256 !== null) {
-    const wanted = input.sha256.toLowerCase()
-    chosen = candidatesOf(post).find((k) => k.sha256.toLowerCase() === wanted) ?? null
-    if (!chosen) return { ok: false, code: 'CANDIDATE_NOT_FOUND' }
-    if (!isValidSha256(chosen.sha256)) return { ok: false, code: 'CANDIDATE_WITHOUT_HASH' }
+  // Deduped: a client sending the same hash twice must not fabricate a second document.
+  const wantedHashes = [...new Set(input.sha256.map((h) => h.toLowerCase()))]
+  const byHash = new Map(candidatesOf(post).map((k) => [k.sha256.toLowerCase(), k] as const))
+  const chosenList: Kandidat[] = []
+  for (const hash of wantedHashes) {
+    const match = byHash.get(hash)
+    if (!match) return { ok: false, code: 'CANDIDATE_NOT_FOUND' }
+    if (!isValidSha256(match.sha256)) return { ok: false, code: 'CANDIDATE_WITHOUT_HASH' }
+    chosenList.push(match)
   }
+  const first = chosenList[0] ?? null
 
   return {
     ok: true,
@@ -510,8 +552,9 @@ export function buildBeslut(
       answer_id: answerId,
       transaction_id,
       svarstyp: 'val_kandidat',
-      vald_kandidat: chosen ? chosen.filnamn : null,
-      ...(chosen ? { sha256: chosen.sha256.toLowerCase(), kalla: chosen.kalla } : {}),
+      vald_kandidat: first ? first.filnamn : null,
+      ...(first ? { sha256: first.sha256.toLowerCase(), kalla: first.kalla } : {}),
+      vald_kandidater: chosenList.map((k) => ({ filnamn: k.filnamn, sha256: k.sha256.toLowerCase(), kalla: k.kalla })),
       motpart: input.motpart,
       kategori: input.kategori,
       bas_konto: input.bas_konto,
@@ -539,6 +582,8 @@ export type BulkSvarInput = z.infer<typeof bulkSvarInputSchema>
 export function buildAnswerFile(
   beslut: Beslut[],
 ): { version: string; beslut: Beslut[] } {
-  const needsNewVersion = beslut.some((b) => b.svarstyp === 'uppladdat_underlag' || b.svarstyp === 'levererar_sjalv')
-  return { version: needsNewVersion ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION, beslut }
+  const needsMultiKandidat = beslut.some((b) => b.svarstyp === 'val_kandidat' && (b.vald_kandidater ?? []).length > 1)
+  const needsUpload = beslut.some((b) => b.svarstyp === 'uppladdat_underlag' || b.svarstyp === 'levererar_sjalv')
+  const version = needsMultiKandidat ? ANSWER_VERSION_MULTI_KANDIDAT : needsUpload ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION
+  return { version, beslut }
 }
