@@ -5660,8 +5660,14 @@
     "candidates_selected_sum_diff": "Differs by {diff} from the payment.",
     "candidates_selected_sum_missing_belopp": "{count, plural, =1 {One selected document has no amount and is excluded from the sum} other {# selected documents have no amount and are excluded from the sum}}",
     "document_view": "View document",
+    "document_close": "Close",
+    "document_loading": "Fetching the document…",
+    "document_unsupported_type": "This file type cannot be displayed directly.",
+    "document_loading_error": "The document could not be fetched.",
     "document_mismatch_title": "Wrong file",
     "document_mismatch_description": "The file you picked is not {filnamn}: the checksum does not match.",
+    "document_stored_mismatch_title": "Document does not match",
+    "document_stored_mismatch_description": "The stored document for {filnamn} no longer matches the checksum bertil gave for it. Try again shortly, or ask bertil to redeliver the underlag.",
     "field_motpart": "Counterparty",
     "field_motpart_hint": "The rule recognises the counterparty by this text.",
     "field_kategori": "Category",
@@ -5775,7 +5781,8 @@
     "reglerar_skuld_account_invalid": "The account must be a liability account (BAS class 2, e.g. 2893). The cost was already booked when the debt arose.",
     "missing_ursprungsverifikat": "which verifikat booked the debt",
     "answer_reglerar_skuld": "Settles debt from verifikat {verifikat}, account {konto}",
-    "error_VERIFIKAT_NOT_FOUND": "The given verifikat does not exist or is not posted."
+    "error_VERIFIKAT_NOT_FOUND": "The given verifikat does not exist or is not posted.",
+    "error_REFERENCE_NOT_FOUND": "The document could not be retrieved. It may have been deleted or the storage source is unavailable."
   },
   "extensions": {
     "page_title": "Extensions",

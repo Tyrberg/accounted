@@ -24,9 +24,9 @@ import { accountClass } from '@/lib/invariants/account-number'
  * before this file has ever seen it. A different major is refused outright.
  */
 export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
-export const MAX_SUPPORTED_EXPORT_VERSION = '1.4'
+export const MAX_SUPPORTED_EXPORT_VERSION = '1.5'
 /** Export versions this extension has been built and tested against, for error messages. */
-export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4'] as const
+export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4', '1.5'] as const
 /**
  * Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only.
  * A file with no upload in it stays 1.4, so a reader that predates 1.5 keeps
@@ -159,6 +159,34 @@ const kandidatSchema = z
      * chosen-vs-payment sum shown when more than one candidate is chosen.
      */
     belopp: z.number().nullable().optional(),
+    /**
+     * New in export 1.5. A reference, never the file itself: the key an
+     * object was archived under by `POST /export/underlag`, the machine
+     * route bertil must call to deliver this candidate's bytes BEFORE
+     * sending the export line that names it (operator decision 2026-09-22,
+     * task 1483). Absent when the document is only described (filename,
+     * source, hash) and the user picks it from their disk, which is every
+     * export to date: bertil does not call `/export/underlag` yet, so this
+     * field is never actually sent. Wiring bertil's exporter to upload
+     * before it posts the export is its own follow-up task in bertil, filed
+     * once this side is merged; until then every candidate keeps working
+     * exactly as it does today (disk-pick, sha256 match), which is what
+     * "optional, added forward-compatibly" buys here.
+     *
+     * Accounted never trusts this path blindly: the sha256 below is checked
+     * against the bytes actually stored under it before anything is shown
+     * (PostAnswerPanel.openViewerForStoredDocument), so a stale or wrong
+     * reference fails closed with a clear message rather than displaying the
+     * wrong document.
+     */
+    storage_path: z.string().optional(),
+    /**
+     * New in export 1.5. MIME type of the stored file (e.g., application/pdf,
+     * image/jpeg), present only when storage_path is. Tells the viewer how
+     * to render it: PDF in an iframe, image/* as an <img>, anything else a
+     * plain "cannot be shown" message rather than a silent download.
+     */
+    mime_type: z.string().nullable().optional(),
   })
   .passthrough()
 export type Kandidat = z.infer<typeof kandidatSchema>

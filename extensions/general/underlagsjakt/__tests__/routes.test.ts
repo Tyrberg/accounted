@@ -149,7 +149,7 @@ describe('GET /', () => {
     expect(status).toBe(200)
     expect(body.data.export).toBeNull()
     expect(body.data.posts).toEqual([])
-    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4'])
+    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4', '1.5'])
   })
 })
 
