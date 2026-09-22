@@ -53,6 +53,12 @@ vi.mock('@/lib/auth/api-keys', () => ({
   createServiceClientNoCookies: () => serviceClient(),
 }))
 
+const uploadDocument = vi.fn()
+vi.mock('@/lib/core/documents/document-service', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/core/documents/document-service')>()),
+  uploadDocument: (...a: unknown[]) => uploadDocument(...a),
+}))
+
 // Imported after the mocks so the extension's own module graph gets them.
 const { underlagsjaktExtension } = await import('@/extensions/general/underlagsjakt')
 
@@ -101,6 +107,7 @@ beforeEach(() => {
   serviceClient.mockImplementation(() => makeClient())
   process.env[TOKEN_ENV] = TOKEN
   process.env[ORGNR_ENV] = ORGNR
+  uploadDocument.mockReset()
 })
 
 afterEach(() => {
@@ -343,7 +350,7 @@ describe('the delivery routes', () => {
     const machine = underlagsjaktExtension
       .apiRoutes!.filter((r) => r.skipAuth)
       .map((r) => `${r.method} ${r.path}`)
-    expect(machine).toEqual(['POST /export', 'GET /svar', 'POST /svar/kvittens'])
+    expect(machine).toEqual(['POST /export', 'POST /export/underlag', 'GET /svar', 'POST /svar/kvittens'])
   })
 
   it("POST /export stores bertil's export on the configured company", async () => {
@@ -533,6 +540,103 @@ describe('the delivery routes', () => {
     // Poll statistics count repeated offers, not confirmed consumption.
     await route('GET', '/svar').handler(request())
     expect(storedValue('leverans')).toMatchObject({ senast_antal: 1 })
+  })
+})
+
+describe('POST /export/underlag', () => {
+  const PDF_BYTES = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34])
+
+  function uploadRequest(over: { file?: File | null; token?: string | null } = {}) {
+    const form = new FormData()
+    const file = over.file === undefined ? new File([PDF_BYTES], 'kvitto.pdf', { type: 'application/pdf' }) : over.file
+    if (file) form.set('file', file)
+    const headers: Record<string, string> = {}
+    if (over.token !== null) headers.Authorization = `Bearer ${over.token ?? TOKEN}`
+    return new Request('http://localhost/api/extensions/ext/underlagsjakt/export/underlag', {
+      method: 'POST',
+      headers,
+      body: form,
+    })
+  }
+
+  const handler = () => route('POST', '/export/underlag').handler
+
+  const storedDocument = {
+    id: 'doc-1',
+    file_name: 'kvitto.pdf',
+    sha256_hash: 'b'.repeat(64),
+    mime_type: 'application/pdf',
+    storage_path: 'documents/company-1/owner-1/1_kvitto.pdf',
+  }
+
+  it('refuses a caller without the token, filing nothing', async () => {
+    uploadDocument.mockResolvedValue(storedDocument)
+    const res = await handler()(uploadRequest({ token: null }))
+    expect(res.status).toBe(401)
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('refuses a wrong token, filing nothing', async () => {
+    uploadDocument.mockResolvedValue(storedDocument)
+    const res = await handler()(uploadRequest({ token: 'not-the-token-but-long-enough-x' }))
+    expect(res.status).toBe(401)
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('archives the file under the configured company and returns a reference an export can point at', async () => {
+    uploadDocument.mockResolvedValue(storedDocument)
+    const { status, body } = await parse<{
+      data: { sha256: string; storage_path: string; mime_type: string; deduplicated: boolean }
+    }>(await handler()(uploadRequest()))
+
+    expect(status).toBe(200)
+    expect(body.data).toEqual({
+      sha256: 'b'.repeat(64),
+      storage_path: 'documents/company-1/owner-1/1_kvitto.pdf',
+      mime_type: 'application/pdf',
+      deduplicated: false,
+    })
+    // Filed under the delivery's own owner/company, not a caller-named one:
+    // the same binding POST /export uses, and deduped by content exactly as
+    // /svar/underlag is, so a re-run of bertil's exporter converges instead
+    // of archiving the same receipt twice.
+    expect(uploadDocument).toHaveBeenCalledWith(
+      expect.anything(),
+      'owner-1',
+      'company-1',
+      expect.objectContaining({ name: 'kvitto.pdf', type: 'application/pdf' }),
+      expect.objectContaining({ upload_source: 'api', dedupeByContent: true, extractionOwner: 'none' }),
+    )
+  })
+
+  it('reports a repeated delivery of the same bytes as deduplicated instead of archiving a second copy', async () => {
+    uploadDocument.mockResolvedValue({ ...storedDocument, deduplicated: true })
+    const { body } = await parse<{ data: { deduplicated: boolean } }>(await handler()(uploadRequest()))
+    expect(body.data.deduplicated).toBe(true)
+  })
+
+  it('rejects a file type outside the underlag allowlist before it is archived', async () => {
+    const { status, body } = await parse<{ error: { code: string } }>(
+      await handler()(uploadRequest({ file: new File(['x'], 'a.exe', { type: 'application/x-msdownload' }) })),
+    )
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('UNDERLAG_UNSUPPORTED_TYPE')
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('rejects a file over the size cap before it is archived', async () => {
+    const big = new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'stor.pdf', { type: 'application/pdf' })
+    const { status, body } = await parse<{ error: { code: string } }>(await handler()(uploadRequest({ file: big })))
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('UNDERLAG_TOO_LARGE')
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('requires a file', async () => {
+    const { status, body } = await parse<{ error: { code: string } }>(await handler()(uploadRequest({ file: null })))
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('UNDERLAG_FILE_MISSING')
+    expect(uploadDocument).not.toHaveBeenCalled()
   })
 })
 

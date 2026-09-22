@@ -2,6 +2,7 @@ import { roundOre } from '@/lib/money'
 import { accountClass } from '@/lib/invariants/account-number'
 import type { Kandidat, Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord, WaitingRow } from '@/extensions/general/underlagsjakt/lib/store'
+import { matchesCandidate } from '@/extensions/general/underlagsjakt/lib/document'
 import { suggestSkuldkontoFromVerifikat } from './account-suggestion'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
@@ -68,6 +69,7 @@ const KNOWN_ERROR_CODES = new Set([
   'COUNT_CHANGED',
   'FEATURE_DISABLED',
   'VERIFIKAT_NOT_FOUND',
+  'REFERENCE_NOT_FOUND',
 ])
 
 /** Map an API error body to a translated sentence. */
@@ -415,6 +417,36 @@ export async function searchReglerarSkuldVerifikat(
   } catch {
     return { ok: false }
   }
+}
+
+/**
+ * A candidate bertil delivered (export 1.5's `storage_path`) is fetched from
+ * its signed URL and its bytes are checked against the candidate's own
+ * sha256 before it is ever shown: `storage_path` is a reference, not proof,
+ * so a stale or wrong one must fail closed with a clear reason rather than
+ * display the wrong document. This is the same proof a disk-picked file
+ * already has to pass (`matchesCandidate`); a stored document gets no less
+ * of it just because the bytes came from Accounted's own archive instead of
+ * the user's disk (task 1483). Injectable `fetchFn`, so the fetch/hash
+ * outcome is directly testable without a DOM.
+ */
+export async function fetchAndVerifyStoredDocument(
+  signedUrl: string,
+  expectedSha256: string,
+  fetchFn?: typeof fetch,
+): Promise<{ ok: true; data: ArrayBuffer } | { ok: false; reason: 'fetch_failed' | 'hash_mismatch' }> {
+  let data: ArrayBuffer
+  try {
+    const res = await (fetchFn || fetch)(signedUrl)
+    if (!res.ok) return { ok: false, reason: 'fetch_failed' }
+    data = await res.arrayBuffer()
+  } catch {
+    return { ok: false, reason: 'fetch_failed' }
+  }
+  if (!(await matchesCandidate(data, expectedSha256))) {
+    return { ok: false, reason: 'hash_mismatch' }
+  }
+  return { ok: true, data }
 }
 
 /**

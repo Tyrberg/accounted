@@ -22,11 +22,10 @@
 import { NextResponse } from 'next/server'
 import type { ApiRouteDefinition, Extension, ExtensionContext } from '@/lib/extensions/types'
 import { requireWritePermission } from '@/lib/auth/require-write'
-import { MAX_DOCUMENT_SIZE, uploadDocument } from '@/lib/core/documents/document-service'
+import { acceptUnderlagFile } from './lib/underlag-upload'
 import {
   ANSWER_VERSION,
   SUPPORTED_EXPORT_VERSIONS,
-  UNDERLAG_UPLOAD_MIME_TYPES,
   buildAnswerFile,
   buildBeslut,
   buildUppladdatBeslut,
@@ -245,6 +244,75 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
     },
   },
   /**
+   * bertil delivering one candidate document ahead of the export that
+   * references it. A kandidat's `storage_path`/`mime_type` (export 1.5, see
+   * lib/contract.ts) is only ever a reference to an object archived through
+   * this route, never the file itself: the export stays one small JSON POST
+   * regardless of how many megabytes of PDFs and photographed receipts the
+   * period holds, one failed upload never takes the whole export down with
+   * it, and a retried run can skip everything already delivered (operator
+   * decision 2026-09-22, task 1483). Must run before `POST /export`: an
+   * export line pointing at a storage_path nothing has delivered yet shows
+   * "visa dokument" with nothing to show, which is the exact bug this task
+   * removes, so bertil's export client uploads first and posts the export
+   * second.
+   *
+   * Reuses `acceptUnderlagFile`, the same validation and dedupe-by-hash
+   * `/svar/underlag` runs for a human-uploaded file (task 1481): two upload
+   * paths with their own size caps and storage would drift, which is what
+   * happened the first time this route was attempted.
+   *
+   * `skipAuth` for the same reason as `/export`: bertil has no session, only
+   * the delivery token.
+   *
+   * bertil does not call this yet (its export today still omits
+   * `storage_path`/`mime_type` entirely, which every reader here already
+   * accepts as absent): wiring bertil's exporter to upload here before it
+   * posts the export is tracked as its own follow-up task in bertil, filed
+   * once this side is merged (operator decision 2026-09-22).
+   */
+  {
+    method: 'POST',
+    path: '/export/underlag',
+    skipAuth: true,
+    handler: async (request) => {
+      const auth = await authenticateLeverans(request)
+      if (!auth.ok) return auth.response
+      const ctx = auth.ctx
+
+      let form: FormData
+      try {
+        form = await request.formData()
+      } catch {
+        return fail(400, 'VALIDATION_ERROR', 'Ogiltigt formulär.')
+      }
+      const file = form.get('file')
+      if (!(file instanceof File)) {
+        return fail(400, 'UNDERLAG_FILE_MISSING', 'Ingen fil vald.')
+      }
+
+      const uploaded = await acceptUnderlagFile(
+        ctx,
+        { name: file.name, type: file.type, size: file.size, buffer: await file.arrayBuffer() },
+        'api',
+      )
+      if (!uploaded.ok) return fail(uploaded.status, uploaded.code, uploaded.message, uploaded.details)
+
+      const { document } = uploaded
+      ctx.log.info('underlagsjakt: leverans underlag uploaded', {
+        deduplicated: !!document.deduplicated,
+      })
+      return NextResponse.json({
+        data: {
+          sha256: document.sha256_hash,
+          storage_path: document.storage_path,
+          mime_type: document.mime_type,
+          deduplicated: !!document.deduplicated,
+        },
+      })
+    },
+  },
+  /**
    * Fetching never acknowledges consumption. Keep offering every pending answer
    * until bertil successfully ingests it and posts its transaction_id and answer_id to
    * /svar/kvittens. Failed ingestion or a lost response can safely be retried.
@@ -408,14 +476,8 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       }
 
       const file = form.get('file')
-      if (!(file instanceof File) || file.size === 0) {
+      if (!(file instanceof File)) {
         return fail(400, 'UNDERLAG_FILE_MISSING', 'Ingen fil vald.')
-      }
-      if (!(UNDERLAG_UPLOAD_MIME_TYPES as readonly string[]).includes(file.type)) {
-        return fail(400, 'UNDERLAG_UNSUPPORTED_TYPE', 'Filtypen stöds inte. Ladda upp en PDF eller en bild.')
-      }
-      if (file.size > MAX_DOCUMENT_SIZE) {
-        return fail(400, 'UNDERLAG_TOO_LARGE', 'Filen är för stor.', { max_bytes: MAX_DOCUMENT_SIZE })
       }
 
       const field = (name: string) => {
@@ -450,24 +512,13 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
         return fail(409, 'ALREADY_DELIVERED', 'Svaret är redan erbjudet till bertil och kan inte ändras.')
       }
 
-      let document: Awaited<ReturnType<typeof uploadDocument>>
-      try {
-        document = await uploadDocument(
-          ctx.supabase,
-          ctx.userId,
-          ctx.companyId,
-          { name: file.name, buffer: await file.arrayBuffer(), type: file.type },
-          // A retry of the same file converges on the archived original.
-          { upload_source: 'file_upload', dedupeByContent: true, extractionOwner: 'none' },
-        )
-      } catch (err) {
-        const message = err instanceof Error ? err.message : ''
-        if (/kunde inte verifieras|matchar inte den angivna filtypen/i.test(message)) {
-          return fail(400, 'UNDERLAG_INVALID_CONTENT', 'Filens innehåll stämmer inte med filtypen.')
-        }
-        ctx.log.error('underlagsjakt: uploading underlag failed', { error: message })
-        return fail(500, 'UNDERLAG_UPLOAD_FAILED', 'Dokumentet kunde inte sparas.')
-      }
+      const uploaded = await acceptUnderlagFile(
+        ctx,
+        { name: file.name, type: file.type, size: file.size, buffer: await file.arrayBuffer() },
+        'file_upload',
+      )
+      if (!uploaded.ok) return fail(uploaded.status, uploaded.code, uploaded.message, uploaded.details)
+      const document = uploaded.document
 
       const now = nowIso()
       const beslut = buildUppladdatBeslut(
@@ -581,6 +632,47 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       }
       await ctx.settings.set(SVAR_KEY, result.svar)
       return NextResponse.json({ data: { transaction_id: transactionId } })
+    },
+  },
+  {
+    method: 'POST',
+    path: '/documents/signed-url',
+    handler: async (request, ctx) => {
+      if (!ctx) return unauthorized()
+
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return fail(400, 'INVALID_JSON', 'Ogiltig JSON.')
+      }
+
+      const storagePath = body && typeof body === 'object'
+        ? (body as { storagePath?: unknown }).storagePath
+        : undefined
+      if (!storagePath || typeof storagePath !== 'string') {
+        return fail(400, 'INVALID_STORAGE_PATH', 'Sökvägen är obligatorisk och måste vara en sträng.')
+      }
+
+      const pathParts = storagePath.split('/')
+      if (pathParts.length < 3 || pathParts[0] !== 'documents') {
+        return fail(400, 'INVALID_STORAGE_PATH', 'Sökvägen följer inte det förväntade formatet.')
+      }
+
+      const companyIdFromPath = pathParts[1]
+      if (ctx.companyId !== companyIdFromPath) {
+        return fail(403, 'ACCESS_DENIED', 'Du har inte åtkomst till denna fil.')
+      }
+
+      const { data, error } = await ctx.supabase.storage
+        .from('documents')
+        .createSignedUrl(storagePath, 3600)
+
+      if (error || !data?.signedUrl) {
+        return fail(500, 'SIGNED_URL_FAILED', 'Kunde inte generera signerad URL.')
+      }
+
+      return NextResponse.json({ signedUrl: data.signedUrl })
     },
   },
   {

@@ -17,6 +17,7 @@ import {
   answerSummary,
   buildAnswerInput,
   deriveTillBolag,
+  fetchAndVerifyStoredDocument,
   interpretSaveResult,
   isReglerarSkuldAccountValid,
   searchReglerarSkuldVerifikat,
@@ -26,6 +27,7 @@ import {
   type SaveOutcome,
   type T,
 } from '../shared'
+import { sha256Hex } from '@/extensions/general/underlagsjakt/lib/document'
 import type { Kandidat, Post } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { SvarRecord } from '@/extensions/general/underlagsjakt/lib/store'
 
@@ -515,6 +517,36 @@ describe('searchReglerarSkuldVerifikat', () => {
   })
 })
 
+describe('fetchAndVerifyStoredDocument', () => {
+  const bytes = new TextEncoder().encode('fakturainnehall').buffer
+
+  it('returns the fetched bytes once they hash to the candidate\'s own sha256', async () => {
+    const hash = await sha256Hex(bytes)
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: async () => bytes })
+    const outcome = await fetchAndVerifyStoredDocument('https://example.com/doc.pdf', hash, mockFetch as unknown as typeof fetch)
+    expect(outcome).toEqual({ ok: true, data: bytes })
+    expect(mockFetch).toHaveBeenCalledWith('https://example.com/doc.pdf')
+  })
+
+  it('refuses bytes whose hash does not match: a stale or wrong storage_path must never be shown as if it were the candidate', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: async () => bytes })
+    const outcome = await fetchAndVerifyStoredDocument('https://example.com/doc.pdf', 'a'.repeat(64), mockFetch as unknown as typeof fetch)
+    expect(outcome).toEqual({ ok: false, reason: 'hash_mismatch' })
+  })
+
+  it('treats a non-ok response as a fetch failure, not a hash mismatch', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: false, arrayBuffer: async () => bytes })
+    const outcome = await fetchAndVerifyStoredDocument('https://example.com/doc.pdf', 'a'.repeat(64), mockFetch as unknown as typeof fetch)
+    expect(outcome).toEqual({ ok: false, reason: 'fetch_failed' })
+  })
+
+  it('treats a network exception as a fetch failure', async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error('offline'))
+    const outcome = await fetchAndVerifyStoredDocument('https://example.com/doc.pdf', 'a'.repeat(64), mockFetch as unknown as typeof fetch)
+    expect(outcome).toEqual({ ok: false, reason: 'fetch_failed' })
+  })
+})
+
 describe('buildAnswerInput: osaker', () => {
   it('never blocks', () => {
     const result = buildAnswerInput({ ...BASE_VAL_KANDIDAT, mode: 'osaker' })
@@ -794,6 +826,33 @@ describe('PostAnswerPanel: rendered correctly', () => {
     expect(html).not.toContain(msg.candidates_legend_multi_hint)
   })
 
+  const STORED_CANDIDATE: Partial<Post> = {
+    kandidater: [
+      {
+        filnamn: 'faktura_google.pdf',
+        kalla: 'gmail:bohed',
+        datum: '2026-09-20',
+        bevisgrund: 'belopp matchar',
+        sha256: 'c'.repeat(64),
+        storage_path: 'documents/company-1/user-1/faktura_google.pdf',
+        mime_type: 'application/pdf',
+      },
+    ],
+  }
+
+  it('offers "Visa dokument" straight away for a candidate bertil delivered, with no disk file picker', () => {
+    const html = renderPanel(STORED_CANDIDATE)
+    expect(html).toContain(msg.document_view)
+    // No hidden file input for this candidate: nothing to pick from disk, it is already stored.
+    expect(html).not.toContain('type="file"')
+  })
+
+  it('falls back to picking the file from disk when bertil only sent a description', () => {
+    const html = renderPanel(TWO_CANDIDATES)
+    expect(html).toContain(msg.document_view)
+    expect(html).toContain('type="file"')
+  })
+
   it('does not offer the upload path while it is switched off', () => {
     const html = renderPanel(undefined, undefined, false)
     expect(html).toContain('Inget underlag behövs, ange motpart och kategori')
@@ -984,6 +1043,15 @@ describe('translations for the new copy exist in both locales', () => {
     'candidates_selected_sum',
     'candidates_selected_sum_diff',
     'candidates_selected_sum_missing_belopp',
+    'document_view',
+    'document_close',
+    'document_loading',
+    'document_unsupported_type',
+    'document_loading_error',
+    'document_mismatch_title',
+    'document_mismatch_description',
+    'document_stored_mismatch_title',
+    'document_stored_mismatch_description',
   ]
 
   it.each(keys)('%s exists in sv.json and en.json', (key) => {

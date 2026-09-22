@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { useTranslations } from 'next-intl'
 import { Eye, Loader2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -38,6 +38,7 @@ import {
   UNKNOWN,
   buildAnswerInput,
   deriveTillBolag,
+  fetchAndVerifyStoredDocument,
   isReglerarSkuldAccountValid,
   searchReglerarSkuldVerifikat,
   submitAnswer,
@@ -46,7 +47,9 @@ import {
   type VerifikatSearchResult,
 } from './shared'
 
+import { DocumentViewer } from './DocumentViewer'
 import { suggestAnswerAccount } from './account-suggestion'
+import { getDocumentSignedUrl } from './get-document-signed-url'
 
 type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'reglerar_skuld' | 'osaker'
 
@@ -92,6 +95,106 @@ export function PostAnswerPanel({
   const [applyToAllVendor, setApplyToAllVendor] = useState(false)
   // The same function the server recounts with, so the promised number is the one enforced.
   const bulkCount = bulkTargets(posts, post).length
+
+  // Document viewer (for displaying candidates or uploaded files). Whatever
+  // is shown, the viewer only ever receives a same-origin blob URL: a
+  // candidate delivered by bertil is fetched and its bytes checked against
+  // the candidate's own sha256 (the same proof a disk-picked file already had
+  // to pass) before display, so a stored document is never shown without the
+  // same guarantee a manually matched one has (task 1483).
+  const [showViewer, setShowViewer] = useState(false)
+  const [viewerFilnamn, setViewerFilnamn] = useState<string | null>(null)
+  const [viewerUrl, setViewerUrl] = useState<string | null>(null)
+  const [viewerMimeType, setViewerMimeType] = useState<string | null>(null)
+  const [isNarrowScreen, setIsNarrowScreen] = useState(true)
+  const blobUrlRef = useRef<string | null>(null)
+
+  // Listen for window resize and update layout mode dynamically
+  useEffect(() => {
+    const handleResize = () => {
+      setIsNarrowScreen(window.innerWidth < 1024) // lg breakpoint from Tailwind
+    }
+    handleResize()
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
+  const handleCloseViewer = () => {
+    setShowViewer(false)
+    setViewerFilnamn(null)
+    setViewerUrl(null)
+    // Revoke blob URL when viewer closes
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current)
+      blobUrlRef.current = null
+    }
+  }
+
+  const showBlob = (data: ArrayBuffer, filnamn: string, mimeType: string) => {
+    // Revoke previous blob URL before creating new one to avoid leaks
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current)
+    }
+    const url = URL.createObjectURL(new Blob([data], { type: mimeType || 'application/pdf' }))
+    blobUrlRef.current = url
+    setViewerFilnamn(filnamn)
+    setViewerMimeType(mimeType)
+    setViewerUrl(url)
+  }
+
+  const openViewerForStoredDocument = async (candidate: Kandidat) => {
+    if (!(candidate.storage_path && candidate.mime_type)) return
+    const result = await getDocumentSignedUrl(candidate.storage_path)
+    if (!result.signedUrl) {
+      toast({ title: t('document_loading_error'), variant: 'destructive' })
+      return
+    }
+    // Never trust the export's storage_path blindly: only the bytes actually
+    // stored under it, checked against the candidate's own sha256, are shown.
+    const verified = await fetchAndVerifyStoredDocument(result.signedUrl, candidate.sha256)
+    if (!verified.ok) {
+      if (verified.reason === 'hash_mismatch') {
+        // Distinct copy from the disk-pick mismatch below: nobody "picked" a
+        // wrong file here, the stored object itself no longer matches what
+        // bertil claimed, so the message must not imply a user mistake.
+        toast({
+          title: t('document_stored_mismatch_title'),
+          description: t('document_stored_mismatch_description', { filnamn: candidate.filnamn }),
+          variant: 'destructive',
+        })
+      } else {
+        toast({ title: t('document_loading_error'), variant: 'destructive' })
+      }
+      return
+    }
+    // Only show the viewer after the blob is ready, never with a missing or stale URL
+    showBlob(verified.data, candidate.filnamn, candidate.mime_type)
+    setShowViewer(true)
+  }
+
+  const openViewerForDiskFile = async (file: File, candidate: Kandidat) => {
+    const data = await file.arrayBuffer()
+    if (!(await matchesCandidate(data, candidate.sha256))) {
+      toast({
+        title: t('document_mismatch_title'),
+        description: t('document_mismatch_description', { filnamn: candidate.filnamn }),
+        variant: 'destructive',
+      })
+      return
+    }
+    showBlob(data, candidate.filnamn, file.type)
+    setShowViewer(true)
+  }
+
+  // The user's own just-picked file for `uppladdat_underlag`: there is no
+  // candidate or sha256 to check it against (it IS the underlag), so it is
+  // shown exactly as picked, through the same viewer a delivered or
+  // disk-matched candidate uses (task 1483).
+  const openViewerForLocalFile = async (localFile: File) => {
+    const data = await localFile.arrayBuffer()
+    showBlob(data, localFile.name, localFile.type)
+    setShowViewer(true)
+  }
 
   // val_kandidat
   const suggestedKategori = (KATEGORIER as readonly string[]).includes(post.forslag?.kategori ?? '')
@@ -359,7 +462,7 @@ export function PostAnswerPanel({
     </>
   )
 
-  return (
+  const formContent = (
     <div className="space-y-6 bg-secondary/20 px-4 py-6" data-ph-mask="">
       <dl className="grid grid-cols-1 gap-x-6 gap-y-2 text-[12.5px] sm:grid-cols-2">
         <Fact label={t('fact_company')} value={`${post.bolag} (${post.period})`} />
@@ -412,6 +515,14 @@ export function PostAnswerPanel({
                 checked={chosen.has(k.sha256)}
                 useCheckbox={showCheckboxes}
                 onSelect={() => toggleCandidate(k.sha256)}
+                onOpenViewer={{
+                  storedDocument: async () => {
+                    await openViewerForStoredDocument(k)
+                  },
+                  diskFile: async (file: File) => {
+                    await openViewerForDiskFile(file, k)
+                  },
+                }}
               />
             ))}
             <label className="flex items-start gap-3 text-[13px]">
@@ -477,6 +588,12 @@ export function PostAnswerPanel({
                 <span className="min-w-0 truncate text-[13px]">
                   {file.name} <span className="text-xs text-muted-foreground tabular-nums">({formatMegabytes(file.size)})</span>
                 </span>
+              )}
+              {file && (
+                <Button variant="outline" size="sm" onClick={() => void openViewerForLocalFile(file)}>
+                  <Eye className="mr-2 h-4 w-4" />
+                  {t('document_view')}
+                </Button>
               )}
             </div>
             <p className="text-xs text-muted-foreground">{t('upload_formats')}</p>
@@ -683,6 +800,7 @@ export function PostAnswerPanel({
                 checked={reglering === r}
                 onSelect={() => setReglering(r)}
                 label={t(`reglering_${r}`)}
+                description={t(`reglering_${r}_description`)}
               />
             ))}
             <p className="text-xs text-muted-foreground">
@@ -723,6 +841,24 @@ export function PostAnswerPanel({
       </div>
     </div>
   )
+
+  return (
+    <div className="flex gap-6">
+      <div className="flex-1">
+        {formContent}
+      </div>
+      {showViewer && viewerUrl && viewerFilnamn && (
+        <DocumentViewer
+          key={viewerFilnamn}
+          filnamn={viewerFilnamn}
+          mimeType={viewerMimeType}
+          signedUrl={viewerUrl}
+          onClose={handleCloseViewer}
+          isModal={isNarrowScreen}
+        />
+      )}
+    </div>
+  )
 }
 
 function Fact({ label, value, numeric, wide }: { label: string; value: string; numeric?: boolean; wide?: boolean }) {
@@ -739,16 +875,21 @@ function RadioRow({
   checked,
   onSelect,
   label,
+  description,
 }: {
   name: string
   checked: boolean
   onSelect: () => void
   label: string
+  description?: string
 }) {
   return (
     <label className="flex items-start gap-3 text-[13px]">
       <input type="radio" className={RADIO_CLASS} name={name} checked={checked} onChange={onSelect} />
-      <span>{label}</span>
+      <span>
+        <span className="block">{label}</span>
+        {description && <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>}
+      </span>
     </label>
   )
 }
@@ -759,85 +900,90 @@ function CandidateOption({
   checked,
   useCheckbox,
   onSelect,
+  onOpenViewer,
 }: {
   name: string
   candidate: Kandidat
   checked: boolean
   useCheckbox: boolean
   onSelect: () => void
+  onOpenViewer: {
+    storedDocument: () => Promise<void>
+    diskFile: (file: File) => Promise<void>
+  }
 }) {
   const t = useTranslations('underlagsjakt')
-  const { toast } = useToast()
   const fileRef = useRef<HTMLInputElement>(null)
-  const selectable = isValidSha256(candidate.sha256)
 
-  const openDocument = async (file: File) => {
-    const data = await file.arrayBuffer()
-    if (!(await matchesCandidate(data, candidate.sha256))) {
-      toast({
-        title: t('document_mismatch_title'),
-        description: t('document_mismatch_description', { filnamn: candidate.filnamn }),
-        variant: 'destructive',
-      })
-      return
-    }
-    const url = URL.createObjectURL(new Blob([data], { type: file.type || 'application/pdf' }))
-    window.open(url, '_blank', 'noopener')
-    // The tab holds its own reference; release ours once it has loaded.
-    setTimeout(() => URL.revokeObjectURL(url), 60_000)
-  }
+  const selectable = isValidSha256(candidate.sha256)
+  const hasStoredDocument = !!(candidate.storage_path && candidate.mime_type)
 
   return (
-    <div className={cn('rounded-lg border border-border p-4', checked && 'border-foreground')}>
-      <div className="flex items-start gap-3">
-        {useCheckbox ? (
-          <Checkbox
-            className="mt-1 border-foreground"
-            checked={checked}
-            disabled={!selectable}
-            onCheckedChange={() => onSelect()}
-            aria-label={candidate.filnamn}
-          />
-        ) : (
-          <input
-            type="radio"
-            className={RADIO_CLASS}
-            name={name}
-            checked={checked}
-            disabled={!selectable}
-            onChange={onSelect}
-            aria-label={candidate.filnamn}
-          />
-        )}
-        <div className="min-w-0 flex-1 space-y-1">
-          <p className="truncate text-[13px] font-medium">{candidate.filnamn}</p>
-          <p className="text-[13px]">{candidate.bevisgrund}</p>
-          <p className="text-xs text-muted-foreground">
-            {candidate.datum
-              ? t('candidate_source_dated', { kalla: candidate.kalla, datum: formatDate(candidate.datum) })
-              : t('candidate_source', { kalla: candidate.kalla })}
-          </p>
-          {!selectable && <p className="text-xs text-destructive">{t('candidate_without_hash')}</p>}
-        </div>
-        {selectable && (
-          <>
-            <input
-              ref={fileRef}
-              type="file"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) void openDocument(file)
-                e.target.value = ''
-              }}
+    <>
+      <div className={cn('rounded-lg border border-border p-4', checked && 'border-foreground')}>
+        <div className="flex items-start gap-3">
+          {useCheckbox ? (
+            <Checkbox
+              className="mt-1 border-foreground"
+              checked={checked}
+              disabled={!selectable}
+              onCheckedChange={() => onSelect()}
+              aria-label={candidate.filnamn}
             />
-            <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
-              <Eye className="mr-2 h-4 w-4" />
-              {t('document_view')}
-            </Button>
-          </>
-        )}
+          ) : (
+            <input
+              type="radio"
+              className={RADIO_CLASS}
+              name={name}
+              checked={checked}
+              disabled={!selectable}
+              onChange={onSelect}
+              aria-label={candidate.filnamn}
+            />
+          )}
+          <div className="min-w-0 flex-1 space-y-1">
+            <p className="truncate text-[13px] font-medium">{candidate.filnamn}</p>
+            <p className="text-[13px]">{candidate.bevisgrund}</p>
+            <p className="text-xs text-muted-foreground">
+              {candidate.datum
+                ? t('candidate_source_dated', { kalla: candidate.kalla, datum: formatDate(candidate.datum) })
+                : t('candidate_source', { kalla: candidate.kalla })}
+            </p>
+            {!selectable && <p className="text-xs text-destructive">{t('candidate_without_hash')}</p>}
+          </div>
+          {selectable && (
+            <>
+              {hasStoredDocument ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void onOpenViewer.storedDocument()}
+                >
+                  <Eye className="mr-2 h-4 w-4" />
+                  {t('document_view')}
+                </Button>
+              ) : (
+                <>
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0]
+                      if (file) void onOpenViewer.diskFile(file)
+                      e.target.value = ''
+                    }}
+                  />
+                  <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+                    <Eye className="mr-2 h-4 w-4" />
+                    {t('document_view')}
+                  </Button>
+                </>
+              )}
+            </>
+          )}
+        </div>
       </div>
-    </div>
+    </>
   )
 }
