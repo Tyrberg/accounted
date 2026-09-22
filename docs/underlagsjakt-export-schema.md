@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** export 1.4 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, or 1.6 for a file where a `val_kandidat` beslut chose more than one document
+**Contract version:** export 1.4 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, 1.6 for a file where a `val_kandidat` beslut chose more than one document, or 1.7 for a file holding a `reglerar_skuld` beslut
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -172,7 +172,7 @@ A supporting document (email, invoice, receipt).
 
 ## Answers (`beslut`)
 
-The answer file is `{ "version": "1.4", "beslut": [...] }`, `"1.5"` when it holds at least one `uppladdat_underlag` entry, or `"1.6"` when a `val_kandidat` entry chose more than one document: a file without either is byte-for-byte what a 1.4 reader already ingests. Every entry carries
+The answer file is `{ "version": "1.4", "beslut": [...] }`, `"1.5"` when it holds at least one `uppladdat_underlag` entry, `"1.6"` when a `val_kandidat` entry chose more than one document, or `"1.7"` when it holds a `reglerar_skuld` entry: a file without any of them is byte-for-byte what a 1.4 reader already ingests. Every entry carries
 `answer_id`, `transaction_id` and a `svarstyp`, one of:
 
 | `svarstyp` | Meaning |
@@ -181,6 +181,7 @@ The answer file is `{ "version": "1.4", "beslut": [...] }`, `"1.5"` when it hold
 | `fel_bolag` | The payment belongs to another company (`fel_bolag_mottagare`, `till_bolag`, `reglering`). |
 | `osaker` | Postponed; bertil asks again later. |
 | `uppladdat_underlag` | **New in 1.5.** bertil found no document (or none that fits), and the user uploaded the real one in Accounted. The entry carries a reference to that file instead of a choice among candidates. |
+| `reglerar_skuld` | **New in 1.7.** The payment is not a new cost: it settles a debt already booked in an earlier verifikat (e.g. a lön payout against an avräkningskonto). The entry carries a reference to that verifikat instead of a document or a cost category. |
 
 ### `val_kandidat` with more than one document
 
@@ -253,6 +254,32 @@ The file is stored in Accounted's archive (WORM, retained seven years) and, when
 `external_id`), pinned to that transaction so it follows the verifikat. When it
 does not, the document is archived and the answer is still delivered; Accounted
 never guesses a transaction from date and amount.
+
+### `reglerar_skuld`
+
+```json
+{
+  "answer_id": "2026-09-22T09:00:00.000Z:tx-lon-20260925",
+  "transaction_id": "tx-lon-20260925",
+  "svarstyp": "reglerar_skuld",
+  "ursprungsverifikat_id": "7c3e9a2e-2b3a-4c9e-9d3a-1a2b3c4d5e6f",
+  "ursprungsverifikat_nummer": "A217",
+  "bas_konto": "2893",
+  "motpart": "LÖN",
+  "bolag": null,
+  "bankkonto": null,
+  "belopp": null
+}
+```
+
+- **`ursprungsverifikat_id`** (string): `journal_entries.id` in Accounted for the verifikat that already booked this debt. Resolved and validated server-side (the id must belong to this company and be posted) from a verifikat the user searched for and picked in Accounted, never typed, so the reference is traceable rather than a free-text note.
+- **`ursprungsverifikat_nummer`** (string): The verifikat's own label (e.g. `"A217"`), for a human reading the answer file. Resolved server-side from `ursprungsverifikat_id`, not taken from the browser.
+- **`bas_konto`** (string): The liability (skuld) account this payment settles, e.g. `2893`. Required, must be BAS class 2 (`2xxx`), and never a cost account: the cost was already booked once, when the debt was booked. Suggested in Accounted from the referenced verifikat's own BAS class 2 lines, never from the cost categories `val_kandidat`/`uppladdat_underlag` use.
+- **`motpart`, `bolag`, `bankkonto`, `belopp`**: As in `val_kandidat`, for the learned rule.
+
+None of `val_kandidat` (expects a *new* document), `osaker` (defers) or "no underlag needed" (which is untrue here: the underlag is last year's verifikat) fit a payment that settles an already-booked debt. Booking it as a new cost would double it: once when the debt was booked, again when it was paid, understating profit and leaving the debt looking unpaid on the balance sheet (task 1482).
+
+When bertil books the verifikat for a `reglerar_skuld` beslut, its description must end with `(netto via avräkning)`, e.g. `LÖN MATTIAS (netto via avräkning) 2025-01-22`. That is the existing wording already used in Mattias's own bookkeeping for every prior payout against an avräkningskonto (e.g. `2893`); matching it keeps verifikat comparable across years instead of introducing a second, differently-worded convention for the same kind of posting.
 
 ## Transport: the automatic delivery
 
@@ -364,6 +391,10 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 
 ## Version History
+
+### Answer 1.7
+- Written only when the file holds a `reglerar_skuld` beslut; every other answer file stays at whatever 1.4/1.5/1.6 rule already applied. The answer type is off until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set on the box, which is done once bertil reads 1.7 and the type.
+- New `svarstyp` `reglerar_skuld`: the payment settles a debt already booked in an earlier verifikat, so it must debit the liability account that verifikat carries rather than be booked as a new cost (see "reglerar_skuld" above).
 
 ### Answer 1.6
 - Written only when a `val_kandidat` beslut chooses more than one document; every other answer file stays at whatever 1.4/1.5 rule already applied. Choosing more than one document in Accounted is off until `UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true` is set on the box, which is done once bertil reads 1.6.

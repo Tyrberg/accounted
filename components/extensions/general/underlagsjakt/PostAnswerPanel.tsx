@@ -38,14 +38,17 @@ import {
   UNKNOWN,
   buildAnswerInput,
   deriveTillBolag,
+  isReglerarSkuldAccountValid,
+  searchReglerarSkuldVerifikat,
   submitAnswer,
   submitBulkAnswer,
   summarizeSelectedCandidates,
+  type VerifikatSearchResult,
 } from './shared'
 
 import { suggestAnswerAccount } from './account-suggestion'
 
-type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'osaker'
+type Mode = 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'reglerar_skuld' | 'osaker'
 
 const UPLOAD_ACCEPT = UNDERLAG_UPLOAD_MIME_TYPES.join(',')
 
@@ -58,6 +61,7 @@ export function PostAnswerPanel({
   uploadEnabled,
   leverarSjalvEnabled,
   multiKandidatEnabled = false,
+  reglerarSkuldEnabled = false,
   onAnswered,
 }: {
   post: Post
@@ -69,6 +73,8 @@ export function PostAnswerPanel({
   leverarSjalvEnabled: boolean
   /** Off until bertil reads vald_kandidater (answer version 1.6): candidates stay single-choice. */
   multiKandidatEnabled?: boolean
+  /** Off until bertil reads reglerar_skuld (answer version 1.7): the "settles a booked debt" option is then not offered. */
+  reglerarSkuldEnabled?: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -139,6 +145,48 @@ export function PostAnswerPanel({
   const [otherMottagare, setOtherMottagare] = useState('')
   const [reglering, setReglering] = useState<Reglering | undefined>(undefined)
 
+  // reglerar_skuld: the debt is settled by pointing at the verifikat that already booked it,
+  // found by searching Accounted's own journal entries (never typed), and the suggested
+  // account is read from that verifikat's own BAS class 2 lines (account-suggestion.ts),
+  // never the cost templates val_kandidat/uppladdat_underlag use.
+  const [verifikatQuery, setVerifikatQuery] = useState('')
+  const [verifikatResults, setVerifikatResults] = useState<VerifikatSearchResult[]>([])
+  const [verifikatSearching, setVerifikatSearching] = useState(false)
+  const [verifikatSearchError, setVerifikatSearchError] = useState<string | null>(null)
+  const [verifikatSearched, setVerifikatSearched] = useState(false)
+  const [selectedVerifikat, setSelectedVerifikat] = useState<VerifikatSearchResult | null>(null)
+  const [skuldkontoOverride, setSkuldkontoOverride] = useState<string | undefined>(undefined)
+  const reglerarBasKonto =
+    skuldkontoOverride ?? (selectedVerifikat?.accountCandidates.length === 1 ? selectedVerifikat.accountCandidates[0] : '')
+  const reglerarBasKontoValid = isReglerarSkuldAccountValid(reglerarBasKonto)
+  // Guards against an in-flight search whose response arrives after a newer one: only the
+  // most recently issued request may write its result, so a slow response for an earlier
+  // query can never overwrite a faster response for what the user searched next.
+  const verifikatSearchSeq = useRef(0)
+
+  const searchVerifikat = async () => {
+    const query = verifikatQuery.trim()
+    if (!query) return
+    const seq = ++verifikatSearchSeq.current
+    setVerifikatSearching(true)
+    setVerifikatSearchError(null)
+    const outcome = await searchReglerarSkuldVerifikat(query)
+    if (seq !== verifikatSearchSeq.current) return
+    if (outcome.ok) {
+      setVerifikatResults(outcome.results)
+    } else {
+      setVerifikatResults([])
+      setVerifikatSearchError(t('reglerar_skuld_search_error'))
+    }
+    setVerifikatSearching(false)
+    setVerifikatSearched(true)
+  }
+
+  const selectVerifikat = (v: VerifikatSearchResult) => {
+    setSelectedVerifikat(v)
+    setSkuldkontoOverride(undefined)
+  }
+
   const basKontoValid = basKonto.trim() === '' || isAccountNumber(basKonto.trim())
 
   // Same derivation buildAnswerInput uses for validation, so what's rendered (the "same
@@ -155,8 +203,8 @@ export function PostAnswerPanel({
     sha256: Array.from(chosen),
     kategori,
     motpart,
-    basKonto,
-    basKontoValid,
+    basKonto: mode === 'reglerar_skuld' ? reglerarBasKonto : basKonto,
+    basKontoValid: mode === 'reglerar_skuld' ? reglerarBasKontoValid : basKontoValid,
     momstyp,
     begransaBolag,
     begransaBelopp,
@@ -167,6 +215,7 @@ export function PostAnswerPanel({
     otherMottagare,
     payerBolag: post.bolag,
     reglering,
+    ursprungsverifikatId: selectedVerifikat?.id,
   })
   const input = answerResult.input ?? null
   const missingReasons = answerResult.missing ?? []
@@ -333,6 +382,7 @@ export function PostAnswerPanel({
           { value: 'val_kandidat', label: t('mode_val_kandidat') },
           ...(uploadEnabled ? [{ value: 'uppladdat_underlag' as const, label: t('mode_uppladdat_underlag') }] : []),
           ...(leverarSjalvEnabled ? [{ value: 'levererar_sjalv' as const, label: t('mode_levererar_sjalv') }] : []),
+          ...(reglerarSkuldEnabled ? [{ value: 'reglerar_skuld' as const, label: t('mode_reglerar_skuld') }] : []),
           { value: 'fel_bolag', label: t('mode_fel_bolag') },
           { value: 'osaker', label: t('mode_osaker') },
         ]}
@@ -432,6 +482,117 @@ export function PostAnswerPanel({
             <p className="text-xs text-muted-foreground">{t('upload_formats')}</p>
           </fieldset>
           {classificationFields}
+        </div>
+      )}
+
+      {mode === 'reglerar_skuld' && (
+        <div className="space-y-6">
+          <p className="text-[13px] text-muted-foreground">{t('reglerar_skuld_description')}</p>
+          <fieldset className="space-y-3">
+            <legend className="mb-2 text-sm font-medium">{t('reglerar_skuld_search_legend')}</legend>
+            <div className="flex flex-wrap items-center gap-3">
+              <Input
+                value={verifikatQuery}
+                onChange={(e) => setVerifikatQuery(e.target.value)}
+                aria-label={t('reglerar_skuld_search_legend')}
+                aria-describedby={`reglerar-sok-hint-${post.transaction_id}`}
+                className="max-w-xs"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void searchVerifikat()}
+                disabled={verifikatSearching || !verifikatQuery.trim()}
+              >
+                {verifikatSearching && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {t('reglerar_skuld_search_button')}
+              </Button>
+            </div>
+            <p id={`reglerar-sok-hint-${post.transaction_id}`} className="text-xs text-muted-foreground">
+              {t('reglerar_skuld_search_hint')}
+            </p>
+            {verifikatSearchError &&<p className="text-xs text-destructive">{verifikatSearchError}</p>}
+            {verifikatResults.length > 0 && (
+              <div className="space-y-2">
+                {verifikatResults.map((v) => (
+                  <RadioRow
+                    key={v.id}
+                    name={`reglerar-verifikat-${post.transaction_id}`}
+                    checked={selectedVerifikat?.id === v.id}
+                    onSelect={() => selectVerifikat(v)}
+                    label={t('reglerar_skuld_verifikat_row', { label: v.label, datum: formatDate(v.date), beskrivning: v.description })}
+                  />
+                ))}
+              </div>
+            )}
+            {verifikatSearched && verifikatResults.length === 0 && !verifikatSearching && !verifikatSearchError && (
+              <p className="text-[12.5px] text-muted-foreground">{t('reglerar_skuld_no_results')}</p>
+            )}
+          </fieldset>
+
+          {selectedVerifikat && (
+            <div className="space-y-2">
+              <Label htmlFor={`reglerar-konto-${post.transaction_id}`}>{t('reglerar_skuld_account_label')}</Label>
+              {selectedVerifikat.accountCandidates.length > 1 ? (
+                <Select value={reglerarBasKonto || undefined} onValueChange={(v) => setSkuldkontoOverride(v)}>
+                  <SelectTrigger aria-label={t('reglerar_skuld_account_label')}>
+                    <SelectValue>{reglerarBasKonto || t('reglerar_skuld_account_choose')}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {selectedVerifikat.accountCandidates.map((a) => (
+                      <SelectItem key={a} value={a}>
+                        {a}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id={`reglerar-konto-${post.transaction_id}`}
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={reglerarBasKonto}
+                  onChange={(e) => setSkuldkontoOverride(e.target.value)}
+                  aria-invalid={!reglerarBasKontoValid}
+                />
+              )}
+              {selectedVerifikat.accountCandidates.length === 0 && (
+                <p className="text-xs text-attn">{t('reglerar_skuld_no_liability_account')}</p>
+              )}
+              {!reglerarBasKontoValid && reglerarBasKonto.trim() !== '' && (
+                <p className="text-xs text-destructive">{t('reglerar_skuld_account_invalid')}</p>
+              )}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <Label htmlFor={`reglerar-motpart-${post.transaction_id}`}>{t('field_motpart')}</Label>
+            <Input
+              id={`reglerar-motpart-${post.transaction_id}`}
+              value={motpart}
+              onChange={(e) => setMotpart(e.target.value)}
+            />
+          </div>
+
+          <div className="space-y-2 text-[13px]">
+            <label className="flex items-center gap-3">
+              <Checkbox
+                className="border-foreground"
+                checked={begransaBolag}
+                onCheckedChange={(v) => setBegransaBolag(v === true)}
+              />
+              {t('restrict_bolag', { bolag: post.bolag })}
+            </label>
+            <label className="flex items-center gap-3">
+              <Checkbox
+                className="border-foreground"
+                checked={begransaBelopp}
+                onCheckedChange={(v) => setBegransaBelopp(v === true)}
+              />
+              {t('restrict_belopp', { belopp: formatCurrency(Math.abs(post.belopp), post.valuta) })}
+            </label>
+          </div>
         </div>
       )}
 

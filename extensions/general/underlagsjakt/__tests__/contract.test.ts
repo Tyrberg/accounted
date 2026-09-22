@@ -9,6 +9,7 @@ import fixture14 from './fixtures/export-1.4.json'
 import {
   ANSWER_VERSION,
   ANSWER_VERSION_MULTI_KANDIDAT,
+  ANSWER_VERSION_REGLERAR_SKULD,
   ANSWER_VERSION_UPLOAD,
   buildAnswerFile,
   buildBeslut,
@@ -18,6 +19,7 @@ import {
   motpartRegelNyckel,
   multiKandidatEnabled,
   parseExport,
+  reglerarSkuldEnabled,
   svarInputSchema,
   uppladdatInputSchema,
   type Post,
@@ -662,6 +664,42 @@ describe('answer file version', () => {
     expect(buildAnswerFile([multi.beslut]).version).toBe(ANSWER_VERSION_MULTI_KANDIDAT)
   })
 
+  it('is 1.7 for a file that holds a reglerar_skuld answer, above the 1.6 multi-kandidat bump', () => {
+    const p = post('tx-google-20260803')
+    const multi = buildBeslut(p, {
+      svarstyp: 'val_kandidat',
+      transaction_id: p.transaction_id,
+      sha256: [
+        'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      ],
+      motpart: 'GOOGLE*WORKSPACE',
+      kategori: 'leverantor',
+      bas_konto: null,
+      momstyp: null,
+      begransa_bolag: false,
+      begransa_belopp: false,
+    }, 'a1')
+    if (!multi.ok) throw new Error('unreachable')
+    const skuld = buildBeslut(
+      p,
+      {
+        svarstyp: 'reglerar_skuld',
+        transaction_id: p.transaction_id,
+        motpart: 'LÖN',
+        ursprungsverifikat_id: '7c3e9a2e-2b3a-4c9e-9d3a-1a2b3c4d5e6f',
+        bas_konto: '2893',
+        begransa_bolag: false,
+        begransa_belopp: false,
+      },
+      'a2',
+      { ursprungsverifikatNummer: 'A217' },
+    )
+    if (!skuld.ok) throw new Error('unreachable')
+    expect(buildAnswerFile([skuld.beslut]).version).toBe(ANSWER_VERSION_REGLERAR_SKULD)
+    expect(buildAnswerFile([osaker, multi.beslut, skuld.beslut]).version).toBe('1.7')
+  })
+
   it('does not throw for a val_kandidat beslut stored before vald_kandidater existed', () => {
     const preDeploy = {
       answer_id: 'a1',
@@ -680,6 +718,91 @@ describe('answer file version', () => {
     } as const
     expect(() => buildAnswerFile([preDeploy])).not.toThrow()
     expect(buildAnswerFile([preDeploy]).version).toBe('1.4')
+  })
+})
+
+describe('reglerar_skuld: "settles an already-booked debt"', () => {
+  const p = posts(fixture14 as typeof fixture)[0]
+  const VALID_INPUT = {
+    svarstyp: 'reglerar_skuld' as const,
+    transaction_id: p.transaction_id,
+    motpart: 'LÖN',
+    ursprungsverifikat_id: '7c3e9a2e-2b3a-4c9e-9d3a-1a2b3c4d5e6f',
+    bas_konto: '2893',
+    begransa_bolag: false,
+    begransa_belopp: false,
+  }
+
+  it('validates as a svar input', () => {
+    expect(svarInputSchema.safeParse(VALID_INPUT).success).toBe(true)
+  })
+
+  it('requires a real BAS account and a UUID verifikat reference, not free text', () => {
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, bas_konto: '28' }).success).toBe(false)
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, ursprungsverifikat_id: 'A217' }).success).toBe(false)
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, motpart: '  ' }).success).toBe(false)
+  })
+
+  it('refuses a bas_konto of null, unlike val_kandidat: a debt settlement always has a real account to debit', () => {
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, bas_konto: null }).success).toBe(false)
+  })
+
+  it('refuses a non-liability bas_konto: this answer exists to stop the payment being booked as a new cost', () => {
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, bas_konto: '7210' }).success).toBe(false)
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, bas_konto: '1930' }).success).toBe(false)
+    expect(svarInputSchema.safeParse({ ...VALID_INPUT, bas_konto: '2893' }).success).toBe(true)
+  })
+
+  it('throws when built without the server-resolved verifikat label: a caller bug, not a user-reachable path', () => {
+    const input = svarInputSchema.parse(VALID_INPUT)
+    expect(() => buildBeslut(p, input, 'answer-1')).toThrow()
+  })
+
+  it('builds a beslut debiting the liability account, referencing the resolved verifikat', () => {
+    const input = svarInputSchema.parse(VALID_INPUT)
+    const built = buildBeslut(p, input, 'answer-1', { ursprungsverifikatNummer: 'A217' })
+    expect(built).toEqual({
+      ok: true,
+      reglering: null,
+      beslut: {
+        answer_id: 'answer-1',
+        transaction_id: p.transaction_id,
+        svarstyp: 'reglerar_skuld',
+        ursprungsverifikat_id: VALID_INPUT.ursprungsverifikat_id,
+        ursprungsverifikat_nummer: 'A217',
+        bas_konto: '2893',
+        motpart: 'LÖN',
+        bolag: null,
+        bankkonto: null,
+        belopp: null,
+      },
+    })
+  })
+
+  it('restricts the learned rule to bolag and belopp only when asked, same as the other svarstyper', () => {
+    const input = svarInputSchema.parse({ ...VALID_INPUT, begransa_bolag: true, begransa_belopp: true })
+    const built = buildBeslut(p, input, 'answer-1', { ursprungsverifikatNummer: 'A217' })
+    expect(built.ok).toBe(true)
+    if (!built.ok) return
+    expect(built.beslut).toMatchObject({ bolag: p.bolag, belopp: p.belopp })
+  })
+})
+
+describe('reglerarSkuldEnabled', () => {
+  const ORIGINAL = process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED
+    else process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED = ORIGINAL
+  })
+
+  it('is off unless the env var is exactly "true"', () => {
+    delete process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED
+    expect(reglerarSkuldEnabled()).toBe(false)
+    process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED = 'yes'
+    expect(reglerarSkuldEnabled()).toBe(false)
+    process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED = 'true'
+    expect(reglerarSkuldEnabled()).toBe(true)
   })
 })
 

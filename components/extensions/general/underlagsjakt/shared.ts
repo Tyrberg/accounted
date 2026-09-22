@@ -1,6 +1,8 @@
 import { roundOre } from '@/lib/money'
+import { accountClass } from '@/lib/invariants/account-number'
 import type { Kandidat, Kategori, Momstyp, Post, Reglering, SvarInput, UppladdatInput } from '@/extensions/general/underlagsjakt/lib/contract'
 import type { FelBolagRow, SvarRecord, WaitingRow } from '@/extensions/general/underlagsjakt/lib/store'
+import { suggestSkuldkontoFromVerifikat } from './account-suggestion'
 
 /** Shape of GET /api/extensions/ext/underlagsjakt/. */
 export interface WorkspaceData {
@@ -12,6 +14,8 @@ export interface WorkspaceData {
   levererar_sjalv_enabled: boolean
   /** Whether a val_kandidat answer may choose more than one document (bertil understands vald_kandidater). */
   multi_kandidat_enabled: boolean
+  /** Whether the "regulates an already-booked debt" answer is switched on (bertil reads answer version 1.7). */
+  reglerar_skuld_enabled: boolean
   /** Whether bertil's delivery lands in the company being viewed, not merely somewhere on this box. */
   leverans: { till_detta_bolag: boolean }
   export: {
@@ -63,6 +67,7 @@ const KNOWN_ERROR_CODES = new Set([
   'NOT_FOUND',
   'COUNT_CHANGED',
   'FEATURE_DISABLED',
+  'VERIFIKAT_NOT_FOUND',
 ])
 
 /** Map an API error body to a translated sentence. */
@@ -107,8 +112,20 @@ export function deriveTillBolag(tillBolagChoice: string | undefined, externalBol
         : tillBolagChoice
 }
 
+/**
+ * A `reglerar_skuld` answer must debit a BAS class 2 (liability) account,
+ * never a cost account: the cost was booked once already, when the debt was
+ * (task 1482). Applies to both the suggested account and one typed by hand,
+ * so the server-side restriction (contract.ts's `liabilityAccountSchema`)
+ * cannot be the only thing standing between a free-text field and a
+ * duplicated cost.
+ */
+export function isReglerarSkuldAccountValid(basKonto: string): boolean {
+  return accountClass(basKonto.trim()) === 2
+}
+
 export interface AnswerFormState {
-  mode: 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'osaker'
+  mode: 'val_kandidat' | 'uppladdat_underlag' | 'fel_bolag' | 'levererar_sjalv' | 'reglerar_skuld' | 'osaker'
   transactionId: string
   /** The file chosen in uppladdat_underlag mode; undefined until one is picked. */
   file?: File
@@ -134,6 +151,8 @@ export interface AnswerFormState {
   /** The company that paid, used when mottagareChoice === PAYER. Only relevant in fel_bolag mode. */
   payerBolag?: string
   reglering?: Reglering
+  /** journal_entries.id of the verifikat picked as "this is the debt being settled". Only relevant in reglerar_skuld mode. */
+  ursprungsverifikatId?: string
 }
 
 export type AnswerFormResult =
@@ -159,6 +178,25 @@ export function buildAnswerInput(state: AnswerFormState): AnswerFormResult {
         svarstyp: 'levererar_sjalv',
         transaction_id,
         motpart: state.motpart.trim(),
+      },
+    }
+  }
+
+  if (state.mode === 'reglerar_skuld') {
+    const missing: string[] = []
+    if (!state.ursprungsverifikatId) missing.push('missing_ursprungsverifikat')
+    if (!state.motpart.trim()) missing.push('missing_motpart')
+    if (!state.basKonto.trim() || !state.basKontoValid) missing.push('missing_bas_konto')
+    if (missing.length > 0) return { missing }
+    return {
+      input: {
+        svarstyp: 'reglerar_skuld',
+        transaction_id,
+        motpart: state.motpart.trim(),
+        ursprungsverifikat_id: state.ursprungsverifikatId!,
+        bas_konto: state.basKonto.trim(),
+        begransa_bolag: state.begransaBolag,
+        begransa_belopp: state.begransaBelopp,
       },
     }
   }
@@ -272,6 +310,9 @@ export function answerSummary(t: T, rec: SvarRecord): string {
   if (b.svarstyp === 'fel_bolag') {
     return t('answer_fel_bolag', { bolag: b.till_bolag ?? t('unknown_company'), mottagare: b.fel_bolag_mottagare })
   }
+  if (b.svarstyp === 'reglerar_skuld') {
+    return t('answer_reglerar_skuld', { verifikat: b.ursprungsverifikat_nummer, konto: b.bas_konto })
+  }
   const kategori = t(`kategori_${b.kategori}`)
   if (b.svarstyp === 'uppladdat_underlag') return t('answer_uppladdat_underlag', { filnamn: b.filnamn, kategori })
   const valdKandidater = b.vald_kandidater ?? []
@@ -318,6 +359,63 @@ export function interpretSaveResult(t: T, ok: boolean, body: unknown): SaveOutco
 
 const SVAR_URL = '/api/extensions/ext/underlagsjakt/svar'
 const BULK_SVAR_URL = '/api/extensions/ext/underlagsjakt/svar/bulk'
+const JOURNAL_ENTRIES_URL = '/api/bookkeeping/journal-entries'
+
+/** A verifikat found via GET /api/bookkeeping/journal-entries?search=, reduced to what "reglerar_skuld" needs. */
+export interface VerifikatSearchResult {
+  id: string
+  label: string
+  date: string
+  description: string
+  accountCandidates: string[]
+}
+
+/**
+ * Looks up posted verifikat by voucher number or description text, for the
+ * "reglerar_skuld" picker: the debt being settled must be a real, existing
+ * verifikat the user finds and points at, never a free-text note (task 1482).
+ * Reuses the core journal-entries list/search route rather than a new
+ * endpoint. Isolated from the component (and its request-sequencing) so the
+ * fetch/parse outcome is directly testable without a DOM.
+ *
+ * A non-ok response and an unparseable body (even on a 200, e.g. a truncated
+ * upstream response) both come back as `{ ok: false }`: a malformed 200 must
+ * read as "the search failed", never silently as "nothing matched", or the
+ * user could be led to believe the debt's verifikat does not exist at all.
+ */
+export async function searchReglerarSkuldVerifikat(
+  query: string,
+  fetchFn?: typeof fetch,
+): Promise<{ ok: true; results: VerifikatSearchResult[] } | { ok: false }> {
+  try {
+    const res = await (fetchFn || fetch)(
+      `${JOURNAL_ENTRIES_URL}?search=${encodeURIComponent(query)}&status=posted&exclude_draft=true&limit=8`,
+    )
+    const NOT_JSON = Symbol('not-json')
+    const json: unknown = await res.json().catch(() => NOT_JSON)
+    if (!res.ok || json === NOT_JSON) return { ok: false }
+    const rows = ((json as { data?: unknown } | null)?.data ?? []) as {
+      id: string
+      voucher_series: string
+      voucher_number: number
+      entry_date: string
+      description: string
+      lines?: { account_number: string }[]
+    }[]
+    return {
+      ok: true,
+      results: rows.map((row) => ({
+        id: row.id,
+        label: `${row.voucher_series}${row.voucher_number}`,
+        date: row.entry_date,
+        description: row.description,
+        accountCandidates: suggestSkuldkontoFromVerifikat(row.lines ?? []),
+      })),
+    }
+  } catch {
+    return { ok: false }
+  }
+}
 
 /**
  * An uploaded underlag travels as multipart, the file next to the answer's own

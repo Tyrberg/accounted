@@ -5760,7 +5760,22 @@
     "error_CANDIDATE_WITHOUT_HASH": "Dokumentet saknar kontrollsumma och kan inte väljas.",
     "error_ALREADY_DELIVERED": "Svaret är redan inläst i bertil och kan inte ändras här.",
     "error_NOT_FOUND": "Svaret finns inte.",
-    "status_offered": "Erbjudet bertil"
+    "status_offered": "Erbjudet bertil",
+    "mode_reglerar_skuld": "Reglerar en bokförd skuld",
+    "reglerar_skuld_description": "Betalningen är ingen ny kostnad: den amorterar en skuld som redan bokfördes i ett tidigare verifikat. Peka ut det verifikatet, så bokförs betalningen mot skuldkontot istället för som en ny kostnad.",
+    "reglerar_skuld_search_legend": "Vilket verifikat bokförde skulden?",
+    "reglerar_skuld_search_hint":"Sök på verifikatnummer eller text, t.ex. A209 eller lön december",
+    "reglerar_skuld_search_button": "Sök",
+    "reglerar_skuld_search_error": "Verifikaten kunde inte sökas fram. Försök igen.",
+    "reglerar_skuld_no_results": "Inga verifikat matchade sökningen.",
+    "reglerar_skuld_verifikat_row": "{label} · {datum} · {beskrivning}",
+    "reglerar_skuld_account_label": "Skuldkonto",
+    "reglerar_skuld_account_choose": "Välj konto",
+    "reglerar_skuld_no_liability_account": "Verifikatet har inget skuldkonto (BAS-klass 2) att föreslå. Ange kontot manuellt.",
+    "reglerar_skuld_account_invalid": "Kontot måste vara ett skuldkonto (BAS-klass 2, t.ex. 2893). Kostnaden bokfördes redan när skulden uppstod.",
+    "missing_ursprungsverifikat": "vilket verifikat skulden bokfördes i",
+    "answer_reglerar_skuld": "Reglerar skuld från verifikat {verifikat}, konto {konto}",
+    "error_VERIFIKAT_NOT_FOUND": "Det angivna verifikatet finns inte eller är inte bokfört."
   },
   "extensions": {
     "page_title": "Tillägg",
