@@ -149,7 +149,7 @@ describe('GET /', () => {
     expect(status).toBe(200)
     expect(body.data.export).toBeNull()
     expect(body.data.posts).toEqual([])
-    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4'])
+    expect(body.data.supported_export_versions).toEqual(['1.1', '1.2', '1.3', '1.4', '1.5'])
   })
 })
 
@@ -1041,5 +1041,142 @@ describe('POST /svar/bulk', () => {
     await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx)
     const again = await route('POST', '/svar/bulk').handler(bulk(hi3gBody()), ctx)
     expect(again.status).toBe(409)
+  })
+})
+
+describe('POST /documents/signed-url', () => {
+  const createSignedUrlMock = vi.fn()
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.doMock('@/lib/supabase/server', () => ({
+      createServiceClient: () => ({
+        storage: {
+          from: () => ({
+            createSignedUrl: createSignedUrlMock,
+          }),
+        },
+      }),
+    }))
+  })
+
+  it('returns 400 for invalid JSON', async () => {
+    const ctx = buildCtx()
+    const badRequest = new Request('http://localhost', {
+      method: 'POST',
+      body: 'not json',
+    })
+    const res = await route('POST', '/documents/signed-url').handler(badRequest, ctx)
+    expect(res.status).toBe(400)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('INVALID_JSON')
+  })
+
+  it('returns 400 for missing storagePath', async () => {
+    const ctx = buildCtx()
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', { method: 'POST', body: {} }),
+      ctx,
+    )
+    expect(res.status).toBe(400)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('INVALID_STORAGE_PATH')
+  })
+
+  it('returns 400 for non-string storagePath', async () => {
+    const ctx = buildCtx()
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', { method: 'POST', body: { storagePath: 123 } }),
+      ctx,
+    )
+    expect(res.status).toBe(400)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('INVALID_STORAGE_PATH')
+  })
+
+  it('returns 400 for invalid storage path format', async () => {
+    const ctx = buildCtx()
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', { method: 'POST', body: { storagePath: 'invalid/path' } }),
+      ctx,
+    )
+    expect(res.status).toBe(400)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('INVALID_STORAGE_PATH')
+  })
+
+  it('returns 403 when company in path does not match user context', async () => {
+    const ctx = buildCtx()
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', {
+        method: 'POST',
+        body: { storagePath: 'documents/other-company/user-1/doc.pdf' },
+      }),
+      ctx,
+    )
+    expect(res.status).toBe(403)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('ACCESS_DENIED')
+  })
+
+  it('returns 500 when signed URL creation fails', async () => {
+    createSignedUrlMock.mockResolvedValue({ data: null, error: { message: 'Storage error' } })
+    const ctx = buildCtx()
+    ctx.supabase = {
+      storage: {
+        from: () => ({
+          createSignedUrl: createSignedUrlMock,
+        }),
+      },
+    } as unknown as ExtensionContext['supabase']
+
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', {
+        method: 'POST',
+        body: { storagePath: 'documents/company-1/user-1/doc.pdf' },
+      }),
+      ctx,
+    )
+    expect(res.status).toBe(500)
+    const { body } = await parseJsonResponse<{ error: Record<string, unknown> }>(res)
+    expect(body.error.code).toBe('SIGNED_URL_FAILED')
+  })
+
+  it('returns signed URL on success', async () => {
+    createSignedUrlMock.mockResolvedValue({
+      data: {
+        signedUrl: 'https://storage.example.com/signed/documents/company-1/user-1/doc.pdf?token=abc123',
+      },
+      error: null,
+    })
+    const ctx = buildCtx()
+    ctx.supabase = {
+      storage: {
+        from: () => ({
+          createSignedUrl: createSignedUrlMock,
+        }),
+      },
+    } as unknown as ExtensionContext['supabase']
+
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', {
+        method: 'POST',
+        body: { storagePath: 'documents/company-1/user-1/doc.pdf' },
+      }),
+      ctx,
+    )
+    expect(res.status).toBe(200)
+    const { body } = await parseJsonResponse<{ signedUrl: string }>(res)
+    expect(body.signedUrl).toBe('https://storage.example.com/signed/documents/company-1/user-1/doc.pdf?token=abc123')
+  })
+
+  it('returns 401 without a context', async () => {
+    const res = await route('POST', '/documents/signed-url').handler(
+      createMockRequest('/documents/signed-url', {
+        method: 'POST',
+        body: { storagePath: 'documents/company-1/user-1/doc.pdf' },
+      }),
+    )
+    expect(res.status).toBe(401)
   })
 })

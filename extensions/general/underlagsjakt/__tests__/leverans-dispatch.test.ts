@@ -226,6 +226,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     ['POST', ['underlagsjakt', 'svar'], { svarstyp: 'osaker', transaction_id: 'tx-moank-20260821' }],
     ['POST', ['underlagsjakt', 'svar', 'underlag'], { transaction_id: 'tx-moank-20260821' }],
     ['POST', ['underlagsjakt', 'svar', 'bulk'], { svarstyp: 'levererar_sjalv', transaction_id: 'tx-moank-20260821', motpart: 'MOANK AVIZION', bekrafta_antal: 1 }],
+    ['POST', ['underlagsjakt', 'documents', 'signed-url'], { storagePath: 'documents/company-1/test.pdf' }],
     ['DELETE', ['underlagsjakt', 'svar', 'tx-moank-20260821'], undefined],
     ['GET', ['underlagsjakt', 'svarsfil'], undefined],
     ['POST', ['underlagsjakt', 'svarsfil', 'levererad'], { transaction_ids: ['tx-moank-20260821'] }],

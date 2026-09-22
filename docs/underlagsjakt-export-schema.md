@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** export 1.4 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, 1.6 for a file where a `val_kandidat` beslut chose more than one document, or 1.7 for a file holding a `reglerar_skuld` beslut
+**Contract version:** export 1.5 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, 1.6 for a file where a `val_kandidat` beslut chose more than one document, or 1.7 for a file holding a `reglerar_skuld` beslut
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -169,6 +169,10 @@ A supporting document (email, invoice, receipt).
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
 - **`belopp`** (number or null, optional): The amount this specific document covers, when known (e.g. one person's löneunderlag out of a payment covering several). Same sign convention as the post's own `belopp` (negative for outgoing): the sum of every chosen candidate's `belopp` is compared to the post's `belopp` directly, not by absolute value, so a payment of -35000 covered exactly by candidates of -15000 and -20000 nets to a difference of zero. Absent on every export version to date; used only to sharpen the chosen-vs-payment sum Accounted shows once more than one candidate is chosen. A missing or null value never blocks a selection.
+- **`storage_path`** (string, optional): **New in export 1.5.** A reference to an object already archived in Accounted's storage via `POST /export/underlag` (see "Transport" below), never the file itself. Present only once bertil has delivered the candidate's bytes ahead of the export; absent on every export bertil sends today. When present, Accounted re-checks the stored object's own hash against `sha256` before ever displaying it (never trusted from the export line alone).
+- **`mime_type`** (string or null, optional): **New in export 1.5.** MIME type of the stored file (`application/pdf`, `image/jpeg`, `image/png`, `image/webp`, `image/heic`, `image/heif`), present only when `storage_path` is. Selects how Accounted renders it (PDF in a viewer, image inline); anything else is refused with a plain-language reason instead of a silent download.
+
+Before `storage_path`/`mime_type` are present, the only way to view a candidate in Accounted is picking the matching file from disk and letting the browser check its hash. Once bertil delivers the bytes, "visa dokument" shows the document immediately, in place, next to the answer form. Delivering the bytes is a separate call from the export (see "Transport" below): **bertil does not make it yet** (see "Version History" > "Export 1.5"). Wiring bertil's exporter to call `POST /export/underlag` before it posts the export is filed as bertil's own follow-up task once the Accounted side (this document) has been merged.
 
 ## Answers (`beslut`)
 
@@ -284,18 +288,51 @@ When bertil books the verifikat for a `reglerar_skuld` beslut, its description m
 ## Transport: the automatic delivery
 
 The export does not have to be uploaded by hand. bertil can deliver it, and
-collect the answers, over three HTTP endpoints. They are the only routes in
+collect the answers, over four HTTP endpoints. They are the only routes in
 Accounted reachable without a logged-in user, and they are authenticated by a
 shared token, not by a session.
 
 | Call | Endpoint | Body |
 |---|---|---|
+| Deliver one candidate's file | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export/underlag` | `multipart/form-data` with a single `file` field |
 | Deliver an export | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/export` | The root wrapper above |
 | Collect the answers | `GET {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar` | Answers as `--mottak-svar` reads them: `{ "version": "1.4" or "1.5", "beslut": [...] }` |
 | Acknowledge ingestion | `POST {GNUBOK_API_URL}/api/extensions/ext/underlagsjakt/svar/kvittens` | Acknowledgement request with both `transaction_id` and `answer_id` (see below) |
 
-All three calls send the token as `Authorization: Bearer <token>` (the `apikey`
+All four calls send the token as `Authorization: Bearer <token>` (the `apikey`
 header is accepted as well, since bertil's client sets both).
+
+### Delivering a candidate's file (export 1.5)
+
+`POST /export/underlag` files one document into Accounted's archive and
+answers with the reference to put on that candidate's `storage_path`/
+`mime_type` in the export that follows:
+
+```json
+{ "data": { "sha256": "b1b2...90", "storage_path": "documents/<company_id>/<user_id>/...", "mime_type": "application/pdf", "deduplicated": false } }
+```
+
+- Same MIME allowlist, size cap and dedupe-by-hash as a person uploading a
+  document in the workspace (`UNDERLAG_UPLOAD_MIME_TYPES`, `MAX_DOCUMENT_SIZE`
+  in `lib/core/documents/document-service.ts`): the two never got their own,
+  separate limits to keep in sync.
+- **Call this before `POST /export`, not after.** The export's
+  `kandidat.storage_path` is a reference, not a payload; a reader that opens
+  it before the file exists has nothing to show. Deliver every candidate's
+  file for a run first (skipping any whose sha256 was already delivered:
+  `deduplicated: true` on a resend), then post the export that names them.
+- One file per call, on purpose (operator decision 2026-09-22): embedding
+  files in the export body would make one JSON POST carry megabytes of PDFs
+  and photographed receipts (roughly +33% for base64 on top of the file
+  size), turn one bad or oversized file into a failure of the *entire*
+  export (today's most reliable link in the chain), and make a failed run
+  impossible to resume file-by-file. A per-file call keeps the export small,
+  keeps one failure local to one document, and makes dedupe-by-hash trivial
+  to apply per call instead of re-sent on every run.
+- Errors: `UNDERLAG_FILE_MISSING` / `UNDERLAG_UNSUPPORTED_TYPE` /
+  `UNDERLAG_TOO_LARGE` / `UNDERLAG_INVALID_CONTENT` (400), `UNDERLAG_UPLOAD_FAILED`
+  (500), plus the same `LEVERANS_*` auth/configuration errors as the other
+  three calls.
 
 `GET /svar` offers every unacknowledged answer on every fetch. It never sets
 `levererad_at`. After successfully persisting each answer through
@@ -391,6 +428,11 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 
 ## Version History
+
+### Export 1.5
+- New optional `storage_path`/`mime_type` fields on `Kandidat` (see "Kandidat" above): a reference to a file bertil delivered ahead of the export through the new `POST /export/underlag`, instead of only a filename/source/hash description the user has to match against their own disk copy. Purely additive: a candidate without them behaves exactly as every export has behaved since 1.1.
+- New machine endpoint `POST /export/underlag` (see "Transport" above) to deliver one candidate's file at a time, dedup'd by content, reusing the same archive, size cap and MIME allowlist as a person uploading a document in the workspace.
+- **bertil does not call this endpoint yet.** Its exporter still sends every candidate exactly as in 1.1-1.4 (filename, source, hash, no file), which every reader here already accepts (`storage_path`/`mime_type` are optional). Wiring bertil to upload each candidate's file before posting the export is tracked as bertil's own follow-up task, to be filed once this side of task 1483 is merged: until it lands, `POST /export/underlag` exists in Accounted but nothing calls it, and candidates keep working exactly as they do today (pick the file from disk, hash-verified in the browser).
 
 ### Answer 1.7
 - Written only when the file holds a `reglerar_skuld` beslut; every other answer file stays at whatever 1.4/1.5/1.6 rule already applied. The answer type is off until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set on the box, which is done once bertil reads 1.7 and the type.
