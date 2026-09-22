@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** export 1.4 (minimum 1.1); answer 1.4, or 1.5 for a file holding an `uppladdat_underlag`
+**Contract version:** export 1.4 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, or 1.6 for a file where a `val_kandidat` beslut chose more than one document
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -168,18 +168,47 @@ A supporting document (email, invoice, receipt).
 - **`datum`** (ISO8601 date string or null, required): Document date.
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
+- **`belopp`** (number or null, optional): The amount this specific document covers, when known (e.g. one person's löneunderlag out of a payment covering several). Same sign convention as the post's own `belopp` (negative for outgoing): the sum of every chosen candidate's `belopp` is compared to the post's `belopp` directly, not by absolute value, so a payment of -35000 covered exactly by candidates of -15000 and -20000 nets to a difference of zero. Absent on every export version to date; used only to sharpen the chosen-vs-payment sum Accounted shows once more than one candidate is chosen. A missing or null value never blocks a selection.
 
 ## Answers (`beslut`)
 
-The answer file is `{ "version": "1.4", "beslut": [...] }`, or `"1.5"` when (and only when) it holds at least one `uppladdat_underlag` entry: a file without one is byte-for-byte what a 1.4 reader already ingests. Every entry carries
+The answer file is `{ "version": "1.4", "beslut": [...] }`, `"1.5"` when it holds at least one `uppladdat_underlag` entry, or `"1.6"` when a `val_kandidat` entry chose more than one document: a file without either is byte-for-byte what a 1.4 reader already ingests. Every entry carries
 `answer_id`, `transaction_id` and a `svarstyp`, one of:
 
 | `svarstyp` | Meaning |
 |---|---|
-| `val_kandidat` | The right document among the post's candidates (`vald_kandidat`/`sha256`/`kalla`), or none (`vald_kandidat: null`, "no document needed"), with `motpart`, `kategori`, `bas_konto`, `momstyp`, `bolag`, `bankkonto`, `belopp` for the learned rule. |
+| `val_kandidat` | The document(s) among the post's candidates (`vald_kandidat`/`sha256`/`kalla` for the first, `vald_kandidater` for all of them), or none (`vald_kandidat: null`, `vald_kandidater: []`, "no document needed"), with `motpart`, `kategori`, `bas_konto`, `momstyp`, `bolag`, `bankkonto`, `belopp` for the learned rule. |
 | `fel_bolag` | The payment belongs to another company (`fel_bolag_mottagare`, `till_bolag`, `reglering`). |
 | `osaker` | Postponed; bertil asks again later. |
 | `uppladdat_underlag` | **New in 1.5.** bertil found no document (or none that fits), and the user uploaded the real one in Accounted. The entry carries a reference to that file instead of a choice among candidates. |
+
+### `val_kandidat` with more than one document
+
+A payment can be backed by several documents at once (e.g. one bank payment covering two people's löneunderlag, one BAS account, no split to compute). `vald_kandidat`/`sha256`/`kalla` keep naming only the first chosen document, exactly as before, so nothing here changes for a reader that has not been updated. `vald_kandidater` carries every chosen document:
+
+```json
+{
+  "answer_id": "2026-09-22T09:00:00.000Z:tx-lon-20260925",
+  "transaction_id": "tx-lon-20260925",
+  "svarstyp": "val_kandidat",
+  "vald_kandidat": "lon_mattias_september.pdf",
+  "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "kalla": "gmail:löner",
+  "vald_kandidater": [
+    { "filnamn": "lon_mattias_september.pdf", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "kalla": "gmail:löner" },
+    { "filnamn": "lon_jennie_september.pdf", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "kalla": "gmail:löner" }
+  ],
+  "motpart": "LÖN SEPTEMBER",
+  "kategori": "lon",
+  "bas_konto": "2893",
+  "momstyp": null,
+  "bolag": null,
+  "bankkonto": null,
+  "belopp": null
+}
+```
+
+`vald_kandidater` is only present with more than one entry when the answer file itself is version 1.6 (see "Version History"); a reader that does not know 1.6 never sees it and keeps working from `vald_kandidat` alone, which is the correct single-document answer for it. This is the opposite situation from Accounted's document-reuse guard (task 1435: one document never backs two payments): here one payment backs several documents, and each of them is still bound in Accounted exactly as a single choice would be, just several at a time.
 
 ### `uppladdat_underlag`
 
@@ -335,6 +364,10 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 | 400 | `UNSUPPORTED_VERSION` / `INVALID_EXPORT` / `INVALID_JSON` | The export was rejected by the contract rules above; nothing was stored. |
 
 ## Version History
+
+### Answer 1.6
+- Written only when a `val_kandidat` beslut chooses more than one document; every other answer file stays at whatever 1.4/1.5 rule already applied. Choosing more than one document in Accounted is off until `UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true` is set on the box, which is done once bertil reads 1.6.
+- New `vald_kandidater` field on `val_kandidat` beslut: every chosen document, not only the first (see "val_kandidat with more than one document"). `vald_kandidat`/`sha256`/`kalla` are unchanged and still name the first choice.
 
 ### Answer 1.5
 - Written only to a file that holds an `uppladdat_underlag`; every other answer file stays 1.4. The upload option in Accounted is off until `UNDERLAGSJAKT_UPLOAD_ENABLED=true` is set on the box, which is done once bertil reads 1.5.

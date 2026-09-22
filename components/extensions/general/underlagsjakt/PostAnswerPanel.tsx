@@ -40,6 +40,7 @@ import {
   deriveTillBolag,
   submitAnswer,
   submitBulkAnswer,
+  summarizeSelectedCandidates,
 } from './shared'
 
 import { suggestAnswerAccount } from './account-suggestion'
@@ -56,6 +57,7 @@ export function PostAnswerPanel({
   bolagChoices,
   uploadEnabled,
   leverarSjalvEnabled,
+  multiKandidatEnabled = false,
   onAnswered,
 }: {
   post: Post
@@ -65,6 +67,8 @@ export function PostAnswerPanel({
   uploadEnabled: boolean
   /** Off until bertil understands levererar_sjalv: the "I'll deliver it" option is then not offered. */
   leverarSjalvEnabled: boolean
+  /** Off until bertil reads vald_kandidater (answer version 1.6): candidates stay single-choice. */
+  multiKandidatEnabled?: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -90,7 +94,32 @@ export function PostAnswerPanel({
   const suggestedMomstyp = (MOMSTYPER as readonly string[]).includes(post.forslag?.momstyp ?? '')
     ? (post.forslag!.momstyp as Momstyp)
     : null
-  const [chosen, setChosen] = useState<string | undefined>(undefined)
+  // Checkboxes once there is more than one candidate and multiKandidatEnabled; a single choice
+  // (mouse-click count, not candidate count) stays exactly as easy as the radio it replaces.
+  const showCheckboxes = multiKandidatEnabled && candidates.length > 1
+  const [chosen, setChosen] = useState<Set<string>>(new Set())
+  const [noneChosen, setNoneChosen] = useState(false)
+  const toggleCandidate = (sha256: string) => {
+    setNoneChosen(false)
+    setChosen((prev) => {
+      if (!showCheckboxes) return new Set([sha256])
+      const next = new Set(prev)
+      if (next.has(sha256)) next.delete(sha256)
+      else next.add(sha256)
+      return next
+    })
+  }
+  const selectNone = () => {
+    setChosen(new Set())
+    setNoneChosen(true)
+  }
+  const selectedCandidates = candidates.filter((k) => chosen.has(k.sha256))
+  // bertil does not send belopp on every candidate (or any, yet): sum what it knows and say
+  // plainly when a chosen document is not part of the sum, instead of a confidently wrong total.
+  // summarizeSelectedCandidates keeps the payment's own sign throughout (both belopp fields are
+  // negative for outgoing), so the diff is never computed by mixing a signed sum against an
+  // absolute-valued payment.
+  const { sum: selectedSum, missingBeloppCount, diff: selectedDiff } = summarizeSelectedCandidates(post.belopp, selectedCandidates)
   const [motpart, setMotpart] = useState(post.motpart)
   const [kategori, setKategori] = useState<Kategori | undefined>(suggestedKategori)
   const [basKontoOverride, setBasKontoOverride] = useState<string | undefined>(undefined)
@@ -122,8 +151,8 @@ export function PostAnswerPanel({
     mode,
     file,
     transactionId: post.transaction_id,
-    hasCandidate: chosen !== undefined,
-    sha256: chosen === NONE ? null : (chosen ?? null),
+    hasCandidate: noneChosen || chosen.size > 0,
+    sha256: Array.from(chosen),
     kategori,
     motpart,
     basKonto,
@@ -313,6 +342,7 @@ export function PostAnswerPanel({
         <div className="space-y-6">
           <fieldset className="space-y-3">
             <legend className="mb-2 text-sm font-medium">{t('candidates_legend')}</legend>
+            {showCheckboxes && <p className="text-[12.5px] text-muted-foreground">{t('candidates_legend_multi_hint')}</p>}
             {candidates.length === 0 && (
               <div className="space-y-2">
                 <p className="text-[12.5px] text-muted-foreground">{t('candidates_none')}</p>
@@ -329,20 +359,42 @@ export function PostAnswerPanel({
                 key={k.sha256 || k.filnamn}
                 name={`kandidat-${post.transaction_id}`}
                 candidate={k}
-                checked={chosen === k.sha256}
-                onSelect={() => setChosen(k.sha256)}
+                checked={chosen.has(k.sha256)}
+                useCheckbox={showCheckboxes}
+                onSelect={() => toggleCandidate(k.sha256)}
               />
             ))}
             <label className="flex items-start gap-3 text-[13px]">
-              <input
-                type="radio"
-                className={RADIO_CLASS}
-                name={`kandidat-${post.transaction_id}`}
-                checked={chosen === NONE}
-                onChange={() => setChosen(NONE)}
-              />
+              {showCheckboxes ? (
+                <Checkbox
+                  className="mt-0.5 border-foreground"
+                  checked={noneChosen}
+                  onCheckedChange={(v) => (v === true ? selectNone() : setNoneChosen(false))}
+                />
+              ) : (
+                <input
+                  type="radio"
+                  className={RADIO_CLASS}
+                  name={`kandidat-${post.transaction_id}`}
+                  checked={noneChosen}
+                  onChange={selectNone}
+                />
+              )}
               <span>{candidates.length === 0 ? t('candidate_none_needed') : t('candidate_none_of_them')}</span>
             </label>
+            {selectedCandidates.length > 1 && (
+              <p className="text-[12.5px] text-muted-foreground" aria-live="polite">
+                {t('candidates_selected_sum', {
+                  sum: formatCurrency(Math.abs(selectedSum), post.valuta),
+                  belopp: formatCurrency(Math.abs(post.belopp), post.valuta),
+                })}
+                {missingBeloppCount > 0
+                  ? ` ${t('candidates_selected_sum_missing_belopp', { count: missingBeloppCount })}`
+                  : selectedDiff !== 0
+                    ? ` ${t('candidates_selected_sum_diff', { diff: formatCurrency(Math.abs(selectedDiff), post.valuta) })}`
+                    : ''}
+              </p>
+            )}
           </fieldset>
 
           {classificationFields}
@@ -544,11 +596,13 @@ function CandidateOption({
   name,
   candidate,
   checked,
+  useCheckbox,
   onSelect,
 }: {
   name: string
   candidate: Kandidat
   checked: boolean
+  useCheckbox: boolean
   onSelect: () => void
 }) {
   const t = useTranslations('underlagsjakt')
@@ -575,15 +629,25 @@ function CandidateOption({
   return (
     <div className={cn('rounded-lg border border-border p-4', checked && 'border-foreground')}>
       <div className="flex items-start gap-3">
-        <input
-          type="radio"
-          className={RADIO_CLASS}
-          name={name}
-          checked={checked}
-          disabled={!selectable}
-          onChange={onSelect}
-          aria-label={candidate.filnamn}
-        />
+        {useCheckbox ? (
+          <Checkbox
+            className="mt-1 border-foreground"
+            checked={checked}
+            disabled={!selectable}
+            onCheckedChange={() => onSelect()}
+            aria-label={candidate.filnamn}
+          />
+        ) : (
+          <input
+            type="radio"
+            className={RADIO_CLASS}
+            name={name}
+            checked={checked}
+            disabled={!selectable}
+            onChange={onSelect}
+            aria-label={candidate.filnamn}
+          />
+        )}
         <div className="min-w-0 flex-1 space-y-1">
           <p className="truncate text-[13px] font-medium">{candidate.filnamn}</p>
           <p className="text-[13px]">{candidate.bevisgrund}</p>

@@ -255,6 +255,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                       bolagChoices={data.bolag_choices}
                       uploadEnabled={data.underlag_upload_enabled}
                       leverarSjalvEnabled={data.levererar_sjalv_enabled}
+                      multiKandidatEnabled={data.multi_kandidat_enabled}
                       onAnswered={async () => {
                         setExpandedId(null)
                         await load()
@@ -432,6 +433,7 @@ function PostRows({
   bolagChoices,
   uploadEnabled,
   leverarSjalvEnabled,
+  multiKandidatEnabled,
   onAnswered,
 }: {
   post: WorkspaceData['posts'][number]
@@ -441,6 +443,7 @@ function PostRows({
   bolagChoices: string[]
   uploadEnabled: boolean
   leverarSjalvEnabled: boolean
+  multiKandidatEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -483,7 +486,15 @@ function PostRows({
         <tr>
           <td colSpan={6} className="border-b border-border p-0">
             <RowFoldout>
-              <PostAnswerPanel post={post} posts={posts} bolagChoices={bolagChoices} uploadEnabled={uploadEnabled} leverarSjalvEnabled={leverarSjalvEnabled} onAnswered={onAnswered} />
+              <PostAnswerPanel
+                post={post}
+                posts={posts}
+                bolagChoices={bolagChoices}
+                uploadEnabled={uploadEnabled}
+                leverarSjalvEnabled={leverarSjalvEnabled}
+                multiKandidatEnabled={multiKandidatEnabled}
+                onAnswered={onAnswered}
+              />
             </RowFoldout>
           </td>
         </tr>
