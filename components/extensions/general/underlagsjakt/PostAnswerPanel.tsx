@@ -683,6 +683,7 @@ export function PostAnswerPanel({
                 checked={reglering === r}
                 onSelect={() => setReglering(r)}
                 label={t(`reglering_${r}`)}
+                description={t(`reglering_${r}_description`)}
               />
             ))}
             <p className="text-xs text-muted-foreground">
@@ -739,16 +740,21 @@ function RadioRow({
   checked,
   onSelect,
   label,
+  description,
 }: {
   name: string
   checked: boolean
   onSelect: () => void
   label: string
+  description?: string
 }) {
   return (
     <label className="flex items-start gap-3 text-[13px]">
       <input type="radio" className={RADIO_CLASS} name={name} checked={checked} onChange={onSelect} />
-      <span>{label}</span>
+      <span>
+        <span className="block">{label}</span>
+        {description && <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>}
+      </span>
     </label>
   )
 }
