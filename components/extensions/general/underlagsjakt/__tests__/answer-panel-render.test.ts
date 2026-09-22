@@ -43,3 +43,35 @@ describe('answer panel initial render', () => {
     expect(html).toContain(sv.underlagsjakt.field_bas_konto_suggestion)
   })
 })
+
+function renderFelBolagPanel(locale: 'sv' | 'en') {
+  const post: Post = { ...fixture.sammanstallningar[0].posts[0], kategori: 'fel_bolag' }
+  return renderToStaticMarkup(
+    createElement(
+      NextIntlClientProvider,
+      {
+        locale,
+        messages: locale === 'sv' ? sv : en,
+        timeZone: 'Europe/Stockholm',
+      } as unknown as Parameters<typeof NextIntlClientProvider>[0],
+      createElement(PostAnswerPanel, { post, posts: [post], bolagChoices: [], uploadEnabled: true, leverarSjalvEnabled: false, onAnswered: async () => {} })
+    )
+  )
+}
+
+describe('answer panel settlement explanations (task 1485)', () => {
+  it.each(['sv', 'en'] as const)('explains what each reglering choice does and shows the not-booked note at the choice, in %s', (locale) => {
+    const messages = locale === 'sv' ? sv : en
+    const html = renderFelBolagPanel(locale)
+    expect(html).toContain(messages.underlagsjakt.reglering_vidarefakturera_description)
+    expect(html).toContain(messages.underlagsjakt.reglering_mellanhavande_description)
+    expect(html).toContain(messages.underlagsjakt.fel_bolag_not_booked)
+  })
+
+  it('has a Swedish and English description for both settlement choices', () => {
+    expect(sv.underlagsjakt.reglering_vidarefakturera_description).toBeTruthy()
+    expect(sv.underlagsjakt.reglering_mellanhavande_description).toBeTruthy()
+    expect(en.underlagsjakt.reglering_vidarefakturera_description).toBeTruthy()
+    expect(en.underlagsjakt.reglering_mellanhavande_description).toBeTruthy()
+  })
+})
