@@ -45,6 +45,7 @@ const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
   'docker-extensions-preset-underlagsjakt': ['docker/extensions.self-hosted.json'],
   'leverans-mfa-gate-prefix': ['lib/auth/api-mfa-gate.ts'],
   'docker-publish-ghcr-namespace': ['.github/workflows/docker-publish.yml'],
+  'docker-publish-latest-forward-only': ['.github/workflows/docker-publish.yml'],
   'docker-cron-entrypoint-hardening': [
     'docker/cron.Dockerfile',
     'scripts/__tests__/generate-crontabs.test.ts',
@@ -219,6 +220,10 @@ describe('the committed manifest', () => {
     //   does not have, so every publish failed at push-by-digest and the fork
     //   never produced an image at all. IMAGE_NAME has to name a namespace we
     //   own; the file is upstream's, so the path is named here on purpose.
+    // - docker-publish-latest-forward-only: the merge job only tags latest
+    //   when its commit is still the tip of main, because two parallel main
+    //   builds left latest on the older commit (2026-09-21). Operator
+    //   dispensation for task 1480, limited to the tagging step.
     // - docker-extensions-preset-underlagsjakt: the image build copies
     //   docker/extensions.<preset>.json over extensions.config.json, so the
     //   underlagsjakt-extension registration is discarded at build time and

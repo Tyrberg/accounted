@@ -285,6 +285,38 @@
       ]
     },
     {
+      "id": "docker-publish-latest-forward-only",
+      "tier": 2,
+      "summary": "docker-publish.yml only moves the latest tag from a run whose commit is still the tip of main.",
+      "why": "Upstream tags latest unconditionally on every main build (type=raw,value=latest,enable={{is_default_branch}}), and two runs started by merges in quick succession have no ordering, so whichever pushes last wins. On 2026-09-21 PR #15 (b6f644653) and PR #16 (cb596981a) built two seconds apart, both succeeded, and latest ended up on b6f644653: a pull of latest silently deployed an app without #16. The merge job now reads the tip of the default branch with git ls-remote (the repo is public, so no token or permission change is needed) and enables latest only when it equals GITHUB_SHA; a superseded run keeps its sha tag, which is the rescue path that deployed cb596981a correctly. A concurrency group was not used: it cancels pending runs, which would drop their sha tags, and it serializes runs without ordering them by commit. Operator dispensation 2026-09-21 (task 1480) covers this tagging step only. upstream.status is not-applicable: upstream has not asked for it, and the fix stands on its own here.",
+      "paths": [".github/workflows/docker-publish.yml"],
+      "tracked": true,
+      "branch": "main",
+      "upstream": {
+        "status": "not-applicable"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": ".github/workflows/docker-publish.yml",
+          "pattern": "type=raw,value=latest,enable=\\$\\{\\{ steps\\.tip\\.outputs\\.latest \\}\\}",
+          "reason": "latest is no longer gated on the tip check, so two merges in quick succession can leave it pointing at the older commit again."
+        },
+        {
+          "kind": "local-contains",
+          "path": ".github/workflows/docker-publish.yml",
+          "pattern": "if \\[ \"\\$TIP\" = \"\\$GITHUB_SHA\" \\]; then",
+          "reason": "The step that compares this run's commit with the tip of main is gone or changed, so the latest gate no longer means what it claims."
+        },
+        {
+          "kind": "local-contains",
+          "path": ".github/workflows/docker-publish.yml",
+          "pattern": "^            type=sha,prefix=$",
+          "reason": "The immutable sha tag is gone. It is the rescue path when latest is skipped, and the only way a superseded build stays deployable."
+        }
+      ]
+    },
+    {
       "id": "docker-extensions-preset-underlagsjakt",
       "tier": 2,
       "summary": "docker/extensions.self-hosted.json lists underlagsjakt, so the published image actually contains the extension.",
