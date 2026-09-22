@@ -256,6 +256,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
                       uploadEnabled={data.underlag_upload_enabled}
                       leverarSjalvEnabled={data.levererar_sjalv_enabled}
                       multiKandidatEnabled={data.multi_kandidat_enabled}
+                      reglerarSkuldEnabled={data.reglerar_skuld_enabled}
                       onAnswered={async () => {
                         setExpandedId(null)
                         await load()
@@ -434,6 +435,7 @@ function PostRows({
   uploadEnabled,
   leverarSjalvEnabled,
   multiKandidatEnabled,
+  reglerarSkuldEnabled,
   onAnswered,
 }: {
   post: WorkspaceData['posts'][number]
@@ -444,6 +446,7 @@ function PostRows({
   uploadEnabled: boolean
   leverarSjalvEnabled: boolean
   multiKandidatEnabled: boolean
+  reglerarSkuldEnabled: boolean
   onAnswered: () => Promise<void>
 }) {
   const t = useTranslations('underlagsjakt')
@@ -493,6 +496,7 @@ function PostRows({
                 uploadEnabled={uploadEnabled}
                 leverarSjalvEnabled={leverarSjalvEnabled}
                 multiKandidatEnabled={multiKandidatEnabled}
+                reglerarSkuldEnabled={reglerarSkuldEnabled}
                 onAnswered={onAnswered}
               />
             </RowFoldout>

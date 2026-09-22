@@ -1,5 +1,6 @@
 import { findMatchingTemplates, getTemplateById } from '@/lib/bookkeeping/booking-templates'
 import { getDefaultAccountForCategory } from '@/lib/bookkeeping/category-mapping'
+import { accountClass } from '@/lib/invariants/account-number'
 import type { Transaction } from '@/types'
 import type { Kategori } from '@/extensions/general/underlagsjakt/lib/contract'
 
@@ -29,4 +30,23 @@ export function suggestAnswerAccount(kategori: Kategori | undefined, amount: num
   const template = getTemplateById(templateId)
   if (!template) return ''
   return template.direction === 'income' ? template.credit_account : template.debit_account
+}
+
+/** The lines of a referenced verifikat, as much as suggesting a skuldkonto needs. */
+export interface VerifikatLineForSuggestion {
+  account_number: string
+}
+
+/**
+ * Suggest which liability account a `reglerar_skuld` answer should debit,
+ * read from the referenced verifikat's own lines: the BAS class 2 accounts
+ * already posted there. Never from the cost templates above (this payment is
+ * not a cost, the cost was booked once already, when the debt was) and never
+ * a hardcoded account list: every company's real skuldkonton differ, so the
+ * only trustworthy source is the verifikat the user themselves pointed at
+ * (task 1482). Usually one match; more than one (e.g. a verifikat crediting
+ * both 2893 and 2990) is left for the user to pick between.
+ */
+export function suggestSkuldkontoFromVerifikat(lines: VerifikatLineForSuggestion[]): string[] {
+  return [...new Set(lines.map((l) => l.account_number).filter((n) => accountClass(n) === 2))]
 }

@@ -29,14 +29,19 @@ function route(method: string, path: string) {
 
 let store: Map<string, unknown>
 let memberships: { data: unknown; error: { message: string } | null }
+let journalEntryLookup: { data: { voucher_series: string; voucher_number: number } | null; error: unknown }
 const membershipQuery = { select: vi.fn(), eq: vi.fn(), is: vi.fn() }
+const journalEntryQuery = { select: vi.fn(), eq: vi.fn(), maybeSingle: vi.fn() }
 const from = vi.fn()
 
 function buildCtx(): ExtensionContext {
   membershipQuery.select.mockReturnValue(membershipQuery)
   membershipQuery.eq.mockReturnValue(membershipQuery)
   membershipQuery.is.mockImplementation(async () => memberships)
-  from.mockReturnValue(membershipQuery)
+  journalEntryQuery.select.mockReturnValue(journalEntryQuery)
+  journalEntryQuery.eq.mockReturnValue(journalEntryQuery)
+  journalEntryQuery.maybeSingle.mockImplementation(async () => journalEntryLookup)
+  from.mockImplementation((table: string) => (table === 'journal_entries' ? journalEntryQuery : membershipQuery))
   return {
     userId: 'user-1',
     companyId: 'company-1',
@@ -97,6 +102,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   store = new Map()
   memberships = { data: [], error: null }
+  journalEntryLookup = { data: null, error: null }
   writePermission.mockResolvedValue({ ok: true })
   uploadDocument.mockResolvedValue(storedDocument)
   kopplaTillTransaktion.mockResolvedValue('kopplad')
@@ -692,6 +698,97 @@ describe('levererar_sjalv', () => {
     await importFixture(ctx)
     const { body } = await parseJsonResponse<GetBody>(await route('GET', '/').handler(get('/'), ctx))
     expect(body.data.waiting.map((w) => w.underlag_hittat_at)).toEqual([null])
+  })
+})
+
+describe('reglerar_skuld', () => {
+  const skuld = {
+    svarstyp: 'reglerar_skuld',
+    transaction_id: 'tx-google-20260803',
+    motpart: 'LÖN',
+    ursprungsverifikat_id: '7c3e9a2e-2b3a-4c9e-9d3a-1a2b3c4d5e6f',
+    bas_konto: '2893',
+    begransa_bolag: false,
+    begransa_belopp: false,
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('POST /svar answers 403 FEATURE_DISABLED while the type is off, and stores nothing', async () => {
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const before = JSON.stringify([...store.entries()])
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar').handler(post('/svar', skuld), ctx),
+    )
+    expect(status).toBe(403)
+    expect(body.error.code).toBe('FEATURE_DISABLED')
+    expect(JSON.stringify([...store.entries()])).toBe(before)
+  })
+
+  it('answers 400 VALIDATION_ERROR for a cost account, even sent directly to the API bypassing the form: the whole point of this answer type is never to book a new cost', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    const before = JSON.stringify([...store.entries()])
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar').handler(post('/svar', { ...skuld, bas_konto: '7210' }), ctx),
+    )
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(JSON.stringify([...store.entries()])).toBe(before)
+  })
+
+  it('answers 404 VERIFIKAT_NOT_FOUND when the referenced verifikat does not exist for this company, and stores nothing', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    journalEntryLookup = { data: null, error: null }
+    const before = JSON.stringify([...store.entries()])
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await route('POST', '/svar').handler(post('/svar', skuld), ctx),
+    )
+    expect(status).toBe(404)
+    expect(body.error.code).toBe('VERIFIKAT_NOT_FOUND')
+    expect(JSON.stringify([...store.entries()])).toBe(before)
+  })
+
+  it('records a beslut debiting the liability account with the resolved verifikat label, and the file is stamped 1.7', async () => {
+    vi.stubEnv('UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED', 'true')
+    const ctx = buildCtx()
+    await importFixture(ctx)
+    journalEntryLookup = { data: { voucher_series: 'A', voucher_number: 217 }, error: null }
+    const { status, body } = await parseJsonResponse<{ data: { beslut: Record<string, unknown> } }>(
+      await route('POST', '/svar').handler(post('/svar', skuld), ctx),
+    )
+    expect(status).toBe(200)
+    expect(body.data.beslut).toMatchObject({
+      svarstyp: 'reglerar_skuld',
+      ursprungsverifikat_id: skuld.ursprungsverifikat_id,
+      ursprungsverifikat_nummer: 'A217',
+      bas_konto: '2893',
+      motpart: 'LÖN',
+    })
+
+    const file = await parseJsonResponse<{ version: string; beslut: { svarstyp: string }[] }>(
+      await route('GET', '/svarsfil').handler(get('/svarsfil'), ctx),
+    )
+    expect(file.body.version).toBe('1.7')
+    expect(file.body.beslut.map((b) => b.svarstyp)).toEqual(['reglerar_skuld'])
+  })
+
+  it('GET / tells the workspace whether the type is switched on', async () => {
+    const off = await parseJsonResponse<{ data: { reglerar_skuld_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(off.body.data.reglerar_skuld_enabled).toBe(false)
+    vi.stubEnv('UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED', 'true')
+    const on = await parseJsonResponse<{ data: { reglerar_skuld_enabled: boolean } }>(
+      await route('GET', '/').handler(get('/'), buildCtx()),
+    )
+    expect(on.body.data.reglerar_skuld_enabled).toBe(true)
   })
 })
 

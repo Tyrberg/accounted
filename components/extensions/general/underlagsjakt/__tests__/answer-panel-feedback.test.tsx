@@ -18,6 +18,8 @@ import {
   buildAnswerInput,
   deriveTillBolag,
   interpretSaveResult,
+  isReglerarSkuldAccountValid,
+  searchReglerarSkuldVerifikat,
   submitAnswer,
   submitBulkAnswer,
   summarizeSelectedCandidates,
@@ -412,6 +414,107 @@ describe('deriveTillBolag', () => {
   })
 })
 
+describe('buildAnswerInput: reglerar_skuld', () => {
+  const BASE_REGLERAR_SKULD = {
+    mode: 'reglerar_skuld' as const,
+    transactionId: 't1',
+    hasCandidate: false,
+    sha256: [] as string[],
+    motpart: 'LÖN',
+    basKonto: '2893',
+    basKontoValid: true,
+    momstyp: null,
+    begransaBolag: false,
+    begransaBelopp: false,
+    ursprungsverifikatId: 'verifikat-1',
+  }
+
+  it('lists every unset field', () => {
+    const result = buildAnswerInput({ ...BASE_REGLERAR_SKULD, ursprungsverifikatId: undefined, motpart: '  ', basKonto: '' })
+    expect(result).toEqual({ missing: ['missing_ursprungsverifikat', 'missing_motpart', 'missing_bas_konto'] })
+  })
+
+  it('flags an invalid BAS account even when one was typed', () => {
+    const result = buildAnswerInput({ ...BASE_REGLERAR_SKULD, basKonto: '28', basKontoValid: false })
+    expect(result).toEqual({ missing: ['missing_bas_konto'] })
+  })
+
+  it('returns an input once complete, referencing the picked verifikat and the liability account', () => {
+    const result = buildAnswerInput(BASE_REGLERAR_SKULD)
+    expect(result.missing).toBeUndefined()
+    expect(result.input).toEqual({
+      svarstyp: 'reglerar_skuld',
+      transaction_id: 't1',
+      motpart: 'LÖN',
+      ursprungsverifikat_id: 'verifikat-1',
+      bas_konto: '2893',
+      begransa_bolag: false,
+      begransa_belopp: false,
+    })
+  })
+})
+
+describe('isReglerarSkuldAccountValid', () => {
+  it('accepts a BAS class 2 (liability) account, e.g. the avräkningskonto from a suggestion', () => {
+    expect(isReglerarSkuldAccountValid('2893')).toBe(true)
+  })
+
+  it('refuses a cost account typed by hand instead of picked from the suggestion: the bug this answer type exists to prevent', () => {
+    expect(isReglerarSkuldAccountValid('7210')).toBe(false)
+  })
+
+  it('refuses an asset account and a malformed value', () => {
+    expect(isReglerarSkuldAccountValid('1930')).toBe(false)
+    expect(isReglerarSkuldAccountValid('28')).toBe(false)
+    expect(isReglerarSkuldAccountValid('')).toBe(false)
+  })
+})
+
+describe('searchReglerarSkuldVerifikat', () => {
+  it('maps rows into verifikat results, suggesting the liability account off each row\'s own lines', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'je-1',
+            voucher_series: 'A',
+            voucher_number: 217,
+            entry_date: '2025-12-31',
+            description: 'Lön december 2025',
+            lines: [{ account_number: '7210' }, { account_number: '2893' }],
+          },
+        ],
+      }),
+    })
+    const outcome = await searchReglerarSkuldVerifikat('A217', mockFetch as unknown as typeof fetch)
+    expect(outcome).toEqual({
+      ok: true,
+      results: [
+        { id: 'je-1', label: 'A217', date: '2025-12-31', description: 'Lön december 2025', accountCandidates: ['2893'] },
+      ],
+    })
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/api\/bookkeeping\/journal-entries\?search=A217&status=posted&exclude_draft=true&limit=8$/),
+    )
+  })
+
+  it('treats a non-ok response as a search failure', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: false, json: async () => ({ error: 'nope' }) })
+    expect(await searchReglerarSkuldVerifikat('A217', mockFetch as unknown as typeof fetch)).toEqual({ ok: false })
+  })
+
+  it('treats an unparseable body on a 200 as a search failure, never as "nothing matched": a truncated response must not look like a verifikat that genuinely does not exist', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, json: async () => { throw new SyntaxError('Unexpected end of JSON input') } })
+    expect(await searchReglerarSkuldVerifikat('A217', mockFetch as unknown as typeof fetch)).toEqual({ ok: false })
+  })
+
+  it('treats a network exception as a search failure', async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error('offline'))
+    expect(await searchReglerarSkuldVerifikat('A217', mockFetch as unknown as typeof fetch)).toEqual({ ok: false })
+  })
+})
+
 describe('buildAnswerInput: osaker', () => {
   it('never blocks', () => {
     const result = buildAnswerInput({ ...BASE_VAL_KANDIDAT, mode: 'osaker' })
@@ -525,6 +628,25 @@ describe('answerSummary', () => {
     expect(answerSummary(t, multi)).toBe('answer_val_kandidat_multi:{"count":2,"kategori":"Bankavgift"}')
   })
 
+  it('names the referenced verifikat and the debited account for a reglerar_skuld save', () => {
+    const skuld = {
+      ...SVAR_RECORD,
+      beslut: {
+        answer_id: 'a1',
+        transaction_id: 't1',
+        svarstyp: 'reglerar_skuld' as const,
+        ursprungsverifikat_id: 'verifikat-1',
+        ursprungsverifikat_nummer: 'A217',
+        bas_konto: '2893',
+        motpart: 'LÖN',
+        bolag: null,
+        bankkonto: null,
+        belopp: null,
+      },
+    } as SvarRecord
+    expect(answerSummary(t, skuld)).toBe('answer_reglerar_skuld:{"verifikat":"A217","konto":"2893"}')
+  })
+
   it('does not throw for a val_kandidat answer stored before vald_kandidater existed', () => {
     const { vald_kandidater: _omit, ...preDeployBeslut } = SVAR_RECORD.beslut as typeof SVAR_RECORD.beslut & {
       vald_kandidater: unknown
@@ -589,6 +711,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
     uploadEnabled = true,
     leverarSjalvEnabled = false,
     multiKandidatEnabled = false,
+    reglerarSkuldEnabled = false,
   ) {
     let finalPost: Post = post
     if (postOverride?.forslag) {
@@ -616,7 +739,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
           messages: sv,
           timeZone: 'Europe/Stockholm',
         } as unknown as Parameters<typeof NextIntlClientProvider>[0],
-        createElement(PostAnswerPanel, { post: finalPost, posts: [finalPost], bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, leverarSjalvEnabled, multiKandidatEnabled, onAnswered: async () => {} })
+        createElement(PostAnswerPanel, { post: finalPost, posts: [finalPost], bolagChoices: bolagChoices ?? ['Acme AB', 'Another Co AB'], uploadEnabled, leverarSjalvEnabled, multiKandidatEnabled, reglerarSkuldEnabled, onAnswered: async () => {} })
       )
     )
   }
@@ -688,6 +811,15 @@ describe('PostAnswerPanel: rendered correctly', () => {
     expect(on).toContain(sv.underlagsjakt.mode_uppladdat_underlag)
     // Two answers that look alike but mean opposite things in the books stay distinct.
     expect(sv.underlagsjakt.mode_levererar_sjalv).not.toBe(sv.underlagsjakt.mode_osaker)
+  })
+
+  it('offers "settles a booked debt" only once it is switched on, next to (not instead of) the other answers', () => {
+    const off = renderPanel()
+    expect(off).not.toContain(sv.underlagsjakt.mode_reglerar_skuld)
+    const on = renderPanel(undefined, undefined, true, false, false, true)
+    expect(on).toContain(sv.underlagsjakt.mode_reglerar_skuld)
+    expect(on).toContain(sv.underlagsjakt.mode_val_kandidat)
+    expect(on).toContain(sv.underlagsjakt.mode_osaker)
   })
 
   it('preserves an exported BAS account in the input value', () => {

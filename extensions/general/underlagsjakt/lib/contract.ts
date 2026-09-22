@@ -15,6 +15,7 @@
  */
 import { z } from 'zod'
 import { accountNumberSchema } from '@/lib/invariants/zod'
+import { accountClass } from '@/lib/invariants/account-number'
 
 /**
  * Version range this extension reads. Only the major component is bounded on
@@ -51,6 +52,17 @@ export const ANSWER_VERSION_UPLOAD = '1.5'
  * flag rather than being written unconditionally.
  */
 export const ANSWER_VERSION_MULTI_KANDIDAT = '1.6'
+/**
+ * 1.7 adds the `reglerar_skuld` svarstyp: a payment that settles a debt
+ * already booked in a prior verifikat (e.g. a lön payout against 2893) must
+ * debit that liability account, not be booked as a new cost, because the
+ * cost was already taken when the debt was booked. None of `val_kandidat`
+ * (needs a NEW document), `osaker` (defers) or "no underlag needed" (the
+ * underlag is last year's verifikat, which does exist) fit that case.
+ * Written only to a file that holds one, so a 1.6 reader loses nothing it
+ * did not already lose (task 1482, Mattias 2026-09-21/22).
+ */
+export const ANSWER_VERSION_REGLERAR_SKULD = '1.7'
 
 /**
  * Whether the `levererar_sjalv` answer type is available: the option is hidden
@@ -61,6 +73,15 @@ export const ANSWER_VERSION_MULTI_KANDIDAT = '1.6'
  */
 export function leverarSjalvEnabled(): boolean {
   return process.env.UNDERLAGSJAKT_LEVERERAR_SJALV_ENABLED === 'true'
+}
+
+/**
+ * Whether the `reglerar_skuld` answer type is available: hidden and refused
+ * with 403 until UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true, set only once
+ * bertil's mottak_svar_fran_ui reads answer version 1.7 and the type.
+ */
+export function reglerarSkuldEnabled(): boolean {
+  return process.env.UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED === 'true'
 }
 
 /**
@@ -384,6 +405,32 @@ export type Beslut =
       /** ISO timestamp when bertil confirmed the document was found. Null while waiting. */
       underlag_hittat_at: string | null
     }
+  | {
+      answer_id: string
+      transaction_id: string
+      svarstyp: 'reglerar_skuld'
+      /**
+       * journal_entries.id in Accounted: the verifikat that already booked this
+       * debt. A real, server-checked reference (the post's own company, posted
+       * status), never free text, so the correction is traceable rather than a
+       * note (task 1482).
+       */
+      ursprungsverifikat_id: string
+      /** The verifikat's own label (e.g. "A217"), resolved server-side from ursprungsverifikat_id. */
+      ursprungsverifikat_nummer: string
+      /**
+       * The liability account this payment settles. Never a cost account: the
+       * cost was booked once already, when the debt was. When bertil books
+       * this verifikat, its description must end with "(netto via
+       * avräkning)", matching the wording already used in Mattias's own
+       * bookkeeping for avräkningskonto payouts (docs/underlagsjakt-export-schema.md, "reglerar_skuld").
+       */
+      bas_konto: string
+      motpart: string
+      bolag: string | null
+      bankkonto: string | null
+      belopp: number | null
+    }
   | { answer_id: string; transaction_id: string; svarstyp: 'osaker' }
 
 /**
@@ -395,6 +442,17 @@ const levererarSjalvSchema = z.object({
   svarstyp: z.literal('levererar_sjalv'),
   transaction_id: z.string().min(1),
   motpart: z.string().trim().min(1),
+})
+
+/**
+ * BAS class 2 (liability) accounts only. `reglerar_skuld` exists precisely to
+ * stop this payment from being booked as a new cost (the cost was booked once
+ * already, when the debt was): a class 3-8 account here would recreate the
+ * exact double-counting bug the answer type is for, whether typed in the
+ * form or posted directly against the API (task 1482).
+ */
+const liabilityAccountSchema = accountNumberSchema.refine((v) => accountClass(v) === 2, {
+  message: 'Kontot måste vara ett skuldkonto (BAS-klass 2): kostnaden bokfördes redan när skulden uppstod',
 })
 
 /** What the workspace sends for one post. Validated against the stored post before it becomes a Beslut. */
@@ -426,6 +484,16 @@ export const svarInputSchema = z.discriminatedUnion('svarstyp', [
       path: ['reglering'],
     }),
   levererarSjalvSchema,
+  z.object({
+    svarstyp: z.literal('reglerar_skuld'),
+    transaction_id: z.string().min(1),
+    motpart: z.string().trim().min(1),
+    /** journal_entries.id of the verifikat that first booked this debt: picked from a search, never typed. */
+    ursprungsverifikat_id: z.string().uuid(),
+    bas_konto: liabilityAccountSchema,
+    begransa_bolag: z.boolean(),
+    begransa_belopp: z.boolean(),
+  }),
   z.object({
     svarstyp: z.literal('osaker'),
     transaction_id: z.string().min(1),
@@ -494,11 +562,20 @@ export type BuildBeslutResult =
  * Turn a validated input into the contract's `beslut`. The chosen file is
  * resolved from the stored post by hash, so filnamn/kalla/sha256 always come
  * from what bertil offered, never from the browser.
+ *
+ * `reglerarSkuld` is the one exception to "pure function of post + input":
+ * the verifikat's human label cannot be derived from the input alone, so the
+ * caller (`POST /svar`) resolves it against `journal_entries` first (the
+ * same DB round trip that also confirms the id is real and belongs to this
+ * company) and passes it in. Always supplied together with a `reglerar_skuld`
+ * input; a call without it for that svarstyp is a caller bug, not a runtime
+ * path a user can reach.
  */
 export function buildBeslut(
   post: Post,
   input: SvarInput,
   answerId: string,
+  reglerarSkuld?: { ursprungsverifikatNummer: string },
 ): BuildBeslutResult {
   const transaction_id = post.transaction_id
   if (input.svarstyp === 'osaker') {
@@ -517,6 +594,27 @@ export function buildBeslut(
         svarstyp: 'levererar_sjalv',
         motpart: input.motpart,
         underlag_hittat_at: null,
+      },
+      reglering: null,
+    }
+  }
+  if (input.svarstyp === 'reglerar_skuld') {
+    if (!reglerarSkuld) {
+      throw new Error('buildBeslut: reglerar_skuld requires the resolved verifikat label')
+    }
+    return {
+      ok: true,
+      beslut: {
+        answer_id: answerId,
+        transaction_id,
+        svarstyp: 'reglerar_skuld',
+        ursprungsverifikat_id: input.ursprungsverifikat_id,
+        ursprungsverifikat_nummer: reglerarSkuld.ursprungsverifikatNummer,
+        bas_konto: input.bas_konto,
+        motpart: input.motpart,
+        bolag: input.begransa_bolag ? post.bolag : null,
+        bankkonto: null,
+        belopp: input.begransa_belopp ? post.belopp : null,
       },
       reglering: null,
     }
@@ -585,8 +683,15 @@ export type BulkSvarInput = z.infer<typeof bulkSvarInputSchema>
 export function buildAnswerFile(
   beslut: Beslut[],
 ): { version: string; beslut: Beslut[] } {
+  const needsReglerarSkuld = beslut.some((b) => b.svarstyp === 'reglerar_skuld')
   const needsMultiKandidat = beslut.some((b) => b.svarstyp === 'val_kandidat' && (b.vald_kandidater ?? []).length > 1)
   const needsUpload = beslut.some((b) => b.svarstyp === 'uppladdat_underlag' || b.svarstyp === 'levererar_sjalv')
-  const version = needsMultiKandidat ? ANSWER_VERSION_MULTI_KANDIDAT : needsUpload ? ANSWER_VERSION_UPLOAD : ANSWER_VERSION
+  const version = needsReglerarSkuld
+    ? ANSWER_VERSION_REGLERAR_SKULD
+    : needsMultiKandidat
+      ? ANSWER_VERSION_MULTI_KANDIDAT
+      : needsUpload
+        ? ANSWER_VERSION_UPLOAD
+        : ANSWER_VERSION
   return { version, beslut }
 }

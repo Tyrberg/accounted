@@ -5760,7 +5760,22 @@
     "error_CANDIDATE_WITHOUT_HASH": "The document has no checksum and cannot be chosen.",
     "error_ALREADY_DELIVERED": "The answer has already been imported into bertil and cannot be changed here.",
     "error_NOT_FOUND": "The answer does not exist.",
-    "status_offered": "Offered to bertil"
+    "status_offered": "Offered to bertil",
+    "mode_reglerar_skuld": "Settles a booked debt",
+    "reglerar_skuld_description": "This payment is not a new cost: it pays down a debt already booked in an earlier verifikat. Point at that verifikat, and the payment is booked against the liability account instead of as a new cost.",
+    "reglerar_skuld_search_legend": "Which verifikat booked the debt?",
+    "reglerar_skuld_search_hint":"Search by voucher number or text, e.g. A209 or december salary",
+    "reglerar_skuld_search_button": "Search",
+    "reglerar_skuld_search_error": "The verifikat could not be searched. Try again.",
+    "reglerar_skuld_no_results": "No verifikat matched the search.",
+    "reglerar_skuld_verifikat_row": "{label} · {datum} · {beskrivning}",
+    "reglerar_skuld_account_label": "Liability account",
+    "reglerar_skuld_account_choose": "Choose account",
+    "reglerar_skuld_no_liability_account": "The verifikat has no liability account (BAS class 2) to suggest. Enter the account manually.",
+    "reglerar_skuld_account_invalid": "The account must be a liability account (BAS class 2, e.g. 2893). The cost was already booked when the debt arose.",
+    "missing_ursprungsverifikat": "which verifikat booked the debt",
+    "answer_reglerar_skuld": "Settles debt from verifikat {verifikat}, account {konto}",
+    "error_VERIFIKAT_NOT_FOUND": "The given verifikat does not exist or is not posted."
   },
   "extensions": {
     "page_title": "Extensions",

@@ -34,6 +34,7 @@ import {
   leverarSjalvEnabled,
   multiKandidatEnabled,
   parseExport,
+  reglerarSkuldEnabled,
   svarInputSchema,
   uppladdatInputSchema,
 } from './lib/contract'
@@ -186,6 +187,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
           underlag_upload_enabled: uploadEnabled(),
           levererar_sjalv_enabled: leverarSjalvEnabled(),
           multi_kandidat_enabled: multiKandidatEnabled(),
+          reglerar_skuld_enabled: reglerarSkuldEnabled(),
           leverans: { till_detta_bolag: leveransHit },
           export: exp
             ? {
@@ -333,14 +335,35 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
       if (input.data.svarstyp === 'val_kandidat' && input.data.sha256.length > 1 && !multiKandidatEnabled()) {
         return fail(403, 'FEATURE_DISABLED', 'Att välja flera dokument till samma betalning är inte påslaget.')
       }
+      if (input.data.svarstyp === 'reglerar_skuld' && !reglerarSkuldEnabled()) {
+        return fail(403, 'FEATURE_DISABLED', 'Svarstypen "reglerar en bokförd skuld" är inte påslagen.')
+      }
 
       const now = nowIso()
       const state = await loadState(ctx.settings)
       const post = findPost(state.export, input.data.transaction_id)
       if (!post) return fail(404, 'POST_NOT_FOUND', 'Posten finns inte i den inlästa exporten.')
 
+      // The referenced verifikat must be real, posted and belong to this
+      // company before its label is trusted into the beslut: an id alone,
+      // unchecked, would be a reference in name only (task 1482).
+      let reglerarSkuldContext: { ursprungsverifikatNummer: string } | undefined
+      if (input.data.svarstyp === 'reglerar_skuld') {
+        const { data: verifikat } = await ctx.supabase
+          .from('journal_entries')
+          .select('voucher_series, voucher_number')
+          .eq('company_id', ctx.companyId)
+          .eq('id', input.data.ursprungsverifikat_id)
+          .eq('status', 'posted')
+          .maybeSingle()
+        if (!verifikat) {
+          return fail(404, 'VERIFIKAT_NOT_FOUND', 'Det angivna verifikatet finns inte eller är inte bokfört.')
+        }
+        reglerarSkuldContext = { ursprungsverifikatNummer: `${verifikat.voucher_series}${verifikat.voucher_number}` }
+      }
+
       const answerId = `${now}:${post.transaction_id}`
-      const built = buildBeslut(post, input.data, answerId)
+      const built = buildBeslut(post, input.data, answerId, reglerarSkuldContext)
       if (!built.ok) {
         return fail(
           400,
