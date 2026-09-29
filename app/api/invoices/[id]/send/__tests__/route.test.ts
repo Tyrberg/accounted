@@ -10,6 +10,11 @@ import {
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
 
+const mockIssuancePeriodError = vi.fn()
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => mockIssuancePeriodError(...args),
+}))
+
 const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => Promise.resolve(mockSupabase),
@@ -116,7 +121,8 @@ vi.mock('@/lib/bookkeeping/invoice-entries', () => ({
 }))
 
 const mockIssueCreditNote = vi.fn()
-vi.mock('@/lib/invoices/issue-credit-note', () => ({
+vi.mock('@/lib/invoices/issue-credit-note', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/invoices/issue-credit-note')>(),
   issueCreditNote: (...args: unknown[]) => mockIssueCreditNote(...args),
 }))
 
@@ -167,6 +173,7 @@ describe('POST /api/invoices/[id]/send', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockIssuancePeriodError.mockResolvedValue(null)
     reset()
     eventBus.clear()
     mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
@@ -179,6 +186,32 @@ describe('POST /api/invoices/[id]/send', () => {
       journalEntryRequired: true,
       failures: [],
     })
+  })
+
+  it('returns 422 without numbering or sending when the fiscal period is missing', async () => {
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: company, error: null })
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+
+    const response = await POST(
+      createMockRequest('/api/invoices/inv-1/send', { method: 'POST' }),
+      createMockRouteParams({ id: 'inv-1' }),
+    )
+
+    expect(mockIssuancePeriodError).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      expect.objectContaining({ invoice_date: invoice.invoice_date, status: 'draft' }),
+      company,
+      true,
+    )
+    expect(response.status).toBe(422)
+    expect((await response.json()).error.code).toBe('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockCreateInvoiceJournalEntry).not.toHaveBeenCalled()
   })
 
   it('returns 401 when not authenticated', async () => {

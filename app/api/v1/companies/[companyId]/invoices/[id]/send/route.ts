@@ -61,6 +61,7 @@ import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
   reserveInvoiceDelivery,
@@ -132,6 +133,7 @@ registerEndpoint({
     'Re-sending an already-sent invoice (returns 409 INVOICE_UPDATE_NOT_DRAFT). Sending a delivery note (no F-series lifecycle). Sending a credit note (use the :credit endpoint to issue the kreditfaktura; subsequent re-send of the credit note via :mark-sent is the supported path).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
+    'When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number, sending email or changing status, including in dry-run. A locked period, or an invoice_date on or before the company lock date, returns 400 PERIOD_LOCKED the same way.',
     'Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL (or an SMTP relay via EMAIL_PROVIDER=smtp) the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.',
     'Customer must have an email address. 400 INVOICE_SEND_NO_CUSTOMER_EMAIL otherwise.',
     'A cancelled invoice is rejected (400 INVOICE_SEND_CANCELLED): its F-series number is preserved for compliance but the document is not a valid faktura.',
@@ -428,6 +430,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // needed on this code path. Kept undefined to satisfy the InvoicePDF
     // signature (it tolerates undefined for non-credit-notes).
     const originalInvoiceNumber: string | undefined = undefined
+
+    const periodError = await invoiceIssuancePeriodError(ctx.supabase, ctx.companyId!, typed, settings)
+    if (periodError) {
+      return v1ErrorResponseFromCode(periodError, ctx.log, { requestId: ctx.requestId })
+    }
 
     // Step 5: preflight PDF render. Validate the pipeline with a placeholder
     // number BEFORE consuming an F-series number.

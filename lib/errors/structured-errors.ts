@@ -1089,6 +1089,16 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'Verifikationsraderna kan inte användas: en rad har både debet och kredit, eller använder ett interimskonto (29xx). Använd periodisering på fakturaraden istället.',
     message_en: 'Custom journal lines are invalid: a row carries both debit and credit, or uses a 29xx interim account. Use line-level periodisering instead.',
   },
+  INVOICE_ISSUE_NO_FISCAL_PERIOD: {
+    httpStatus: 422,
+    message_sv: 'Inget öppet räkenskapsår täcker fakturadatumet. Skapa räkenskapsåret innan fakturan ställs ut.',
+    message_en: 'No open fiscal period covers the invoice date. Create the fiscal year before issuing the invoice.',
+  },
+  INVOICE_ISSUE_PERIOD_LOOKUP_FAILED: {
+    httpStatus: 500,
+    message_sv: 'Räkenskapsperioden kunde inte kontrolleras. Fakturan har inte ställts ut. Försök igen.',
+    message_en: 'The fiscal period could not be checked. The invoice has not been issued. Try again.',
+  },
   INVOICE_MARK_SENT_BOOK_FAILED: {
     httpStatus: 500,
     message_sv: 'Fakturan kunde inte bokföras och ligger kvar som utkast.',

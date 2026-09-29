@@ -5,6 +5,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { ensureInitialized } from '@/lib/init'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { issueAndBookInvoice, type IssueAndBookResult } from '@/lib/invoices/issue-and-book-invoice'
 import { hasRequiredInvoicePaymentAccount } from '@/lib/invoices/payment-accounts'
 import { snapshotInvoicePayee } from '@/lib/invoices/invoice-payee'
@@ -151,6 +152,11 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     // accepts it. Refuse up front what issuance would refuse afterwards, so an
     // invoice never reaches the buyer and then fails to book.
     if (wasDraft) {
+      const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, company)
+      if (periodError) {
+        return privateNoStore(errorResponseFromCode(periodError, log, { requestId }))
+      }
+
       const payeeSnapshot = await snapshotInvoicePayee(supabase, companyId, invoice)
       if (!payeeSnapshot.ok) {
         return privateNoStore(errorResponseFromCode(payeeSnapshot.code, log, {

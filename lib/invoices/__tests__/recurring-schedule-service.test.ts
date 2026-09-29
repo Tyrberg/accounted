@@ -13,6 +13,11 @@ import { eventBus } from '@/lib/events'
 // ── Mocks for the executeRecurringSchedule auto-send path ─────────────
 // The pure date-helper tests below don't touch any of these modules.
 
+const mockIssuancePeriodError = vi.fn().mockResolvedValue(null)
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => mockIssuancePeriodError(...args),
+}))
+
 const mockRenderToBuffer = vi.fn()
 vi.mock('@react-pdf/renderer', () => ({
   renderToBuffer: (...args: unknown[]) => mockRenderToBuffer(...args),
@@ -320,7 +325,7 @@ describe('getStockholmDateHour', () => {
 })
 
 describe('executeRecurringSchedule auto-send', () => {
-  const { supabase, enqueue, reset } = createQueuedMockSupabase()
+  const { supabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
   const client = supabase as unknown as SupabaseClient
   const today = new Date('2026-07-06T06:30:00Z')
 
@@ -428,6 +433,29 @@ describe('executeRecurringSchedule auto-send', () => {
     mockSendEmail.mockResolvedValue({ success: true, messageId: 'm-1' })
     mockCreateJE.mockResolvedValue({ id: 'je-1' })
     mockUploadDocument.mockResolvedValue({})
+  })
+
+  it('keeps the draft and warns in Swedish when no open period covers the invoice date', async () => {
+    enqueue({ data: customer, error: null })
+    enqueue({ data: { vat_registered: true }, error: null })
+    enqueue({ data: makeInsertedInvoice(), error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompleteInvoice(), error: null })
+    enqueue({ data: company, error: null })
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.invoiceId).toBe('inv-1')
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toBe(
+      'Auto-utskick misslyckades: Inget öppet räkenskapsår täcker fakturadatumet. Skapa räkenskapsåret innan fakturan ställs ut.',
+    )
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockSendTrackedInvoiceEmail).not.toHaveBeenCalled()
+    expect(mockCreateJE).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([])
   })
 
   it('creates a payment link before rendering and passes its QR to the PDF', async () => {

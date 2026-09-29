@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import {
   creditNoteNeedsJournalEntry,
   issueCreditNote,
@@ -147,14 +148,6 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     })
   }
 
-  // Assign the number only after all payment-instruction guards pass.
-  try {
-    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
-  } catch (err) {
-    log.error('failed to assign invoice number on mark-sent', err as Error)
-    return errorResponseFromCode('INVOICE_CREATE_NUMBER_ASSIGN_FAILED', log, { requestId })
-  }
-
   const accountingMethod = (settings.accounting_method || 'accrual') as AccountingMethod
   const entityType = (settings.entity_type as EntityType) || 'enskild_firma'
 
@@ -185,6 +178,19 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     (!journalEntryRequired || !!invoice.journal_entry_id)
   ) {
     return errorResponseFromCode('INVOICE_CREDIT_ALREADY_ISSUED', log, { requestId })
+  }
+
+  const periodError = await invoiceIssuancePeriodError(
+    supabase, companyId, invoice as Invoice, settings as CompanySettings, journalEntryRequired,
+  )
+  if (periodError) return errorResponseFromCode(periodError, log, { requestId })
+
+  // Assign the number only after all payment-instruction guards pass.
+  try {
+    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
+  } catch (err) {
+    log.error('failed to assign invoice number on mark-sent', err as Error)
+    return errorResponseFromCode('INVOICE_CREATE_NUMBER_ASSIGN_FAILED', log, { requestId })
   }
 
   // Compare-and-set prevents two concurrent requests from posting two journal

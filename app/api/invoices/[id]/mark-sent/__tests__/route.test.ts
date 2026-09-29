@@ -9,6 +9,11 @@ import {
   makeCompanySettings,
 } from '@/tests/helpers'
 
+const mockIssuancePeriodError = vi.fn()
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => mockIssuancePeriodError(...args),
+}))
+
 const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
 
 const requireAuthMock = vi.fn()
@@ -117,6 +122,7 @@ describe('POST /api/invoices/[id]/mark-sent: PDF archival', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockIssuancePeriodError.mockResolvedValue(null)
     reset()
     requireAuthMock.mockResolvedValue({ user: mockUser, supabase: mockSupabase, error: null })
     mockRenderToBuffer.mockResolvedValue(Buffer.from('fake-pdf'))
@@ -129,6 +135,30 @@ describe('POST /api/invoices/[id]/mark-sent: PDF archival', () => {
       failures: [],
     })
     mockRecordManualInvoiceDelivery.mockResolvedValue({ id: 'delivery-1' })
+  })
+
+  it('returns 422 before numbering or changing status when the invoice date has no open period', async () => {
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: company, error: null })
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+
+    const response = await POST(
+      createMockRequest('/api/invoices/inv-1/mark-sent', { method: 'POST' }),
+      createMockRouteParams({ id: 'inv-1' }),
+    )
+
+    expect(mockIssuancePeriodError).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      expect.objectContaining({ invoice_date: invoice.invoice_date, status: 'draft' }),
+      company,
+    )
+    expect(response.status).toBe(422)
+    expect((await response.json()).error.code).toBe('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateInvoiceJournalEntry).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -303,6 +333,22 @@ describe('POST /api/invoices/[id]/mark-sent: PDF archival', () => {
     expect(body.success).toBe(true)
     expect(mockUploadDocument).not.toHaveBeenCalled()
     expect(mockRenderToBuffer).not.toHaveBeenCalled()
+  })
+
+  it('blocks a credit note before consuming its number when booking needs a period', async () => {
+    enqueue({ data: { ...invoice, invoice_number: null, credited_invoice_id: 'original-1' }, error: null })
+    enqueue({ data: company, error: null })
+    enqueue({ data: { id: 'original-1', status: 'sent', journal_entry_id: 'je-1' }, error: null })
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    const response = await POST(
+      createMockRequest('/api/invoices/inv-1/mark-sent', { method: 'POST' }),
+      createMockRouteParams({ id: 'inv-1' }),
+    )
+    expect(response.status).toBe(422)
+    expect(mockIssuancePeriodError).toHaveBeenCalledWith(mockSupabase, 'company-1',
+      expect.objectContaining({ credited_invoice_id: 'original-1' }), company, true)
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockIssueCreditNote).not.toHaveBeenCalled()
   })
 
   it('issues the credit note and uses a credit-note filename when archiving it', async () => {

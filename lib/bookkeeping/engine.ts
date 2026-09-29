@@ -1,3 +1,4 @@
+import { lookupOpenFiscalPeriod } from './fiscal-period-lookup'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
 import { createLogger } from '@/lib/logger'
@@ -178,23 +179,8 @@ export async function findFiscalPeriod(
   date: string
 ): Promise<string | null> {
 
-  // Overlapping periods are prevented by a DB exclusion constraint
-  // (migration 042). limit(1) is kept as a defensive measure.
-  const { data, error } = await supabase
-    .from('fiscal_periods')
-    .select('id')
-    .eq('company_id', companyId)
-    .lte('period_start', date)
-    .gte('period_end', date)
-    .eq('is_closed', false)
-    .order('period_start', { ascending: false })
-    .limit(1)
-
-  if (error || !data || data.length === 0) {
-    return null
-  }
-
-  return data[0].id
+  const { period, error } = await lookupOpenFiscalPeriod(supabase, companyId, date)
+  return error ? null : period?.id ?? null
 }
 
 /**

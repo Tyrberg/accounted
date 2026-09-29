@@ -1879,3 +1879,54 @@ describe('commitPendingOperation: mark_invoice_sent honours defer_invoice_bookin
     bookSpy.mockRestore()
   })
 })
+
+
+describe.each([
+  { period: [], status: 422 },
+  { period: [{ id: 'period-1', locked_at: '2026-01-01' }], status: 400 },
+])('invoice issuance period preflight: $status', ({ period, status }) => {
+  it.each(['mark_invoice_sent', 'send_invoice'] as const)('blocks %s before numbering or delivery without a period', async (operation_type) => {
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: makeInvoice({ status: 'draft', invoice_number: null,
+      customer: makeCustomer({ email: 'customer@example.test' }), items: [],
+    }), error: null })
+    enqueue({ data: { accounting_method: 'accrual', bankgiro: '123-4567' }, error: null })
+    enqueue({ data: period, error: null })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1',
+      makePendingOp({ operation_type, params: { invoice_id: 'invoice-1' } }))
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(status)
+    expect(ensureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([])
+  })
+})
+
+describe('invoice issuance preflight: company lock date', () => {
+  it.each(['mark_invoice_sent', 'send_invoice'] as const)('blocks %s on or before bookkeeping_locked_through in an open, unlocked period', async (operation_type) => {
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: makeInvoice({ status: 'draft', invoice_number: null, invoice_date: '2026-03-15',
+      customer: makeCustomer({ email: 'customer@example.test' }), items: [],
+    }), error: null })
+    enqueue({ data: {
+      accounting_method: 'accrual', bankgiro: '123-4567', bookkeeping_locked_through: '2026-03-15',
+    }, error: null })
+    enqueue({ data: [{ id: 'period-1', locked_at: null, is_closed: false }], error: null })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1',
+      makePendingOp({ operation_type, params: { invoice_id: 'invoice-1' } }))
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(result.code).toBe('PERIOD_LOCKED')
+    // The mock returns the row regardless of the select list, so pin the column
+    // the lock check depends on: a trimmed select would read it as undefined.
+    const settingsSelect = String(findCalls('company_settings', 'select')[0]?.[0])
+    expect(settingsSelect === '*' || settingsSelect.includes('bookkeeping_locked_through')).toBe(true)
+    expect(ensureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([])
+  })
+})

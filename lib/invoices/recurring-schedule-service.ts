@@ -20,6 +20,7 @@ import { eventBus } from '@/lib/events'
 import { getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { renderToBuffer } from '@react-pdf/renderer'
@@ -56,6 +57,7 @@ import {
 import { snapshotInvoicePayee } from '@/lib/invoices/invoice-payee'
 import { hasRequiredSellerVatNumber } from '@/lib/invoices/seller-vat-number'
 import { createLogger } from '@/lib/logger'
+import { getErrorEntry } from '@/lib/errors/structured-errors'
 import type {
   Invoice,
   InvoiceItem,
@@ -576,6 +578,12 @@ async function sendInvoiceFromSchedule(
   if (!company) {
     throw new Error('company settings missing: cannot send invoice')
   }
+  // Same preflight as the send routes: never issue an invoice that cannot be
+  // booked. The numbered draft is kept and the Swedish reason becomes the
+  // schedule warning.
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, company)
+  if (periodError) throw new Error(getErrorEntry(periodError)?.message_sv ?? periodError)
+
   const payeeSnapshot = await snapshotInvoicePayee(supabase, companyId, invoice)
   if (!payeeSnapshot.ok) {
     log.warn('chosen payee account is no longer usable; recurring schedule cannot auto-send', {

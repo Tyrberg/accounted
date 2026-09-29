@@ -5,6 +5,7 @@ import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { createSchedulesForCustomerInvoice } from '@/lib/bookkeeping/accruals/from-invoices'
 import { eventBus } from '@/lib/events'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import type { CustomIssuanceLine } from '@/lib/invoices/issuance-custom-lines'
 import { recordManualInvoiceDelivery } from '@/lib/invoices/invoice-deliveries'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
@@ -182,7 +183,10 @@ export async function issueAndBookInvoice(
     return { ok: false, errorCode: 'INVOICE_SEND_VAT_NUMBER_MISSING' }
   }
 
-  // Assign the number only after all payment-instruction guards pass.
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, settings)
+  if (periodError) return { ok: false, errorCode: periodError }
+
+  // Assign the number only after all issuance preflight guards pass.
   try {
     await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
   } catch (err) {
