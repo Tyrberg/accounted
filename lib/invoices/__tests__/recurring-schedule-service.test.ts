@@ -325,7 +325,7 @@ describe('getStockholmDateHour', () => {
 })
 
 describe('executeRecurringSchedule auto-send', () => {
-  const { supabase, enqueue, reset } = createQueuedMockSupabase()
+  const { supabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
   const client = supabase as unknown as SupabaseClient
   const today = new Date('2026-07-06T06:30:00Z')
 
@@ -435,15 +435,27 @@ describe('executeRecurringSchedule auto-send', () => {
     mockUploadDocument.mockResolvedValue({})
   })
 
-  it('blocks automatic issuance before creating or numbering an invoice without a period', async () => {
+  it('keeps the draft and warns in Swedish when no open period covers the invoice date', async () => {
     enqueue({ data: customer, error: null })
+    enqueue({ data: { vat_registered: true }, error: null })
+    enqueue({ data: makeInsertedInvoice(), error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompleteInvoice(), error: null })
     enqueue({ data: company, error: null })
     mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
-    await expect(executeRecurringSchedule(client, makeSchedule(), today))
-      .rejects.toThrow('INVOICE_ISSUE_NO_FISCAL_PERIOD')
-    expect(supabase.from).not.toHaveBeenCalledWith('invoices')
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.invoiceId).toBe('inv-1')
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toBe(
+      'Auto-utskick misslyckades: Inget öppet räkenskapsår täcker fakturadatumet. Skapa räkenskapsåret innan fakturan ställs ut.',
+    )
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
     expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockSendTrackedInvoiceEmail).not.toHaveBeenCalled()
     expect(mockCreateJE).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([])
   })
 
   it('creates a payment link before rendering and passes its QR to the PDF', async () => {

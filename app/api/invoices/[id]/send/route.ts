@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { renderToBuffer } from '@react-pdf/renderer'
@@ -18,6 +17,7 @@ import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { createSchedulesForCustomerInvoice } from '@/lib/bookkeeping/accruals/from-invoices'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
   creditNoteNeedsJournalEntry,

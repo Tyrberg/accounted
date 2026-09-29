@@ -38,7 +38,6 @@
  * (sub-millisecond between the two statements in normal load).
  */
 
-import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
@@ -48,6 +47,7 @@ import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { recordManualInvoiceDelivery } from '@/lib/invoices/invoice-deliveries'
 import {
   hasRequiredInvoicePaymentAccount,
@@ -91,7 +91,7 @@ registerEndpoint({
   doNotUseFor:
     'Sending the invoice via Accounted email: use :send (PR-B-2b-3) for that. Marking an already-sent invoice as paid: use :mark-paid (PR-B-2b-2).',
   pitfalls: [
-    'When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number or changing status, including in dry-run.',
+    'When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number or changing status, including in dry-run. A locked period, or an invoice_date on or before the company lock date, returns 400 PERIOD_LOCKED the same way.',
     'Only invoices in `status=draft` can be marked sent. Other states return 409 INVOICE_UPDATE_NOT_DRAFT (re-used; the action is structurally an update).',
     'Allocation is atomic. If a concurrent transition beats the agent\'s request to the same draft, the runner-up gets 409 INVOICE_UPDATE_NOT_DRAFT and no number is consumed.',
     'Delivery notes (document_type=delivery_note) don\'t transition to sent: they were never drafts in the f-series sense. This endpoint will reject them with 400 VALIDATION_ERROR.',
@@ -221,7 +221,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // decision, payable invoices need a currency-matching account.
     const { data: settings, error: settingsError } = await ctx.supabase
       .from('company_settings')
-      .select('accounting_method, defer_invoice_booking, entity_type, invoice_payment_accounts, bank_name, clearing_number, account_number, bankgiro, plusgiro, swish, iban, bic, vat_registered, vat_number')
+      .select('accounting_method, defer_invoice_booking, bookkeeping_locked_through, entity_type, invoice_payment_accounts, bank_name, clearing_number, account_number, bankgiro, plusgiro, swish, iban, bic, vat_registered, vat_number')
       .eq('company_id', ctx.companyId!)
       .maybeSingle()
     if (settingsError || !settings) {

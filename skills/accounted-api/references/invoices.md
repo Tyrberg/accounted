@@ -612,6 +612,7 @@ Marks a draft invoice as sent: for invoices delivered outside Accounted (an exte
 **Do not use for:** Sending the invoice via Accounted email: use :send (PR-B-2b-3) for that. Marking an already-sent invoice as paid: use :mark-paid (PR-B-2b-2).
 
 **Pitfalls:**
+- When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number or changing status, including in dry-run. A locked period, or an invoice_date on or before the company lock date, returns 400 PERIOD_LOCKED the same way.
 - Only invoices in `status=draft` can be marked sent. Other states return 409 INVOICE_UPDATE_NOT_DRAFT (re-used; the action is structurally an update).
 - Allocation is atomic. If a concurrent transition beats the agent's request to the same draft, the runner-up gets 409 INVOICE_UPDATE_NOT_DRAFT and no number is consumed.
 - Delivery notes (document_type=delivery_note) don't transition to sent: they were never drafts in the f-series sense. This endpoint will reject them with 400 VALIDATION_ERROR.
@@ -779,6 +780,7 @@ The full send pipeline: preflight PDF render → allocate F-series number atomic
 
 **Pitfalls:**
 - Idempotency-Key is mandatory.
+- When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number, sending email or changing status, including in dry-run. A locked period, or an invoice_date on or before the company lock date, returns 400 PERIOD_LOCKED the same way.
 - Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL (or an SMTP relay via EMAIL_PROVIDER=smtp) the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.
 - Customer must have an email address. 400 INVOICE_SEND_NO_CUSTOMER_EMAIL otherwise.
 - A cancelled invoice is rejected (400 INVOICE_SEND_CANCELLED): its F-series number is preserved for compliance but the document is not a valid faktura.

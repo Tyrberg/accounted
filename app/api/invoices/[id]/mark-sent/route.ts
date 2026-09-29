@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import {
   creditNoteNeedsJournalEntry,
   issueCreditNote,
@@ -148,7 +148,6 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     })
   }
 
-
   const accountingMethod = (settings.accounting_method || 'accrual') as AccountingMethod
   const entityType = (settings.entity_type as EntityType) || 'enskild_firma'
 
@@ -193,7 +192,6 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     log.error('failed to assign invoice number on mark-sent', err as Error)
     return errorResponseFromCode('INVOICE_CREATE_NUMBER_ASSIGN_FAILED', log, { requestId })
   }
-
 
   // Compare-and-set prevents two concurrent requests from posting two journal
   // entries for the same draft.

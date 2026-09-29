@@ -18,7 +18,6 @@ describe('invoiceIssuancePeriodError', () => {
 
   it('requires an open period belonging to this company and covering the invoice date inclusively', async () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
-    enqueue({ data: { bookkeeping_locked_through: null }, error: null })
     expect(await invoiceIssuancePeriodError(supabase as never, 'company-1', invoice, settings)).toBeNull()
     expect(findCalls('fiscal_periods', 'eq')).toEqual([
       ['company_id', 'company-1'],
@@ -76,20 +75,17 @@ describe('issuance locks', () => {
 
   it.each(['2026-09-10', '2026-09-30'])('blocks dates on or behind the company lock %s', async (bookkeeping_locked_through) => {
     enqueue({ data: [{ id: 'period-1', locked_at: null }], error: null })
-    enqueue({ data: { bookkeeping_locked_through }, error: null })
-    expect(await invoiceIssuancePeriodError(supabase as never, 'company-1', invoice, settings)).toBe('PERIOD_LOCKED')
+    expect(await invoiceIssuancePeriodError(
+      supabase as never, 'company-1', invoice, { ...settings, bookkeeping_locked_through },
+    )).toBe('PERIOD_LOCKED')
   })
 
   it('allows the day after the company lock', async () => {
     enqueue({ data: [{ id: 'period-1', locked_at: null }], error: null })
-    enqueue({ data: { bookkeeping_locked_through: '2026-09-09' }, error: null })
-    expect(await invoiceIssuancePeriodError(supabase as never, 'company-1', invoice, settings)).toBeNull()
-  })
-
-  it('fails closed when the company lock cannot be read', async () => {
-    enqueue({ data: [{ id: 'period-1' }], error: null })
-    enqueue({ data: null, error: { message: 'offline' } })
-    expect(await invoiceIssuancePeriodError(supabase as never, 'company-1', invoice, settings)).toBe('INVOICE_ISSUE_PERIOD_LOOKUP_FAILED')
+    expect(await invoiceIssuancePeriodError(
+      supabase as never, 'company-1', invoice, { ...settings, bookkeeping_locked_through: '2026-09-09' },
+    )).toBeNull()
+    expect(supabase.from).not.toHaveBeenCalledWith('company_settings')
   })
 
   it('checks cash credit notes when their original requires a journal entry', async () => {

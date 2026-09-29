@@ -170,6 +170,29 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(supabase.from.mock.calls.filter(([table]) => table === 'invoices')).toHaveLength(1)
   })
 
+  it('blocks an invoice date on the company lock date read from the route settings row', async () => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: { data: DRAFT_INVOICE, error: null },
+      company_settings: {
+        data: { accounting_method: 'accrual', bankgiro: '123-4567', bookkeeping_locked_through: '2026-05-12' },
+        error: null,
+      },
+      fiscal_periods: { data: [{ id: 'period-1', locked_at: null }], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await markSent(
+      makeMarkSentRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.code).toBe('PERIOD_LOCKED')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(supabase.from.mock.calls.filter(([table]) => table === 'company_settings')).toHaveLength(1)
+  })
+
   it('transitions a draft invoice to sent and writes the journal entry id back', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({

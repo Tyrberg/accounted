@@ -3139,7 +3139,7 @@ async function commitMarkInvoiceSent(
 
   const { data: settings, error: settingsError } = await supabase
     .from('company_settings')
-    .select('accounting_method, defer_invoice_booking, entity_type, invoice_payment_accounts, bank_name, clearing_number, account_number, bankgiro, plusgiro, swish, iban, bic, vat_registered, vat_number')
+    .select('accounting_method, defer_invoice_booking, bookkeeping_locked_through, entity_type, invoice_payment_accounts, bank_name, clearing_number, account_number, bankgiro, plusgiro, swish, iban, bic, vat_registered, vat_number')
     .eq('company_id', companyId)
     .single()
 

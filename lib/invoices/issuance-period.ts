@@ -21,14 +21,7 @@ export async function invoiceIssuancePeriodError(
   if (error) return 'INVOICE_ISSUE_PERIOD_LOOKUP_FAILED'
   if (!period) return 'INVOICE_ISSUE_NO_FISCAL_PERIOD'
   if (period.locked_at) return 'PERIOD_LOCKED'
-
-  const { data: lockSettings, error: lockError } = await supabase
-    .from('company_settings')
-    .select('bookkeeping_locked_through')
-    .eq('company_id', companyId)
-    .single()
-  if (lockError || !lockSettings) return 'INVOICE_ISSUE_PERIOD_LOOKUP_FAILED'
-  if (lockSettings.bookkeeping_locked_through && invoice.invoice_date <= lockSettings.bookkeeping_locked_through) {
+  if (settings.bookkeeping_locked_through && invoice.invoice_date <= settings.bookkeeping_locked_through) {
     return 'PERIOD_LOCKED'
   }
   return null
