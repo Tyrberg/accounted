@@ -1,0 +1,5 @@
+
+> erp-base@0.1.0 check:types
+> node scripts/checks/no-new-type-errors.mjs
+
+no-new-type-errors: OK: 0 error(s), baseline 535. Count went DOWN: ratchet it: node scripts/checks/no-new-type-errors.mjs --update

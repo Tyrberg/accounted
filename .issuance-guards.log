@@ -1,0 +1,6 @@
+
+> erp-base@0.1.0 check:guards
+> node scripts/checks/no-new-antipatterns.mjs
+
+
+✓ Antipattern guard passed (raw-route-auth: 1, naive-ore-round: 615, hand-rolled-invariant: 113, ledger-scanning-report: 4, direct-jel-insert: 0, direct-invoice-payment-insert: 0, leaky-supabase-client: 0, pinned-dep: 0, raw-user-error: 0, sek-labelled-amount: 0, off-ladder-radius: 0, folded-public-flag: 0, cross-extension-import: 0, ungated-extension-route: 9/9 allowlisted, dialog-overflow-risk: 7 file(s), raw-reference-fetch: 0 file(s), client-node-builtin: 0, ambiguous-embed: 0, provider-host: 22 file(s), direct-ai-client: 12/10 allowlisted).

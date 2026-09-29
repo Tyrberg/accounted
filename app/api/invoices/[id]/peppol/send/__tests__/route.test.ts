@@ -20,6 +20,10 @@ const serviceTables = createQueuedMockSupabase()
 const requireAuthMock = vi.fn()
 const serviceRpcMock = vi.fn()
 const issueAndBookMock = vi.fn()
+const periodErrorMock = vi.fn().mockResolvedValue(null)
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => periodErrorMock(...args),
+}))
 
 vi.mock('@/lib/init', () => ({
   ensureInitialized: vi.fn(),
@@ -476,4 +480,19 @@ describe('POST /api/invoices/[id]/peppol/send', () => {
     expect((await response.json()).error.code).toBe('PEPPOL_SUBMISSION_REJECTED')
     expect(transport.submit).not.toHaveBeenCalled()
   })
+
+it('blocks a draft before numbering or network submission when the period is missing', async () => {
+  const transport = makeTransport()
+  unregister = registerPeppolTransport(transport)
+  grantAccess()
+  enqueue({ data: invoiceRow({ status: 'draft', invoice_number: null }), error: null })
+  enqueue({ data: company, error: null })
+  periodErrorMock.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+  const response = await send()
+  expect(response.status).toBe(422)
+  expect(transport.submit).not.toHaveBeenCalled()
+  expect(serviceRpcMock).not.toHaveBeenCalled()
+  expect(issueAndBookMock).not.toHaveBeenCalled()
+})
+
 })

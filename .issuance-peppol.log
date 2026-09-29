@@ -1,0 +1,50 @@
+
+ RUN  v4.1.10 /tmp/oc-wt.id5fd9
+
+stderr | app/api/invoices/[id]/peppol/send/__tests__/route.test.ts > POST /api/invoices/[id]/peppol/send > blocks a draft before numbering or network submission when the period is missing
+[api/invoice.peppol.send] ERROR failed to assign invoice number before Peppol send requestId="req_0e4e4f57-9202-4c31-8d2e-1b5cf4d04440" operation="invoice.peppol.send" userId="user-1" companyId="company-1"
+  err: {
+  name: 'Error',
+  message: 'Failed to assign invoice number: no value returned',
+  stack: 'Error: Failed to assign invoice number: no value returned\n' +
+    '    at ensureInvoiceNumber (/tmp/oc-wt.id5fd9/lib/invoices/ensure-invoice-number.ts:47:11)\n' +
+    '    at processTicksAndRejections (node:internal/process/task_queues:103:5)\n' +
+    '    at POST.requireWrite (/tmp/oc-wt.id5fd9/app/api/invoices/[id]/peppol/send/route.ts:172:34)\n' +
+    '    at Module.wrapped (/tmp/oc-wt.id5fd9/lib/api/with-route-context.ts:163:24)\n' +
+    '    at /tmp/oc-wt.id5fd9/app/api/invoices/[id]/peppol/send/__tests__/route.test.ts:491:20\n' +
+    '    at file:///opt/projects/accounted/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:20',
+  code: undefined
+}
+[api/invoice.peppol.send] ERROR INVOICE_CREATE_NUMBER_ASSIGN_FAILED requestId="req_0e4e4f57-9202-4c31-8d2e-1b5cf4d04440" operation="invoice.peppol.send" userId="user-1" companyId="company-1"
+  details: Failed to assign invoice number on create.
+
+ ❯ |unit| app/api/invoices/[id]/peppol/send/__tests__/route.test.ts (16 tests | 1 failed) 48ms
+     × blocks a draft before numbering or network submission when the period is missing 5ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |unit| app/api/invoices/[id]/peppol/send/__tests__/route.test.ts > POST /api/invoices/[id]/peppol/send > blocks a draft before numbering or network submission when the period is missing
+AssertionError: expected 500 to be 422 // Object.is equality
+
+- Expected
++ Received
+
+- 422
++ 500
+
+ ❯ app/api/invoices/[id]/peppol/send/__tests__/route.test.ts:492:27
+    490|   periodErrorMock.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIO…
+    491|   const response = await send()
+    492|   expect(response.status).toBe(422)
+       |                           ^
+    493|   expect(transport.submit).not.toHaveBeenCalled()
+    494|   expect(serviceRpcMock).not.toHaveBeenCalled()
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 15 passed (16)
+   Start at  08:23:25
+   Duration  1.72s (transform 443ms, setup 0ms, import 1.36s, tests 48ms, environment 0ms)
+

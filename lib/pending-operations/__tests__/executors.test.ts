@@ -1879,3 +1879,27 @@ describe('commitPendingOperation: mark_invoice_sent honours defer_invoice_bookin
     bookSpy.mockRestore()
   })
 })
+
+
+describe.each([
+  { period: [], status: 422 },
+  { period: [{ id: 'period-1', locked_at: '2026-01-01' }], status: 400 },
+])('invoice issuance period preflight: $status', ({ period, status }) => {
+  it.each(['mark_invoice_sent', 'send_invoice'] as const)('blocks %s before numbering or delivery without a period', async (operation_type) => {
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: makeInvoice({ status: 'draft', invoice_number: null,
+      customer: makeCustomer({ email: 'customer@example.test' }), items: [],
+    }), error: null })
+    enqueue({ data: { accounting_method: 'accrual', bankgiro: '123-4567' }, error: null })
+    enqueue({ data: period, error: null })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1',
+      makePendingOp({ operation_type, params: { invoice_id: 'invoice-1' } }))
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(status)
+    expect(ensureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([])
+  })
+})

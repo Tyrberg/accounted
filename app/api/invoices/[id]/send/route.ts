@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { renderToBuffer } from '@react-pdf/renderer'
@@ -19,6 +20,7 @@ import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
+  creditNoteNeedsJournalEntry,
   issueCreditNote,
   type CreditNoteOriginalInvoice,
 } from '@/lib/invoices/issue-credit-note'
@@ -291,6 +293,15 @@ export const POST = withRouteContext(
       // (issue #1820).
       originalInvoiceNumber =
         original.invoice_number ?? original.external_invoice_number ?? undefined
+    }
+
+    const periodError = await invoiceIssuancePeriodError(supabase, companyId!, invoice as Invoice, company as CompanySettings,
+      originalInvoice
+        ? creditNoteNeedsJournalEntry(company.accounting_method || 'accrual', originalInvoice)
+        : booksInvoicesOnIssue(company),
+    )
+    if (periodError) {
+      return errorResponseFromCode(periodError, opLog, { requestId })
     }
 
     // Preflight render: validate the PDF pipeline BEFORE consuming an F-series

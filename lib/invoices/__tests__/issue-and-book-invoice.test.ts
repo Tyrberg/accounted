@@ -8,6 +8,11 @@ import {
 import { eventBus } from '@/lib/events'
 import type { Logger } from '@/lib/logger'
 
+const mockIssuancePeriodError = vi.fn()
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => mockIssuancePeriodError(...args),
+}))
+
 const { supabase: mockSupabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
 
 const mockEnsureInvoiceNumber = vi.fn()
@@ -94,6 +99,7 @@ function issue(invoice = makeDraft(), theSettings = settings) {
 describe('issueAndBookInvoice', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockIssuancePeriodError.mockResolvedValue(null)
     reset()
     eventBus.clear()
     mockRenderToBuffer.mockResolvedValue(Buffer.from('fake-pdf'))
@@ -101,6 +107,21 @@ describe('issueAndBookInvoice', () => {
     mockCreateSchedules.mockResolvedValue({ created: 0, failed: 0 })
     mockRecordManualInvoiceDelivery.mockResolvedValue({ id: 'delivery-1' })
     mockEnsureInvoiceNumber.mockResolvedValue('F-2026010')
+  })
+
+  it('blocks missing periods before numbering, status changes or delivery', async () => {
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    const result = await issue(makeDraft({ invoice_number: null }))
+
+    expect(mockIssuancePeriodError).toHaveBeenCalledWith(
+      mockSupabase, 'company-1', expect.objectContaining({ status: 'draft' }), settings,
+    )
+    expect(result).toEqual({ ok: false, errorCode: 'INVOICE_ISSUE_NO_FISCAL_PERIOD' })
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateInvoiceJournalEntry).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toHaveLength(0)
   })
 
   it('rejects when the payment account is missing, before number allocation', async () => {

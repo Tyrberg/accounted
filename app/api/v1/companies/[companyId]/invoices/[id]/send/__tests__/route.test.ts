@@ -134,6 +134,7 @@ vi.mock('@/lib/sandbox/guard', () => ({
 vi.mock('@/lib/entitlements/has-capability', () => ({
   requireCapability: vi.fn().mockResolvedValue(null),
 }))
+import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
@@ -147,7 +148,7 @@ const mockEnsureInvoiceNumber = mockedEnsureInvoiceNumber as ReturnType<typeof v
 type MockResult = { data?: unknown; error?: unknown }
 function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>) {
   const queues = new Map<string, MockResult[]>()
-  for (const [t, val] of Object.entries(byTable)) {
+  for (const [t, val] of Object.entries({ fiscal_periods: { data: [{ id: 'period-1' }], error: null }, ...byTable })) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
   // Records every .select() projection string per table so tests can assert
@@ -427,6 +428,33 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(res.status).toBe(400)
     const body = await res.json()
     expect(body.error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it.each([
+    ['', { data: [], error: null }, 422, 'INVOICE_ISSUE_NO_FISCAL_PERIOD'],
+    ['', { data: [{ id: 'period-1', locked_at: '2026-01-01' }], error: null }, 400, 'PERIOD_LOCKED'],
+    ['?dry_run=true', { data: [], error: null }, 422, 'INVOICE_ISSUE_NO_FISCAL_PERIOD'],
+    ['', { data: null, error: { message: 'connection reset' } }, 500, 'INVOICE_ISSUE_PERIOD_LOOKUP_FAILED'],
+  ])('blocks issuance before delivery when the period check fails (%s, %j)', async (query, period, status, code) => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: { data: DRAFT_INVOICE, error: null },
+      company_settings: { data: COMPANY_SETTINGS, error: null },
+      fiscal_periods: period,
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send${query}`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(status)
+    expect((await res.json()).error.code).toBe(code)
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(createInvoiceJournalEntry).not.toHaveBeenCalled()
+    expect(supabase.from.mock.calls.filter(([table]) => table === 'invoices')).toHaveLength(1)
   })
 
   it('sends a draft invoice end-to-end and returns 200 with messageId', async () => {

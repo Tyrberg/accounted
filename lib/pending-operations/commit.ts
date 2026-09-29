@@ -148,6 +148,7 @@ import {
   invoiceEmailRecipientCount,
   resolveInvoiceEmailRecipients,
 } from '@/lib/invoices/email-recipients'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { convertToInvoice } from '@/lib/invoices/convert-to-invoice'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
@@ -2966,6 +2967,12 @@ async function commitSendInvoice(
     }
   }
 
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice as Invoice, company as CompanySettings)
+  if (periodError) {
+    const entry = getErrorEntry(periodError)!
+    return { error: entry.message_sv, errorCode: periodError, status: entry.httpStatus }
+  }
+
   let deliveryId: string
   try {
     deliveryId = await reserveInvoiceDelivery({
@@ -3160,6 +3167,12 @@ async function commitMarkInvoiceSent(
         ?? 'Momsregistreringsnummer saknas i företagsinställningarna.',
       status: 400,
     }
+  }
+
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice as Invoice, settings as CompanySettings)
+  if (periodError) {
+    const entry = getErrorEntry(periodError)!
+    return { error: entry.message_sv, errorCode: periodError, status: entry.httpStatus }
   }
 
   try {

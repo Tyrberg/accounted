@@ -19,6 +19,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
 import { getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
@@ -291,9 +292,9 @@ export async function executeRecurringSchedule(
   // VAT on the cron-generated invoice even though momskrysset is off. Zero
   // every line at spawn time; 0% is a permitted rate for every customer type,
   // so the allowedRates gate below still passes.
-  const { data: vatSettings } = await supabase
+  const { data: vatSettings, error: settingsError } = await supabase
     .from('company_settings')
-    .select('vat_registered')
+    .select('*')
     .eq('company_id', schedule.company_id)
     .maybeSingle()
   const notVatRegistered = vatSettings?.vat_registered === false
@@ -326,6 +327,14 @@ export async function executeRecurringSchedule(
   const due = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()))
   due.setUTCDate(due.getUTCDate() + schedule.payment_terms_days)
   const dueDate = due.toISOString().slice(0, 10)
+
+  if (schedule.auto_send && !options.suppressAutoSend) {
+    if (settingsError || !vatSettings) throw new Error('Company settings missing')
+    const periodError = await invoiceIssuancePeriodError(supabase, schedule.company_id, {
+      status: 'draft', document_type: 'invoice', invoice_date: invoiceDate,
+    }, vatSettings as CompanySettings)
+    if (periodError) throw new Error(periodError)
+  }
 
   // 4. Foreign currency: fetch exchange rate.
   let exchangeRate: number | null = null
@@ -576,6 +585,9 @@ async function sendInvoiceFromSchedule(
   if (!company) {
     throw new Error('company settings missing: cannot send invoice')
   }
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, company)
+  if (periodError) throw new Error(periodError)
+
   const payeeSnapshot = await snapshotInvoicePayee(supabase, companyId, invoice)
   if (!payeeSnapshot.ok) {
     log.warn('chosen payee account is no longer usable; recurring schedule cannot auto-send', {

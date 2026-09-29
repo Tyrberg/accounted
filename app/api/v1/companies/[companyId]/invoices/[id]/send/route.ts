@@ -39,6 +39,7 @@
  * number, sending email, or mutating state.
  */
 
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { z } from 'zod'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { ok } from '@/lib/api/v1/response'
@@ -428,6 +429,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // needed on this code path. Kept undefined to satisfy the InvoicePDF
     // signature (it tolerates undefined for non-credit-notes).
     const originalInvoiceNumber: string | undefined = undefined
+
+    const periodError = await invoiceIssuancePeriodError(ctx.supabase, ctx.companyId!, typed, settings)
+    if (periodError) {
+      return v1ErrorResponseFromCode(periodError, ctx.log, { requestId: ctx.requestId })
+    }
 
     // Step 5: preflight PDF render. Validate the pipeline with a placeholder
     // number BEFORE consuming an F-series number.

@@ -1,5 +1,6 @@
 import { renderToBuffer } from '@react-pdf/renderer'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { createSchedulesForCustomerInvoice } from '@/lib/bookkeeping/accruals/from-invoices'
@@ -182,7 +183,10 @@ export async function issueAndBookInvoice(
     return { ok: false, errorCode: 'INVOICE_SEND_VAT_NUMBER_MISSING' }
   }
 
-  // Assign the number only after all payment-instruction guards pass.
+  const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, settings)
+  if (periodError) return { ok: false, errorCode: periodError }
+
+  // Assign the number only after all issuance preflight guards pass.
   try {
     await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
   } catch (err) {

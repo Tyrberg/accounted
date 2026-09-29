@@ -38,6 +38,7 @@
  * (sub-millisecond between the two statements in normal load).
  */
 
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
@@ -90,6 +91,7 @@ registerEndpoint({
   doNotUseFor:
     'Sending the invoice via Accounted email: use :send (PR-B-2b-3) for that. Marking an already-sent invoice as paid: use :mark-paid (PR-B-2b-2).',
   pitfalls: [
+    'When booking at issue, an open fiscal period must cover invoice_date. Otherwise returns 422 INVOICE_ISSUE_NO_FISCAL_PERIOD before allocating a number or changing status, including in dry-run.',
     'Only invoices in `status=draft` can be marked sent. Other states return 409 INVOICE_UPDATE_NOT_DRAFT (re-used; the action is structurally an update).',
     'Allocation is atomic. If a concurrent transition beats the agent\'s request to the same draft, the runner-up gets 409 INVOICE_UPDATE_NOT_DRAFT and no number is consumed.',
     'Delivery notes (document_type=delivery_note) don\'t transition to sent: they were never drafts in the f-series sense. This endpoint will reject them with 400 VALIDATION_ERROR.',
@@ -260,6 +262,11 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // #967: kontantmetoden and defer_invoice_booking companies mark sent
     // WITHOUT booking (same gate as the dashboard, issue-and-book-invoice.ts).
     const wouldCreateJournalEntry = isRealInvoice && booksInvoicesOnIssue(companySettings)
+
+    const periodError = await invoiceIssuancePeriodError(ctx.supabase, ctx.companyId!, typed, companySettings)
+    if (periodError) {
+      return v1ErrorResponseFromCode(periodError, ctx.log, { requestId: ctx.requestId })
+    }
 
     if (ctx.dryRun) {
       // Preview the post-send state. invoice_number can't be predicted

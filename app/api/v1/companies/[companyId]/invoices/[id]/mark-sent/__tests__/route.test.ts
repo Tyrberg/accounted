@@ -63,7 +63,7 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   // Per-table queue: arrays return results in order across multiple calls
   // to .from('table'); single values return the same result every time.
   const queues = new Map<string, MockResult[]>()
-  for (const [t, val] of Object.entries(byTable)) {
+  for (const [t, val] of Object.entries({ fiscal_periods: { data: [{ id: 'period-1' }], error: null }, ...byTable })) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
   const buildChain = (table: string): unknown => {
@@ -138,6 +138,38 @@ beforeEach(() => {
 })
 
 describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
+  it.each([
+    ['', { data: [], error: null }, 422, 'INVOICE_ISSUE_NO_FISCAL_PERIOD'],
+    ['', { data: [{ id: 'period-1', locked_at: '2026-01-01' }], error: null }, 400, 'PERIOD_LOCKED'],
+    ['?dry_run=true', { data: [], error: null }, 422, 'INVOICE_ISSUE_NO_FISCAL_PERIOD'],
+    ['', { data: null, error: { message: 'connection reset' } }, 500, 'INVOICE_ISSUE_PERIOD_LOOKUP_FAILED'],
+  ])('blocks a failed period check before issuance (%s, %j)', async (query, period, status, code) => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: { data: DRAFT_INVOICE, error: null },
+      company_settings: {
+        data: { accounting_method: 'accrual', bankgiro: '123-4567' },
+        error: null,
+      },
+      fiscal_periods: period,
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent${query}`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(status)
+    expect((await res.json()).error.code).toBe(code)
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(supabase.from.mock.calls.filter(([table]) => table === 'invoices')).toHaveLength(1)
+  })
+
   it('transitions a draft invoice to sent and writes the journal entry id back', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({

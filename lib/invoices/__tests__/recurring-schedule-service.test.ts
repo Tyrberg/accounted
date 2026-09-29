@@ -13,6 +13,11 @@ import { eventBus } from '@/lib/events'
 // ── Mocks for the executeRecurringSchedule auto-send path ─────────────
 // The pure date-helper tests below don't touch any of these modules.
 
+const mockIssuancePeriodError = vi.fn().mockResolvedValue(null)
+vi.mock('@/lib/invoices/issuance-period', () => ({
+  invoiceIssuancePeriodError: (...args: unknown[]) => mockIssuancePeriodError(...args),
+}))
+
 const mockRenderToBuffer = vi.fn()
 vi.mock('@react-pdf/renderer', () => ({
   renderToBuffer: (...args: unknown[]) => mockRenderToBuffer(...args),
@@ -428,6 +433,17 @@ describe('executeRecurringSchedule auto-send', () => {
     mockSendEmail.mockResolvedValue({ success: true, messageId: 'm-1' })
     mockCreateJE.mockResolvedValue({ id: 'je-1' })
     mockUploadDocument.mockResolvedValue({})
+  })
+
+  it('blocks automatic issuance before creating or numbering an invoice without a period', async () => {
+    enqueue({ data: customer, error: null })
+    enqueue({ data: company, error: null })
+    mockIssuancePeriodError.mockResolvedValueOnce('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    await expect(executeRecurringSchedule(client, makeSchedule(), today))
+      .rejects.toThrow('INVOICE_ISSUE_NO_FISCAL_PERIOD')
+    expect(supabase.from).not.toHaveBeenCalledWith('invoices')
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockCreateJE).not.toHaveBeenCalled()
   })
 
   it('creates a payment link before rendering and passes its QR to the PDF', async () => {

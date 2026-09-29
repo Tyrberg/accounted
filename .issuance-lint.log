@@ -1,0 +1,1352 @@
+
+> erp-base@0.1.0 lint
+> eslint
+
+[BABEL] Note: The code generator has deoptimised the styling of /tmp/oc-wt.id5fd9/extensions/general/mcp-server/server.ts as it exceeds the max of 500KB.
+
+/tmp/oc-wt.id5fd9/app/(auth)/login/login-client.tsx
+  287:11  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+  375:9   warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/app/(auth)/mfa/verify/page.tsx
+  144:9  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/app/(auth)/register/register-client.tsx
+  281:9   warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+  441:15  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/articles/[id]/page.tsx
+  53:6  warning  React Hook useEffect has a missing dependency: 'fetchArticle'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/bookkeeping/page.tsx
+  136:6  warning  React Hook useEffect has a missing dependency: 't'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/[id]/page.tsx
+  108:6  warning  React Hook useEffect has a missing dependency: 'fetchCustomer'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx
+  327:20  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:327:20
+  325 |               <thead>
+  326 |                 <tr>
+> 327 |                   <SortableHeader column="name" label={t('col_name')} className="w-full" />
+      |                    ^^^^^^^^^^^^^^ This component is created during render
+  328 |                   <SortableHeader column="customer_type" label={t('col_type')} />
+  329 |                   <SortableHeader
+  330 |                     column="identifier"
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:222:3
+  220 |   // Sortable dry-table head: the button inherits the uppercase hairline
+  221 |   // styling from TH_CLASS on the th.
+> 222 |   function SortableHeader({
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+> 223 |     column,
+      | ^^^^^^^^^^^
+> 224 |     label,
+      …
+      | ^^^^^^^^^^^
+> 244 |     )
+      | ^^^^^^^^^^^
+> 245 |   }
+      | ^^^^ The component is created during render here
+  246 |
+  247 |   return (
+  248 |     <div className="space-y-8">                                                            react-hooks/static-components
+  328:20  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:328:20
+  326 |                 <tr>
+  327 |                   <SortableHeader column="name" label={t('col_name')} className="w-full" />
+> 328 |                   <SortableHeader column="customer_type" label={t('col_type')} />
+      |                    ^^^^^^^^^^^^^^ This component is created during render
+  329 |                   <SortableHeader
+  330 |                     column="identifier"
+  331 |                     label={t('col_identifier')}
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:222:3
+  220 |   // Sortable dry-table head: the button inherits the uppercase hairline
+  221 |   // styling from TH_CLASS on the th.
+> 222 |   function SortableHeader({
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+> 223 |     column,
+      | ^^^^^^^^^^^
+> 224 |     label,
+      …
+      | ^^^^^^^^^^^
+> 244 |     )
+      | ^^^^^^^^^^^
+> 245 |   }
+      | ^^^^ The component is created during render here
+  246 |
+  247 |   return (
+  248 |     <div className="space-y-8">                                  react-hooks/static-components
+  329:20  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:329:20
+  327 |                   <SortableHeader column="name" label={t('col_name')} className="w-full" />
+  328 |                   <SortableHeader column="customer_type" label={t('col_type')} />
+> 329 |                   <SortableHeader
+      |                    ^^^^^^^^^^^^^^ This component is created during render
+  330 |                     column="identifier"
+  331 |                     label={t('col_identifier')}
+  332 |                     className="hidden lg:table-cell"
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:222:3
+  220 |   // Sortable dry-table head: the button inherits the uppercase hairline
+  221 |   // styling from TH_CLASS on the th.
+> 222 |   function SortableHeader({
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+> 223 |     column,
+      | ^^^^^^^^^^^
+> 224 |     label,
+      …
+      | ^^^^^^^^^^^
+> 244 |     )
+      | ^^^^^^^^^^^
+> 245 |   }
+      | ^^^^ The component is created during render here
+  246 |
+  247 |   return (
+  248 |     <div className="space-y-8">  react-hooks/static-components
+  334:20  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:334:20
+  332 |                     className="hidden lg:table-cell"
+  333 |                   />
+> 334 |                   <SortableHeader
+      |                    ^^^^^^^^^^^^^^ This component is created during render
+  335 |                     column="email"
+  336 |                     label={t('col_email')}
+  337 |                     className="hidden md:table-cell"
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:222:3
+  220 |   // Sortable dry-table head: the button inherits the uppercase hairline
+  221 |   // styling from TH_CLASS on the th.
+> 222 |   function SortableHeader({
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+> 223 |     column,
+      | ^^^^^^^^^^^
+> 224 |     label,
+      …
+      | ^^^^^^^^^^^
+> 244 |     )
+      | ^^^^^^^^^^^
+> 245 |   }
+      | ^^^^ The component is created during render here
+  246 |
+  247 |   return (
+  248 |     <div className="space-y-8">                                                                                                                react-hooks/static-components
+  339:20  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:339:20
+  337 |                     className="hidden md:table-cell"
+  338 |                   />
+> 339 |                   <SortableHeader
+      |                    ^^^^^^^^^^^^^^ This component is created during render
+  340 |                     column="city"
+  341 |                     label={t('col_city')}
+  342 |                     className="hidden sm:table-cell"
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/customers/page.tsx:222:3
+  220 |   // Sortable dry-table head: the button inherits the uppercase hairline
+  221 |   // styling from TH_CLASS on the th.
+> 222 |   function SortableHeader({
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+> 223 |     column,
+      | ^^^^^^^^^^^
+> 224 |     label,
+      …
+      | ^^^^^^^^^^^
+> 244 |     )
+      | ^^^^^^^^^^^
+> 245 |   }
+      | ^^^^ The component is created during render here
+  246 |
+  247 |   return (
+  248 |     <div className="space-y-8">                                                                                                                  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/[extension]/page.tsx
+  80:14  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/[extension]/page.tsx:80:14
+  78 |         <div className="flex items-start gap-4">
+  79 |           <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-secondary flex-shrink-0">
+> 80 |             <Icon className="h-6 w-6 text-foreground" />
+     |              ^^^^ This component is created during render
+  81 |           </div>
+  82 |           <div>
+  83 |             <h1 className="font-display text-2xl leading-8 tracking-tight">{extensionName}</h1>
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/[extension]/page.tsx:48:16
+  46 |   })()
+  47 |
+> 48 |   const Icon = resolveIcon(definition.icon)
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  49 |
+  50 |   const hasWorkspace = `${sectorSlug}/${extensionSlug}` in WORKSPACES
+  51 |  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/page.tsx
+  44:12  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/page.tsx:44:12
+  42 |       <div className="flex items-start gap-4 mb-8">
+  43 |         <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-secondary flex-shrink-0">
+> 44 |           <Icon className="h-6 w-6 text-foreground" />
+     |            ^^^^ This component is created during render
+  45 |         </div>
+  46 |         <div>
+  47 |           <h1 className="font-display text-2xl leading-8 tracking-tight">{sectorName}</h1>
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/extensions/[sector]/page.tsx:28:16
+  26 |
+  27 |
+> 28 |   const Icon = resolveIcon(sector.icon)
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  29 |
+  30 |   return (
+  31 |     <div>  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/import/page.tsx
+  2364:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/import/page.tsx:2364:7
+  2362 |       : ['psd2', 'stripe', 'woocommerce', 'shopify', 'bank', 'skattekonto', 'sie', 'underlag', 'csv_data', 'migration']
+  2363 |     if (!isSandbox && searchParams.get('migration')) {
+> 2364 |       setMode('migration')
+       |       ^^^^^^^ Avoid calling setState() directly within an effect
+  2365 |     } else {
+  2366 |       const modeParam = searchParams.get('mode')
+  2367 |       if (modeParam && allowedModes.includes(modeParam)) {  react-hooks/set-state-in-effect
+  2404:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/import/page.tsx:2404:7
+  2402 |     const hash = window.location.hash
+  2403 |     if (hash === '#sie-export') {
+> 2404 |       setView('export')
+       |       ^^^^^^^ Avoid calling setState() directly within an effect
+  2405 |       setSieDialogOpen(true)
+  2406 |     } else if (hash === '#full-archive') {
+  2407 |       setView('export')                                                                                                                                     react-hooks/set-state-in-effect
+  2842:7  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/invoices/[id]/credit/page.tsx
+  103:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/invoices/[id]/credit/page.tsx:103:5
+  101 |
+  102 |   useEffect(() => {
+> 103 |     fetchInvoice()
+      |     ^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  104 |   }, [id])
+  105 |
+  106 |   async function handleSubmit() {  react-hooks/set-state-in-effect
+  104:6  warning  React Hook useEffect has a missing dependency: 'fetchInvoice'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/invoices/[id]/page.tsx
+  293:6  warning  React Hook useEffect has a missing dependency: 'fetchInvoice'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/invoices/recurring/page.tsx
+  76:6  warning  React Hook useEffect has a missing dependency: 'fetchSchedules'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/skattekonto/page.tsx
+  638:19  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/supplier-invoices/[id]/page.tsx
+  201:6  warning  React Hook useEffect has a missing dependency: 'fetchInvoice'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(dashboard)/suppliers/[id]/page.tsx
+  104:6  warning  React Hook useEffect has missing dependencies: 'fetchInvoices' and 'fetchSupplier'. Either include them or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/(onboarding)/select-company/page.tsx
+  187:7  warning  Error: Cannot call impure function during render
+
+`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component happens to re-render. (https://react.dev/reference/rules/components-and-hooks-must-be-pure#components-and-hooks-must-be-idempotent).
+
+/tmp/oc-wt.id5fd9/app/(onboarding)/select-company/page.tsx:187:7
+  185 |   const enrichmentTimestamp = enrichmentRow?.updated_at ?? enrichmentRow?.created_at ?? null
+  186 |   const enrichmentStale = enrichmentTimestamp
+> 187 |     ? Date.now() - new Date(enrichmentTimestamp).getTime() > ENRICHMENT_TTL_DAYS * 24 * 60 * 60 * 1000
+      |       ^^^^^^^^^^ Cannot call impure function
+  188 |     : false
+  189 |
+  190 |   // A member of exactly one company with nothing else to decide (no new TIC  react-hooks/purity
+
+/tmp/oc-wt.id5fd9/app/(public)/invoice-action/[token]/page.tsx
+  81:6  warning  React Hook useEffect has a missing dependency: 'fetchInvoiceData'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/app/api/documents/[id]/route.ts
+  97:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/documents/[id]/verify/route.ts
+  23:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/documents/[id]/versions/route.ts
+  44:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/enable-banking/callback/route.ts
+  129:38  warning  Unexpected console statement  no-console
+  129:53  warning  Unexpected console statement  no-console
+  226:9   warning  Unexpected console statement  no-console
+  266:5   warning  Unexpected console statement  no-console
+  312:7   warning  Unexpected console statement  no-console
+  413:3   warning  Unexpected console statement  no-console
+  423:3   warning  Unexpected console statement  no-console
+  547:7   warning  Unexpected console statement  no-console
+  677:5   warning  Unexpected console statement  no-console
+  703:7   warning  Unexpected console statement  no-console
+  835:9   warning  Unexpected console statement  no-console
+  861:7   warning  Unexpected console statement  no-console
+  905:7   warning  Unexpected console statement  no-console
+  967:5   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/skatteverket/agi/kvittenser/cron/route.ts
+  114:7  warning  Unexpected console statement  no-console
+  123:7  warning  Unexpected console statement  no-console
+  207:3  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/skatteverket/ombud/sync/cron/__tests__/route.test.ts
+  1:1  warning  Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-explicit-any')
+
+/tmp/oc-wt.id5fd9/app/api/extensions/skatteverket/ombud/sync/cron/route.ts
+  108:5  warning  Unexpected console statement  no-console
+  125:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/skatteverket/skattekonto/sync/cron/route.ts
+   90:5   warning  Unexpected console statement  no-console
+  120:7   warning  Unexpected console statement  no-console
+  141:5   warning  Unexpected console statement  no-console
+  167:5   warning  Unexpected console statement  no-console
+  173:3   warning  Unexpected console statement  no-console
+  200:7   warning  Unexpected console statement  no-console
+  233:9   warning  Unexpected console statement  no-console
+  257:13  warning  Unexpected console statement  no-console
+  295:7   warning  Unexpected console statement  no-console
+  313:3   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/skatteverket/vat/kvittenser/cron/route.ts
+   64:5   warning  Unexpected console statement  no-console
+  112:7   warning  Unexpected console statement  no-console
+  177:9   warning  Unexpected console statement  no-console
+  245:11  warning  Unexpected console statement  no-console
+  270:11  warning  Unexpected console statement  no-console
+  284:7   warning  Unexpected console statement  no-console
+  294:3   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/extensions/stripe/callback/route.ts
+   43:51  warning  Unexpected console statement  no-console
+   43:66  warning  Unexpected console statement  no-console
+   59:9   warning  Unexpected console statement  no-console
+   86:7   warning  Unexpected console statement  no-console
+  126:7   warning  Unexpected console statement  no-console
+  162:7   warning  Unexpected console statement  no-console
+  198:7   warning  Unexpected console statement  no-console
+  206:5   warning  Unexpected console statement  no-console
+  223:7   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/import/sie/create-accounts/route.ts
+  108:11  warning  Unexpected console statement  no-console
+  125:7   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/invoices/reminders/action/route.ts
+   79:7  warning  Unexpected console statement  no-console
+   91:5  warning  Unexpected console statement  no-console
+  100:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/mcp-oauth/token/route.ts
+  173:7  warning  Unexpected console statement  no-console
+  209:5  warning  Unexpected console statement  no-console
+  222:5  warning  Unexpected console statement  no-console
+  272:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/reports/kpi/route.ts
+  266:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/stripe/webhook/route.ts
+  49:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/team/accept/route.ts
+  132:5  warning  Unexpected console statement  no-console
+  220:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/transactions/[id]/attach-document/route.ts
+  102:7  warning  Unexpected console statement  no-console
+  124:7  warning  Unexpected console statement  no-console
+  156:9  warning  Unexpected console statement  no-console
+  203:9  warning  Unexpected console statement  no-console
+  291:7  warning  Unexpected console statement  no-console
+  333:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/api/transactions/create-from-document/route.ts
+   84:7  warning  Unexpected console statement  no-console
+  103:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/app/invite/[token]/page.tsx
+  174:7  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/app/sandbox/page.tsx
+  31:9   warning  'router' is assigned a value but never used. Allowed unused vars must match /^_/u                                                                                                                                                                                   @typescript-eslint/no-unused-vars
+  68:15  warning  'body' is assigned a value but never used. Allowed unused vars must match /^_/u                                                                                                                                                                                     @typescript-eslint/no-unused-vars
+  80:7   warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/agent/AgentAvatar.tsx
+  41:3  warning  Unused eslint-disable directive (no problems were reported from '@next/next/no-img-element')
+  43:5  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/agent/AgentTrigger.tsx
+  59:72  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/agent/AgentTrigger.tsx:59:72
+  57 |   useEffect(() => {
+  58 |     try {
+> 59 |       if (window.sessionStorage.getItem(UPSELL_DISMISSED_KEY) === '1') setUpsellDismissed(true)
+     |                                                                        ^^^^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  60 |     } catch {
+  61 |       // Storage unavailable (private mode, blocked cookies): the pill simply
+  62 |       // stays dismissible per page load instead of per session  react-hooks/set-state-in-effect
+  85:7   warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/agent/AgentTrigger.tsx:85:7
+  83 |     prevOpenRef.current = isOpen
+  84 |     if (wasOpen && !isOpen && !hasAi) {
+> 85 |       setUpsellDismissed(true)
+     |       ^^^^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  86 |       try {
+  87 |         window.sessionStorage.setItem(UPSELL_DISMISSED_KEY, '1')
+  88 |       } catch {                                                                                                                                                         react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/agent/ChatSidebar.tsx
+  51:29  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/agent/ChatSidebar.tsx:51:29
+  49 |   useEffect(() => {
+  50 |     const stored = localStorage.getItem('Accounted:chat-sidebar-collapsed')
+> 51 |     if (stored === 'false') setCollapsed(false)
+     |                             ^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  52 |   }, [])
+  53 |   const toggleCollapsed = () => {
+  54 |     setCollapsed(c => {  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/AttachmentPreviewSheet.tsx
+  395:23  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/BookingTemplatePicker.tsx
+  51:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/BookingTemplatePicker.tsx:51:7
+  49 |   useEffect(() => {
+  50 |     if (open && defaultAmount != null && defaultAmount > 0) {
+> 51 |       setAmount(String(Math.round(defaultAmount * 100) / 100))
+     |       ^^^^^^^^^ Avoid calling setState() directly within an effect
+  52 |     }
+  53 |   }, [open, defaultAmount])
+  54 |  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/InboxDocumentPicker.tsx
+  287:17  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/JournalEntryAttachments.tsx
+  441:21  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/bookkeeping/JournalEntryList.tsx
+  682:6  warning  React Hook useEffect has a missing dependency: 'fetchEntries'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/dashboard/CompanyTabSync.tsx
+  226:7  warning  Do not use `window.location.assign()` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+  234:5  warning  Do not use `window.location.assign()` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/deadlines/DeadlineGroupCard.tsx
+  58:9  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/deadlines/DeadlineRow.tsx
+  78:9  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionCard.tsx
+  24:14  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionCard.tsx:24:14
+  22 |         <div className="flex items-start gap-3 min-w-0">
+  23 |           <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary flex-shrink-0">
+> 24 |             <Icon className="h-5 w-5 text-foreground" />
+     |              ^^^^ This component is created during render
+  25 |           </div>
+  26 |           <div className="min-w-0">
+  27 |             <Link
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionCard.tsx:17:16
+  15 |   const description = descriptionKey ? t(descriptionKey) : extension.description
+  16 |
+> 17 |   const Icon = resolveIcon(extension.icon)
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  18 |
+  19 |   return (
+  20 |     <Card className="group relative">  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionWorkspaceLoader.tsx
+  27:13  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionWorkspaceLoader.tsx:27:13
+  25 |
+  26 |   if (isFullScreen && WorkspaceComponent) {
+> 27 |     return <WorkspaceComponent userId={userId} />
+     |             ^^^^^^^^^^^^^^^^^^ This component is created during render
+  28 |   }
+  29 |
+  30 |   return (
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionWorkspaceLoader.tsx:23:30
+  21 |   userId: string
+  22 | }) {
+> 23 |   const WorkspaceComponent = getWorkspaceComponent(sector, slug)
+     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  24 |   const isFullScreen = FULLSCREEN_WORKSPACES.has(`${sector}/${slug}`)
+  25 |
+  26 |   if (isFullScreen && WorkspaceComponent) {                                                                                                react-hooks/static-components
+  33:10  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionWorkspaceLoader.tsx:33:10
+  31 |     <ExtensionWorkspaceShell definition={definition}>
+  32 |       {WorkspaceComponent ? (
+> 33 |         <WorkspaceComponent userId={userId} />
+     |          ^^^^^^^^^^^^^^^^^^ This component is created during render
+  34 |       ) : (
+  35 |         <EmptyExtensionState
+  36 |           title="Bakgrundstjänst"
+
+/tmp/oc-wt.id5fd9/components/extensions/ExtensionWorkspaceLoader.tsx:23:30
+  21 |   userId: string
+  22 | }) {
+> 23 |   const WorkspaceComponent = getWorkspaceComponent(sector, slug)
+     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  24 |   const isFullScreen = FULLSCREEN_WORKSPACES.has(`${sector}/${slug}`)
+  25 |
+  26 |   if (isFullScreen && WorkspaceComponent) {  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/components/extensions/SectorCard.tsx
+  24:16  warning  Error: Cannot create components during render
+
+Components created during render will reset their state each time they are created. Declare components outside of render.
+
+/tmp/oc-wt.id5fd9/components/extensions/SectorCard.tsx:24:16
+  22 |           <div className="flex items-start gap-3">
+  23 |             <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary flex-shrink-0">
+> 24 |               <Icon className="h-5 w-5 text-foreground" />
+     |                ^^^^ This component is created during render
+  25 |             </div>
+  26 |             <div>
+  27 |               <h3 className="text-sm">
+
+/tmp/oc-wt.id5fd9/components/extensions/SectorCard.tsx:16:16
+  14 |   const description = descriptionKey ? t(descriptionKey) : sector.description
+  15 |
+> 16 |   const Icon = resolveIcon(sector.icon)
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^ The component is created during render here
+  17 |
+  18 |   return (
+  19 |     <Link href={`/extensions/${sector.slug}`} className="h-full">  react-hooks/static-components
+
+/tmp/oc-wt.id5fd9/components/extensions/general/ArcimMigrationWorkspace.tsx
+  557:19  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  640:17  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/extensions/general/CalendarWorkspace.tsx
+  13:45  warning  'userId' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/components/extensions/general/EnableBankingWorkspace.tsx
+  8:50  warning  'userId' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/components/extensions/general/InvoiceInboxWorkspace.tsx
+   818:6  warning  React Hook useMemo has a missing dependency: 't'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+  3058:3  warning  'accountingMethod' is defined but never used. Allowed unused args must match /^_/u                  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/components/extensions/general/PushNotificationsWorkspace.tsx
+  7:54  warning  'userId' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/components/extensions/general/TicWorkspace.tsx
+  189:40  warning  'userId' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/components/import/BankFileColumnMappingStep.tsx
+  124:6  warning  React Hook useMemo has a missing dependency: 'DATE_PATTERNS'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/import/BankFileConfirmStep.tsx
+  74:19  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/BankFileConfirmStep.tsx:74:19
+  72 |     defaultedRef.current = true
+  73 |     const has1930 = bankAccounts.some((a) => a.account_number === '1930')
+> 74 |     if (!has1930) setSelectedAccount(bankAccounts[0].account_number)
+     |                   ^^^^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  75 |   }, [bankAccounts])
+  76 |
+  77 |   if (isLoading) {  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/import/BankFileImportHistory.tsx
+  92:10  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/BankFileImportHistory.tsx:92:10
+  90 |
+  91 |   useEffect(() => {
+> 92 |     void fetchImports()
+     |          ^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  93 |   }, [fetchImports])
+  94 |
+  95 |   // Deliberately no client-side timeout: undoing a large import can take  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/import/ImportReviewStep.tsx
+  100:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/ImportReviewStep.tsx:100:5
+   98 |   useEffect(() => {
+   99 |     if (!company?.id) return
+> 100 |     setSeriesLoaded(false)
+      |     ^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  101 |     const supabase = createClient()
+  102 |
+  103 |     let cancelled = false                                                                               react-hooks/set-state-in-effect
+  174:6  warning  React Hook useEffect has a missing dependency: 'preview.voucherSeriesInFile'. Either include it or remove the dependency array. If 'setOptions' needs the current value of 'preview.voucherSeriesInFile', you can also switch to useReducer instead of useState and read 'preview.voucherSeriesInFile' in the reducer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    react-hooks/exhaustive-deps
+  182:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/ImportReviewStep.tsx:182:7
+  180 |   useEffect(() => {
+  181 |     if (isLoading) {
+> 182 |       setElapsed(0)
+      |       ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  183 |       intervalRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
+  184 |     } else {
+  185 |       if (intervalRef.current) clearInterval(intervalRef.current)  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/import/OpeningBalancePeriodStep.tsx
+  62:21  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/OpeningBalancePeriodStep.tsx:62:21
+  60 |       (p) => !p.is_closed && !p.locked_at && !p.opening_balances_set,
+  61 |     )
+> 62 |     if (openPeriod) setSelectedPeriodId(openPeriod.id)
+     |                     ^^^^^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  63 |   }, [periods, loadingPeriods])
+  64 |
+  65 |   const selectedPeriod = periods.find((p) => p.id === selectedPeriodId)  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/import/SIEImportHistory.tsx
+  85:10  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/SIEImportHistory.tsx:85:10
+  83 |
+  84 |   useEffect(() => {
+> 85 |     void fetchImports()
+     |          ^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  86 |   }, [fetchImports])
+  87 |
+  88 |   // Deliberately no client-side timeout: undoing a large import can take  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/import/SIEUploadStep.tsx
+  37:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/import/SIEUploadStep.tsx:37:7
+  35 |   useEffect(() => {
+  36 |     if (!isLoading) {
+> 37 |       setLoadingPhase(0)
+     |       ^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  38 |       return
+  39 |     }
+  40 |  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/invoices/InvoiceEditor.tsx
+   678:6  warning  React Hook useEffect has missing dependencies: 'isEditMode' and 'setValue'. Either include them or remove the dependency array  react-hooks/exhaustive-deps
+  1137:6  warning  React Hook useEffect has a missing dependency: 'isEditMode'. Either include it or remove the dependency array                   react-hooks/exhaustive-deps
+  1180:6  warning  React Hook useEffect has a missing dependency: 'watchItems'. Either include it or remove the dependency array                   react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/invoices/NewRecurringScheduleDialog.tsx
+  188:6  warning  React Hook useEffect has a missing dependency: 'supabase'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/onboarding/BankIdCompanyPicker.tsx
+  132:5  warning  Do not use `window.location.assign()` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/onboarding/journey/OnboardingJourney.tsx
+  519:72  warning  Error: Cannot call impure function during render
+
+`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component happens to re-render. (https://react.dev/reference/rules/components-and-hooks-must-be-pure#components-and-hooks-must-be-idempotent).
+
+/tmp/oc-wt.id5fd9/components/onboarding/journey/OnboardingJourney.tsx:519:72
+  517 |           : null
+  518 |         const firstYearSuggested = state.lookupRan
+> 519 |           ? deriveFirstYearDefaults(state.ticLookup?.registrationDate, Date.now(), {
+      |                                                                        ^^^^^^^^^^ Cannot call impure function
+  520 |               noClosedPeriod: state.ticLookup?.fiscalYear == null,
+  521 |             }).isFirstFiscalYear
+  522 |           : false  react-hooks/purity
+
+/tmp/oc-wt.id5fd9/components/reconciliation/ReconciliationWorkspace.tsx
+  85:10  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reconciliation/ReconciliationWorkspace.tsx:85:10
+  83 |
+  84 |   useEffect(() => {
+> 85 |     void load()
+     |          ^^^^ Avoid calling setState() directly within an effect
+  86 |   }, [load])
+  87 |
+  88 |   const requestedKey = searchParams.get('account')  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/reports/SkatteverketPanel.tsx
+  242:5  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx
+   149:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:149:5
+  147 |
+  148 |   useEffect(() => {
+> 149 |     setLoading(true)
+      |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  150 |     setError(null)
+  151 |     fetch(`/api/reports/trial-balance?period_id=${periodId}`)
+  152 |       .then((res) => res.json())  react-hooks/set-state-in-effect
+   440:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:440:5
+  438 |
+  439 |   useEffect(() => {
+> 440 |     setLoading(true)
+      |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  441 |     setError(null)
+  442 |     setMonthlyLoading(true)
+  443 |                                                                     react-hooks/set-state-in-effect
+   477:6  warning  React Hook useEffect has a missing dependency: 'dimensionFilter'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  react-hooks/exhaustive-deps
+   584:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:584:5
+  582 |
+  583 |   useEffect(() => {
+> 584 |     setLoading(true)
+      |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  585 |     setError(null)
+  586 |     fetch(`/api/reports/balance-sheet?${reportQs}`)
+  587 |       .then((res) => res.json())            react-hooks/set-state-in-effect
+   697:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:697:5
+  695 |
+  696 |   useEffect(() => {
+> 697 |     setLoading(true)
+      |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  698 |     setError(null)
+  699 |     fetch(`/api/reports/resultatrapport?${reportQs}`)
+  700 |       .then((res) => res.json())          react-hooks/set-state-in-effect
+   841:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:841:5
+  839 |
+  840 |   useEffect(() => {
+> 841 |     setLoading(true)
+      |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  842 |     setError(null)
+  843 |     fetch(`/api/reports/balansrapport?${reportQs}`)
+  844 |       .then((res) => res.json())            react-hooks/set-state-in-effect
+  1631:5  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/reports/views/index.tsx:1631:5
+  1629 |
+  1630 |   useEffect(() => {
+> 1631 |     setChosenStep(null)
+       |     ^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  1632 |   }, [periodType, year, period, fiscalPeriodId])
+  1633 |
+  1634 |   useEffect(() => {                                 react-hooks/set-state-in-effect
+  2500:6  warning  React Hook useEffect has a missing dependency: 'fetchData'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        react-hooks/exhaustive-deps
+  2772:6  warning  React Hook useEffect has a missing dependency: 'fetchData'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        react-hooks/exhaustive-deps
+  2957:6  warning  React Hook useEffect has a missing dependency: 'fetchData'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        react-hooks/exhaustive-deps
+  3250:6  warning  React Hook useEffect has a missing dependency: 'fetchData'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/salary/AGIPanel.tsx
+  519:7  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/settings/BankNameCombobox.tsx
+   74:5   warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/settings/BankNameCombobox.tsx:74:5
+  72 |
+  73 |   useEffect(() => {
+> 74 |     setHighlightedIndex(-1)
+     |     ^^^^^^^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  75 |   }, [value])
+  76 |
+  77 |   useEffect(() => {  react-hooks/set-state-in-effect
+  176:17  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           @next/next/no-img-element
+
+/tmp/oc-wt.id5fd9/components/settings/SkatteverketConnectPanel.tsx
+  214:7  warning  Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination  @next/next/no-location-assign-relative-destination
+
+/tmp/oc-wt.id5fd9/components/settings/VoucherSeriesManager.tsx
+  27:35  warning  Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `company`, but the source dependencies were [company?.id]. Inferred less specific property than source.
+
+/tmp/oc-wt.id5fd9/components/settings/VoucherSeriesManager.tsx:27:35
+  25 |   const [isLoading, setIsLoading] = useState(true)
+  26 |
+> 27 |   const fetchSeries = useCallback(async () => {
+     |                                   ^^^^^^^^^^^^^
+> 28 |     if (!company?.id) { setIsLoading(false); return }
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 29 |     const supabase = createClient()
+     …
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 36 |     setIsLoading(false)
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 37 |   }, [company?.id])
+     | ^^^^ Could not preserve existing manual memoization
+  38 |
+  39 |   useEffect(() => { fetchSeries() }, [fetchSeries])
+  40 |  react-hooks/preserve-manual-memoization
+  39:21  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/settings/VoucherSeriesManager.tsx:39:21
+  37 |   }, [company?.id])
+  38 |
+> 39 |   useEffect(() => { fetchSeries() }, [fetchSeries])
+     |                     ^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  40 |
+  41 |   // Group by series letter, show the highest last_number
+  42 |   const grouped = series.reduce<Record<string, number>>((acc, s) => {                                                                                                            react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/supplier-invoices/supplier-invoice-cells.tsx
+   25:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/supplier-invoices/supplier-invoice-cells.tsx:25:7
+  23 |   useEffect(() => {
+  24 |     if (document.activeElement !== inputRef.current) {
+> 25 |       setDraft(rateToPctString(value))
+     |       ^^^^^^^^ Avoid calling setState() directly within an effect
+  26 |     }
+  27 |   }, [value])
+  28 |    react-hooks/set-state-in-effect
+  125:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/components/supplier-invoices/supplier-invoice-cells.tsx:125:7
+  123 |   useEffect(() => {
+  124 |     if (document.activeElement !== innerRef.current) {
+> 125 |       setDraft(toDisplay(value))
+      |       ^^^^^^^^ Avoid calling setState() directly within an effect
+  126 |     }
+  127 |   }, [value])
+  128 |  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/components/suppliers/SupplierForm.tsx
+  118:24  warning  Compilation Skipped: Use of incompatible library
+
+This API returns functions which cannot be memoized without leading to stale UI. To prevent this, by default React Compiler will skip memoizing this component/hook. However, you may see issues if values from this API are passed to other components/hooks that are memoized.
+
+/tmp/oc-wt.id5fd9/components/suppliers/SupplierForm.tsx:118:24
+  116 |   })
+  117 |
+> 118 |   const countryValue = watch('country')
+      |                        ^^^^^ React Hook Form's `useForm()` API returns a `watch()` function which cannot be memoized safely.
+  119 |   // A stored value the picker does not list (an unmapped legacy name, or a
+  120 |   // code outside the curated list) still has to be visible, or the field
+  121 |   // would look empty while holding something  react-hooks/incompatible-library
+
+/tmp/oc-wt.id5fd9/components/transactions/TransactionForm.tsx
+  66:6  warning  React Hook useEffect has a missing dependency: 'setValue'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/components/ui/use-toast.tsx
+  16:7  warning  'actionTypes' is assigned a value but only used as a type. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/extensions/general/calendar/components/PaymentCalendar.tsx
+   41:38  warning  Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `setYear`, but the source dependencies were [viewMode, month, year, selectedDate]. Inferred different dependency than source.
+
+/tmp/oc-wt.id5fd9/extensions/general/calendar/components/PaymentCalendar.tsx:41:38
+  39 |
+  40 |   // Navigation handlers based on view mode
+> 41 |   const handlePrevious = useCallback(() => {
+     |                                      ^^^^^^^
+> 42 |     if (viewMode === 'month') {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 43 |       if (month === 0) {
+     …
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 61 |     }
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 62 |   }, [viewMode, month, year, selectedDate])
+     | ^^^^ Could not preserve existing manual memoization
+  63 |
+  64 |   const handleNext = useCallback(() => {
+  65 |     if (viewMode === 'month') {                                react-hooks/preserve-manual-memoization
+   64:34  warning  Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `setYear`, but the source dependencies were [viewMode, month, year, selectedDate]. Inferred different dependency than source.
+
+/tmp/oc-wt.id5fd9/extensions/general/calendar/components/PaymentCalendar.tsx:64:34
+  62 |   }, [viewMode, month, year, selectedDate])
+  63 |
+> 64 |   const handleNext = useCallback(() => {
+     |                                  ^^^^^^^
+> 65 |     if (viewMode === 'month') {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 66 |       if (month === 11) {
+     …
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 84 |     }
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 85 |   }, [viewMode, month, year, selectedDate])
+     | ^^^^ Could not preserve existing manual memoization
+  86 |
+  87 |   const handleToday = useCallback(() => {
+  88 |     const today = new Date()                                         react-hooks/preserve-manual-memoization
+   87:35  warning  Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `setYear`, but the source dependencies were []. Inferred dependency not present in source.
+
+/tmp/oc-wt.id5fd9/extensions/general/calendar/components/PaymentCalendar.tsx:87:35
+  85 |   }, [viewMode, month, year, selectedDate])
+  86 |
+> 87 |   const handleToday = useCallback(() => {
+     |                                   ^^^^^^^
+> 88 |     const today = new Date()
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 89 |     setYear(today.getFullYear())
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 90 |     setMonth(today.getMonth())
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 91 |     setSelectedDate(today)
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 92 |   }, [])
+     | ^^^^ Could not preserve existing manual memoization
+  93 |
+  94 |   const handleViewModeChange = useCallback((mode: CalendarViewMode) => {
+  95 |     setViewMode(mode)  react-hooks/preserve-manual-memoization
+  103:38  warning  Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `setYear`, but the source dependencies were [viewMode]. Inferred different dependency than source.
+
+/tmp/oc-wt.id5fd9/extensions/general/calendar/components/PaymentCalendar.tsx:103:38
+  101 |   }, [selectedDate])
+  102 |
+> 103 |   const handleDayClick = useCallback((date: Date) => {
+      |                                      ^^^^^^^^^^^^^^^^^
+> 104 |     if (viewMode === 'month') {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 105 |       // In month view, clicking a day shows the modal
+      …
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 114 |     }
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 115 |   }, [viewMode])
+      | ^^^^ Could not preserve existing manual memoization
+  116 |
+  117 |   const handleAddDeadline = useCallback((date: Date) => {
+  118 |     setDeadlineFormDate(date)                           react-hooks/preserve-manual-memoization
+  131:6   warning  React Hook useCallback has a missing dependency: 'handleDeadlineFormClose'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/extensions/general/enable-banking/components/BankSelector.tsx
+  197:3  warning  Unused eslint-disable directive (no problems were reported from 'react-hooks/exhaustive-deps')
+
+/tmp/oc-wt.id5fd9/extensions/general/enable-banking/components/BankSyncProgressDialog.tsx
+  99:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/extensions/general/enable-banking/components/BankSyncProgressDialog.tsx:99:7
+   97 |     if (!open || state.kind !== 'done' || state.summary.imported === 0) {
+   98 |       // A later sync must not inherit the previous run's numbers.
+>  99 |       setWorkCounts(null)
+      |       ^^^^^^^^^^^^^ Avoid calling setState() directly within an effect
+  100 |       return
+  101 |     }
+  102 |     let cancelled = false  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/extensions/general/enable-banking/components/BankingSettingsPanel.tsx
+  122:6  warning  React Hook useEffect has a missing dependency: 'fetchConnections'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+/tmp/oc-wt.id5fd9/extensions/general/invoice-inbox/lib/upload-and-extract.ts
+  206:3  warning  Unused eslint-disable directive (no problems were reported from 'no-control-regex')
+
+/tmp/oc-wt.id5fd9/extensions/general/mcp-server/server.ts
+  255:49   warning  'lockPeriod' is defined but never used. Allowed unused vars must match /^_/u               @typescript-eslint/no-unused-vars
+  287:52   warning  'InvoiceExtractionSchema' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  314:75   warning  'Invoice' is defined but never used. Allowed unused vars must match /^_/u                  @typescript-eslint/no-unused-vars
+  314:94   warning  'CompanySettings' is defined but never used. Allowed unused vars must match /^_/u          @typescript-eslint/no-unused-vars
+  314:121  warning  'InvoiceItem' is defined but never used. Allowed unused vars must match /^_/u              @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/extensions/general/push-notifications/payload-builders.ts
+  101:3  warning  'transactionId' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/extensions/general/tic/index.ts
+    5:3  warning  'getBankAccounts' is defined but never used. Allowed unused vars must match /^_/u                     @typescript-eslint/no-unused-vars
+    6:3  warning  'getIndustryCodes' is defined but never used. Allowed unused vars must match /^_/u                    @typescript-eslint/no-unused-vars
+    7:3  warning  'getEmails' is defined but never used. Allowed unused vars must match /^_/u                           @typescript-eslint/no-unused-vars
+    8:3  warning  'getPhones' is defined but never used. Allowed unused vars must match /^_/u                           @typescript-eslint/no-unused-vars
+    9:3  warning  'getCompanyPurpose' is defined but never used. Allowed unused vars must match /^_/u                   @typescript-eslint/no-unused-vars
+   13:3  warning  'getSignatory' is defined but never used. Allowed unused vars must match /^_/u                        @typescript-eslint/no-unused-vars
+  243:7  warning  Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-unused-vars')
+
+/tmp/oc-wt.id5fd9/lib/api/__tests__/schemas.test.ts
+  2138:11  warning  'result' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/api/__tests__/validate.test.ts
+  264:13  warning  'body' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/api/v1/__tests__/actor-attribution.test.ts
+  19:10  warning  'NextResponse' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/api/v1/report-period.ts
+  11:10  warning  'z' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/auth/consume-invite-cookie.ts
+  181:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/auth/require-auth.ts
+   49:11  warning  Unexpected console statement  no-console
+   60:5   warning  Unexpected console statement  no-console
+  113:7   warning  Unexpected console statement  no-console
+  118:5   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/auth/session-timeout.ts
+  131:7  warning  Unexpected console statement  no-console
+  139:5  warning  Unexpected console statement  no-console
+  285:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/bokslut/assets/asset-service.ts
+  16:3  warning  'DepreciationMethod' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/bookkeeping/__tests__/counterparty-templates.test.ts
+  1:36  warning  'beforeEach' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/bookkeeping/bas-catalog-client.ts
+  34:9  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/bookkeeping/engine.ts
+  634:17  warning  'rpcResult' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/company/actions.ts
+   34:5  warning  Unexpected console statement  no-console
+   80:5  warning  Unexpected console statement  no-console
+  212:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/company/create-company.ts
+   85:5  warning  Unexpected console statement  no-console
+   94:5  warning  Unexpected console statement  no-console
+  105:9  warning  Unexpected console statement  no-console
+  146:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/company/landing-server.ts
+  45:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/company/pending-invites.ts
+   69:7   warning  Unexpected console statement  no-console
+   81:7   warning  Unexpected console statement  no-console
+   91:5   warning  Unexpected console statement  no-console
+  187:7   warning  Unexpected console statement  no-console
+  218:11  warning  Unexpected console statement  no-console
+  234:5   warning  Unexpected console statement  no-console
+  276:5   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/connect/hosted/__tests__/state.test.ts
+  21:17  warning  'body' is assigned a value but never used. Allowed unused elements of array destructuring must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/connect/upstreams/__tests__/skatteverket-oauth.test.ts
+  18:7  warning  'ENV' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/core/bookkeeping/storno-service.ts
+   95:5  warning  Unexpected console statement  no-console
+  102:5  warning  Unexpected console statement  no-console
+  627:5  warning  Unexpected console statement  no-console
+  662:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/hooks/use-document-extraction.ts
+  46:7  warning  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+/tmp/oc-wt.id5fd9/lib/hooks/use-document-extraction.ts:46:7
+  44 |   useEffect(() => {
+  45 |     if (!documentId) {
+> 46 |       setState({ status: 'idle', elapsedMs: 0 })
+     |       ^^^^^^^^ Avoid calling setState() directly within an effect
+  47 |       return
+  48 |     }
+  49 |  react-hooks/set-state-in-effect
+
+/tmp/oc-wt.id5fd9/lib/import/sie-import.ts
+  1884:7   warning  Unexpected console statement  no-console
+  2562:15  warning  Unexpected console statement  no-console
+  2810:11  warning  Unexpected console statement  no-console
+  2829:7   warning  Unexpected console statement  no-console
+  2883:9   warning  Unexpected console statement  no-console
+  2968:7   warning  Unexpected console statement  no-console
+  2991:11  warning  Unexpected console statement  no-console
+  2994:9   warning  Unexpected console statement  no-console
+  3003:9   warning  Unexpected console statement  no-console
+  3005:9   warning  Unexpected console statement  no-console
+  3024:9   warning  Unexpected console statement  no-console
+  3054:9   warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/invoices/pdf-template.tsx
+   898:15  warning  Image elements must have an alt prop, either with meaningful text, or an empty string for decorative images  jsx-a11y/alt-text
+  1369:17  warning  Image elements must have an alt prop, either with meaningful text, or an empty string for decorative images  jsx-a11y/alt-text
+  1376:17  warning  Image elements must have an alt prop, either with meaningful text, or an empty string for decorative images  jsx-a11y/alt-text
+
+/tmp/oc-wt.id5fd9/lib/notifications/bookkeeping-digest.ts
+  493:3  warning  Unused eslint-disable directive (no problems were reported from 'no-control-regex')
+
+/tmp/oc-wt.id5fd9/lib/pending-operations/commit.ts
+  3890:5  warning  Unexpected console statement  no-console
+  3923:7  warning  Unexpected console statement  no-console
+  3967:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/providers/provider-data-fetcher.ts
+   50:3  warning  Unexpected console statement  no-console
+  176:7  warning  Unexpected console statement  no-console
+  181:7  warning  Unexpected console statement  no-console
+  235:9  warning  Unexpected console statement  no-console
+  284:7  warning  Unexpected console statement  no-console
+  289:7  warning  Unexpected console statement  no-console
+  343:9  warning  Unexpected console statement  no-console
+  674:9  warning  Unexpected console statement  no-console
+  683:7  warning  Unexpected console statement  no-console
+  692:3  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/providers/types.ts
+  1:15  warning  'ResourceType' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/rate-limits/agent.ts
+  34:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/rate-limits/inbox.ts
+  38:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/reports/xlsx-export.ts
+  122:1  warning  Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-unused-vars')
+
+/tmp/oc-wt.id5fd9/lib/salary/absence-calculator.ts
+  186:9  warning  'dailyRate' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/supabase/middleware.ts
+   157:7  warning  Unexpected console statement  no-console
+   650:5  warning  Unexpected console statement  no-console
+   692:5  warning  Unexpected console statement  no-console
+   700:7  warning  Unexpected console statement  no-console
+   704:7  warning  Unexpected console statement  no-console
+   712:5  warning  Unexpected console statement  no-console
+   723:5  warning  Unexpected console statement  no-console
+   943:5  warning  Unexpected console statement  no-console
+   981:9  warning  Unexpected console statement  no-console
+  1013:5  warning  Unexpected console statement  no-console
+  1122:5  warning  Unexpected console statement  no-console
+  1130:5  warning  Unexpected console statement  no-console
+  1146:7  warning  Unexpected console statement  no-console
+  1200:5  warning  Unexpected console statement  no-console
+  1223:7  warning  Unexpected console statement  no-console
+  1246:5  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/suppliers/match-supplier.ts
+  138:7  warning  Unexpected console statement  no-console
+
+/tmp/oc-wt.id5fd9/lib/transactions/category-suggestions.ts
+  8:55  warning  'TemplateMatch' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/lib/webhooks/dispatcher.ts
+  28:33  warning  'PinnedFetchResult' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/public/sw.template.js
+  95:35  warning  'event' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/scripts/seed-demo-account.ts
+   349:10  warning  'skipVoucher' is defined but never used. Allowed unused vars must match /^_/u       @typescript-eslint/no-unused-vars
+   998:9   warning  'seedInv' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  1008:11  warning  'number' is assigned a value but never used. Allowed unused vars must match /^_/u   @typescript-eslint/no-unused-vars
+  1904:3   warning  'suppliers' is defined but never used. Allowed unused args must match /^_/u         @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/tests/pg/journal-entry-no-doc-required.pg.test.ts
+  1:10  warning  'randomUUID' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/tests/pg/security-role-gates-and-posting-integrity.pg.test.ts
+  7:3  warning  'insertCompany' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/tmp/oc-wt.id5fd9/tests/pg/vat-ruta-drilldown-reconcile.pg.test.ts
+  19:10  warning  'randomUUID' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+✖ 287 problems (0 errors, 287 warnings)
+  0 errors and 7 warnings potentially fixable with the `--fix` option.
+

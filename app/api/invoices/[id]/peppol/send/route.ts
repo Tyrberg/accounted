@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { invoiceIssuancePeriodError } from '@/lib/invoices/issuance-period'
 import { z } from 'zod'
 import { privateNoStore } from '@/lib/api/private-no-store'
 import { withRouteContext } from '@/lib/api/with-route-context'
@@ -151,6 +152,11 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     // accepts it. Refuse up front what issuance would refuse afterwards, so an
     // invoice never reaches the buyer and then fails to book.
     if (wasDraft) {
+      const periodError = await invoiceIssuancePeriodError(supabase, companyId, invoice, company)
+      if (periodError) {
+        return privateNoStore(errorResponseFromCode(periodError, log, { requestId }))
+      }
+
       const payeeSnapshot = await snapshotInvoicePayee(supabase, companyId, invoice)
       if (!payeeSnapshot.ok) {
         return privateNoStore(errorResponseFromCode(payeeSnapshot.code, log, {
