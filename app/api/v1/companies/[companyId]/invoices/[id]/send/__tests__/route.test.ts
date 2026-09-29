@@ -377,6 +377,87 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(mockSendEmail).not.toHaveBeenCalled()
   })
 
+  it('backoffice#94: blocks BEFORE the preflight PDF render, allocation, or email when no fiscal period covers the invoice date', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: { data: COMPANY_SETTINGS, error: null },
+        // findFiscalPeriod: no open period covers invoice_date.
+        fiscal_periods: { data: [], error: null },
+      }),
+    )
+
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_NO_FISCAL_PERIOD')
+    expect(body.data).toBeUndefined()
+    // Nothing happened: no PDF render, no number, no reservation, no email.
+    // This is what makes the check safe on :send, where nothing sent to the
+    // customer can be un-sent afterwards.
+    expect(InvoicePDF).not.toHaveBeenCalled()
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
+  it('backoffice#94: dry-run also fails when no fiscal period covers the invoice date', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [], error: null },
+      }),
+    )
+
+    const res = await sendInvoice(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send?dry_run=true`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    // A dry-run that could not actually commit must not report success.
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_NO_FISCAL_PERIOD')
+    expect(body.data).toBeUndefined()
+  })
+
+  it('does not require a fiscal period when the company defers booking', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: DRAFT_INVOICE, error: null },
+          { data: { invoice_number: '2026-0042' }, error: null },
+        ],
+        company_settings: {
+          data: { ...COMPANY_SETTINGS, defer_invoice_booking: true },
+          error: null,
+        },
+        // No fiscal_periods row configured (defaults to null/no period):
+        // deferred booking must not trip the pre-flight check at all.
+      }),
+    )
+
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.status).toBe('sent')
+    expect(body.data.journal_entry_id ?? null).toBeNull()
+  })
+
   it('returns VALIDATION_ERROR for malformed JSON', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -438,6 +519,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           { data: { invoice_number: '2026-0042' }, error: null }, // re-read after allocation
         ],
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -488,6 +570,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'member' }, error: null },
         invoices: { data: DRAFT_INVOICE, error: null },
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -512,6 +595,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: DRAFT_INVOICE, error: null },
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -546,6 +630,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           },
           error: null,
         },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -587,6 +672,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           },
           error: null,
         },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -692,6 +778,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           { data: { invoice_number: '2026-0042' }, error: null },
         ],
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -711,6 +798,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: DRAFT_INVOICE, error: null },
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -769,6 +857,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           { data: [], error: null }, // status flip: 0 rows matched
         ],
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -794,6 +883,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
           { data: { invoice_number: '2026-0043' }, error: null }, // re-read after allocation
         ],
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -826,6 +916,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         { data: { invoice_number: '2026-0042' }, error: null },
       ],
       company_settings: { data: COMPANY_SETTINGS, error: null },
+      fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
     })
     mockServiceClient.mockReturnValue(supabaseMock)
 
@@ -856,6 +947,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: DRAFT_INVOICE, error: null },
         company_settings: { data: COMPANY_SETTINGS, error: null },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 

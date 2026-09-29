@@ -628,6 +628,206 @@ describe('commitPendingOperation: invoice send recipient limit', () => {
   })
 })
 
+// backoffice#94: an invoice that books at issue must never end up 'sent'
+// without its verifikat through the MCP executors either.
+describe('commitPendingOperation: fiscal-period pre-flight on issuance', () => {
+  it('mark_invoice_sent fails before number allocation when no open period covers invoice_date', async () => {
+    const invoiceEntries = await import('@/lib/bookkeeping/invoice-entries')
+    const bookSpy = vi.spyOn(invoiceEntries, 'createInvoiceJournalEntry')
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: makeInvoice({
+        id: 'invoice-1',
+        status: 'draft',
+        invoice_number: null,
+        credited_invoice_id: null,
+        invoice_date: '2026-09-10',
+      }),
+      error: null,
+    })
+    enqueue({
+      data: { accounting_method: 'accrual', entity_type: 'aktiebolag', bankgiro: '123-4567' },
+      error: null,
+    })
+    enqueue({ data: [], error: null }) // fiscal_periods: none open
+    enqueue({ data: null, error: null }) // dispatcher rejected update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'mark_invoice_sent', params: { invoice_id: 'invoice-1' } }),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(result.code).toBe('INVOICE_MARK_SENT_NO_FISCAL_PERIOD')
+    expect(supabase.from).toHaveBeenCalledWith('fiscal_periods')
+    expect(ensureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(bookSpy).not.toHaveBeenCalled()
+    bookSpy.mockRestore()
+  })
+
+  it('mark_invoice_sent restores the draft when booking returns null after the pre-flight passed', async () => {
+    const invoiceEntries = await import('@/lib/bookkeeping/invoice-entries')
+    const bookSpy = vi.spyOn(invoiceEntries, 'createInvoiceJournalEntry').mockResolvedValueOnce(null)
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    const draft = makeInvoice({
+      id: 'invoice-1',
+      status: 'draft',
+      invoice_number: 'F-2026001',
+      credited_invoice_id: null,
+      updated_at: '2026-09-01T08:00:00.000Z',
+    })
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: draft, error: null })
+    enqueue({
+      data: { accounting_method: 'accrual', entity_type: 'aktiebolag', bankgiro: '123-4567' },
+      error: null,
+    })
+    enqueue({ data: [{ id: 'fp-1' }], error: null }) // fiscal_periods pre-flight
+    enqueue({ data: null, error: null }) // status flip to sent
+    enqueue({ data: [{ id: 'invoice-1' }], error: null }) // rollback to draft
+    enqueue({ data: null, error: null }) // dispatcher rejected update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'mark_invoice_sent', params: { invoice_id: 'invoice-1' } }),
+    )
+
+    expect(bookSpy).toHaveBeenCalledTimes(1)
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(result.code).toBe('INVOICE_MARK_SENT_BOOK_FAILED')
+    expect(findCalls('invoices', 'update')).toContainEqual([
+      { status: 'draft', updated_at: '2026-09-01T08:00:00.000Z' },
+    ])
+    // The immutable delivery row must not outlive the rollback to draft.
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    bookSpy.mockRestore()
+  })
+
+  it('mark_invoice_sent restores the draft without recording delivery when booking throws', async () => {
+    const invoiceEntries = await import('@/lib/bookkeeping/invoice-entries')
+    const bookSpy = vi
+      .spyOn(invoiceEntries, 'createInvoiceJournalEntry')
+      .mockRejectedValueOnce(new Error('exchange rate missing'))
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: makeInvoice({
+        id: 'invoice-1',
+        status: 'draft',
+        invoice_number: 'F-2026001',
+        credited_invoice_id: null,
+      }),
+      error: null,
+    })
+    enqueue({
+      data: { accounting_method: 'accrual', entity_type: 'aktiebolag', bankgiro: '123-4567' },
+      error: null,
+    })
+    enqueue({ data: [{ id: 'fp-1' }], error: null }) // fiscal_periods pre-flight
+    enqueue({ data: null, error: null }) // status flip to sent
+    enqueue({ data: [{ id: 'invoice-1' }], error: null }) // rollback to draft
+    enqueue({ data: null, error: null }) // dispatcher rejected update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'mark_invoice_sent', params: { invoice_id: 'invoice-1' } }),
+    )
+
+    expect(bookSpy).toHaveBeenCalledTimes(1)
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(result.code).toBe('INVOICE_MARK_SENT_BOOK_FAILED')
+    expect(findCalls('invoices', 'update')).toContainEqual([
+      expect.objectContaining({ status: 'draft' }),
+    ])
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    bookSpy.mockRestore()
+  })
+
+  it('mark_invoice_sent reports a distinct error when the rollback matches no row', async () => {
+    const invoiceEntries = await import('@/lib/bookkeeping/invoice-entries')
+    const bookSpy = vi.spyOn(invoiceEntries, 'createInvoiceJournalEntry').mockResolvedValueOnce(null)
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: makeInvoice({
+        id: 'invoice-1',
+        status: 'draft',
+        invoice_number: 'F-2026001',
+        credited_invoice_id: null,
+      }),
+      error: null,
+    })
+    enqueue({
+      data: { accounting_method: 'accrual', entity_type: 'aktiebolag', bankgiro: '123-4567' },
+      error: null,
+    })
+    enqueue({ data: [{ id: 'fp-1' }], error: null }) // fiscal_periods pre-flight
+    enqueue({ data: null, error: null }) // status flip to sent
+    enqueue({ data: [], error: null }) // rollback matched 0 rows
+    enqueue({ data: null, error: null }) // dispatcher update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'mark_invoice_sent', params: { invoice_id: 'invoice-1' } }),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(500)
+    expect(result.code).toBe('INVOICE_MARK_SENT_ROLLBACK_FAILED')
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    bookSpy.mockRestore()
+  })
+
+  it('send_invoice fails before delivery reservation and number allocation when no open period covers invoice_date', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({
+      data: makeInvoice({
+        id: 'invoice-1',
+        status: 'draft',
+        invoice_number: null,
+        invoice_date: '2026-09-10',
+        customer: makeCustomer({ id: 'customer-1', email: 'customer@example.test' }),
+        items: [],
+      }),
+      error: null,
+    })
+    enqueue({
+      data: { company_name: 'Test AB', accounting_method: 'accrual', bankgiro: '123-4567' },
+      error: null,
+    })
+    enqueue({ data: [], error: null }) // fiscal_periods: none open
+    enqueue({ data: null, error: null }) // dispatcher rejected update
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'send_invoice', params: { invoice_id: 'invoice-1' } }),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(result.code).toBe('INVOICE_SEND_NO_FISCAL_PERIOD')
+    expect(supabase.from).toHaveBeenCalledWith('fiscal_periods')
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(ensureInvoiceNumber).not.toHaveBeenCalled()
+  })
+})
+
 // ─── post_annual_depreciation ───────────────────────────────────────
 
 describe('commitPendingOperation: post_annual_depreciation', () => {

@@ -10,22 +10,44 @@
  * :send pipeline (PDF + email) will land in PR-B-2b-3.
  *
  * What happens on commit:
+ *   0. Pre-flight (backoffice#94): if the company books at issue
+ *      (faktureringsmetoden without defer_invoice_booking) AND
+ *      document_type='invoice', an open fiscal period must cover
+ *      invoice_date BEFORE anything below happens. No open period → 400
+ *      INVOICE_MARK_SENT_NO_FISCAL_PERIOD, and NOTHING is allocated or
+ *      flipped: no F-series number consumed, no gap, no draft-turned-sent
+ *      to unwind. This also runs on dry-run, so a preview that could not
+ *      actually commit does not report success.
  *   1. F-series invoice_number is allocated atomically via the
  *      generate_invoice_number Postgres RPC (ML 17 kap 24§ p.2: only
  *      issued invoices consume numbers; this is where the F-series
  *      number gets assigned, NOT at draft-create per PR-B-2a's design).
  *   2. Invoice status flips to 'sent'.
- *   3. If the company books at issue (faktureringsmetoden without
- *      defer_invoice_booking) AND document_type='invoice', a
- *      journal entry is posted via createInvoiceJournalEntry (Debit AR
- *      1510, Credit revenue 3xxx, Credit output VAT 2611/2621/2631).
- *      Under kontantmetoden ('cash') no journal entry is created here:
- *      booking happens at payment time.
+ *   3. If step 0 applies, a journal entry is posted via
+ *      createInvoiceJournalEntry (Debit AR 1510, Credit revenue 3xxx,
+ *      Credit output VAT 2611/2621/2631). Under kontantmetoden ('cash')
+ *      no journal entry is created here: booking happens at payment time.
+ *      The fiscal period was already confirmed open in step 0, so this
+ *      should not fail on that ground again; if it still does (a period
+ *      closed in the race window between step 0 and here) or throws for
+ *      any other reason (e.g. a missing exchange rate), steps 1-2 are
+ *      rolled back to 'draft' and the request returns a 4xx instead of a
+ *      200 with a warning. If the rollback itself fails, the response is
+ *      500 INVOICE_MARK_SENT_ROLLBACK_FAILED rather than claiming the
+ *      invoice is still a draft when it is actually left 'sent' with no
+ *      journal entry: that state needs manual reconciliation. An invoice
+ *      can never end up 'sent' with no journal entry AND a 2xx/4xx
+ *      response that says otherwise.
  *   4. invoice.sent event is emitted.
  *
- * Idempotent (mandatory Idempotency-Key). Dry-run shows the would-be
- * post-send state without allocating a number, posting a journal entry,
- * or emitting events.
+ * Idempotent (mandatory Idempotency-Key). A 4xx response is cached under
+ * that key for 24h (see with-api-v1.ts): after fixing the underlying
+ * problem (e.g. creating the fiscal period), retry with a NEW
+ * Idempotency-Key, not the same one.
+ *
+ * Dry-run shows the would-be post-send state without allocating a number,
+ * posting a journal entry, or emitting events; it also runs the step 0
+ * fiscal-period pre-flight, so a dry-run can fail too.
  *
  * Known residual race window: the F-series number is allocated via the
  * generate_invoice_number RPC BEFORE the status-flip UPDATE. If a
@@ -47,6 +69,7 @@ import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { hasOpenPeriodForIssueBooking } from '@/lib/invoices/issue-booking-preflight'
 import { recordManualInvoiceDelivery } from '@/lib/invoices/invoice-deliveries'
 import {
   hasRequiredInvoicePaymentAccount,
@@ -93,7 +116,9 @@ registerEndpoint({
     'Only invoices in `status=draft` can be marked sent. Other states return 409 INVOICE_UPDATE_NOT_DRAFT (re-used; the action is structurally an update).',
     'Allocation is atomic. If a concurrent transition beats the agent\'s request to the same draft, the runner-up gets 409 INVOICE_UPDATE_NOT_DRAFT and no number is consumed.',
     'Delivery notes (document_type=delivery_note) don\'t transition to sent: they were never drafts in the f-series sense. This endpoint will reject them with 400 VALIDATION_ERROR.',
-    'Idempotency-Key is mandatory. A retried mark-sent with the same key replays the cached response.',
+    'Idempotency-Key is mandatory. A retried mark-sent with the same key replays the cached response, INCLUDING a cached error: after fixing the problem that caused a 4xx, retry with a NEW Idempotency-Key, not the same one.',
+    'When the company books at issue and no open fiscal period covers invoice_date, the request fails with 400 INVOICE_MARK_SENT_NO_FISCAL_PERIOD before anything is allocated or changed: the invoice stays a draft and no F-series number is consumed. Create the fiscal period, then retry with a new Idempotency-Key.',
+    'A 500 INVOICE_MARK_SENT_ROLLBACK_FAILED means booking failed after the number/status were already committed AND the automatic rollback to draft also failed: the invoice may be left sent with no journal entry. This needs manual reconciliation; do not retry blindly.',
   ],
   example: {
     response: {
@@ -261,6 +286,29 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // WITHOUT booking (same gate as the dashboard, issue-and-book-invoice.ts).
     const wouldCreateJournalEntry = isRealInvoice && booksInvoicesOnIssue(companySettings)
 
+    // Pre-flight (backoffice#94): when booking would be attempted, confirm an
+    // open fiscal period covers invoice_date BEFORE allocating the F-series
+    // number or flipping status, on both the commit and dry-run paths. This
+    // is the fix the issue asked for: checking after allocation (the
+    // original bug) means the invoice can go out unbooked before anyone
+    // notices, and needs number/status rolled back on failure; checking
+    // first means neither is ever touched, so there is nothing to roll back
+    // or gap for this failure mode.
+    // Same shared gate as every other issuing path (issue-booking-preflight.ts).
+    if (wouldCreateJournalEntry) {
+      if (!(await hasOpenPeriodForIssueBooking(ctx.supabase, ctx.companyId!, typed, companySettings))) {
+        ctx.log.warn('invoices.mark-sent: no open fiscal period covers invoice_date', {
+          invoiceId,
+          companyId: ctx.companyId,
+          invoiceDate: typed.invoice_date,
+        })
+        return v1ErrorResponseFromCode('INVOICE_MARK_SENT_NO_FISCAL_PERIOD', ctx.log, {
+          requestId: ctx.requestId,
+          details: { invoice_date: typed.invoice_date },
+        })
+      }
+    }
+
     if (ctx.dryRun) {
       // Preview the post-send state. invoice_number can't be predicted
       // exactly (atomic sequence allocation); show a marker so the agent
@@ -327,18 +375,51 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
-    // Collect partial-state signals to surface on the response. BFL 5 kap
-    // requires every affärshändelse to have a verifikation; if the
-    // journal-entry creation fails after the status flip, the response
-    // must surface this so the agent (or the dashboard, or a monitoring
-    // sink) can reconcile rather than silently treating the invoice as
-    // fully posted.
+    // Collect partial-state signals to surface on the response. These cover
+    // steps whose failure leaves the invoice validly 'sent' but with some
+    // secondary bookkeeping unreconciled; they are not used for the journal
+    // entry itself (see Step 3 below, which fails closed instead).
     const warnings: { code: string; message: string }[] = []
 
-    // Step 3: journal entry for real invoices when the company books at issue. Failure escalates
-    // to error-level log AND surfaces in the response as a warning.
+    // Step 3: journal entry for real invoices when the company books at
+    // issue. The fiscal-period pre-flight above already confirmed an open
+    // period covers invoice_date, so createInvoiceJournalEntry returning
+    // null here should be rare (only a race: the period closed between the
+    // pre-flight and this call). BFL 5 kap 5 § requires every
+    // affärshändelse to have a verifikation, so any failure here (that race,
+    // or an unrelated throw such as a missing exchange rate) must not leave
+    // the invoice 'sent': roll the status (and the race guard's implicit
+    // consumption) back to 'draft' and report a 4xx instead of a silent 200
+    // + warning (backoffice#94). The invoice_number allocated in Step 1 is
+    // left in place: ensureInvoiceNumber is idempotent, so a retry reuses it
+    // rather than opening a gap in the F-series (ML 17 kap 24§ p.2).
     let journalEntryId: string | null = null
     if (wouldCreateJournalEntry) {
+      // Returns whether the invoice was actually restored to 'draft'. A
+      // failed or zero-row rollback leaves the invoice 'sent' with no
+      // journal entry: exactly the state backoffice#94 exists to prevent,
+      // so the caller must get a distinct error rather than the reassuring
+      // (and here false) "invoice remains a draft" message.
+      const rollbackToDraft = async (): Promise<boolean> => {
+        const { data: rolledBack, error: rollbackErr } = await ctx.supabase
+          .from('invoices')
+          .update({ status: 'draft', updated_at: typed.updated_at })
+          .eq('id', invoiceId)
+          .eq('company_id', ctx.companyId!)
+          .eq('status', 'sent')
+          .is('journal_entry_id', null)
+          .select('id')
+        if (rollbackErr || !rolledBack || rolledBack.length === 0) {
+          ctx.log.error(
+            'mark-sent: rollback to draft after journal entry failure failed; invoice left sent with no journal entry',
+            (rollbackErr ?? new Error('0 rows matched')) as Error,
+            { invoiceId, companyId: ctx.companyId },
+          )
+          return false
+        }
+        return true
+      }
+
       try {
         // Pass the just-updated invoice (carries the new invoice_number).
         const refreshedInvoice = { ...typed, ...(updated as object), customer: typed.customer } as Invoice & { customer?: { name?: string } }
@@ -373,14 +454,23 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
             })
           }
         } else {
-          // null result = no fiscal period or other engine-side guard.
-          ctx.log.error('mark-sent: journal entry not created (engine returned null)', new Error('null entry'), {
+          // null result = no open fiscal period covers invoice_date. The
+          // pre-flight check above already confirmed one existed, so this
+          // means the period closed in the narrow race window since then.
+          ctx.log.error('mark-sent: journal entry not created (no open fiscal period)', new Error('null entry'), {
             invoiceId,
             companyId: ctx.companyId,
           })
-          warnings.push({
-            code: 'JOURNAL_ENTRY_NOT_POSTED',
-            message: 'Invoice was marked sent but no journal entry was posted. Check fiscal period, then issue a credit note and reissue if the missing verifikation is required (BFL 5 kap).',
+          const rolledBack = await rollbackToDraft()
+          if (!rolledBack) {
+            return v1ErrorResponseFromCode('INVOICE_MARK_SENT_ROLLBACK_FAILED', ctx.log, {
+              requestId: ctx.requestId,
+              details: { invoice_date: typed.invoice_date },
+            })
+          }
+          return v1ErrorResponseFromCode('INVOICE_MARK_SENT_NO_FISCAL_PERIOD', ctx.log, {
+            requestId: ctx.requestId,
+            details: { invoice_date: typed.invoice_date },
           })
         }
       } catch (err) {
@@ -388,10 +478,13 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           invoiceId,
           companyId: ctx.companyId,
         })
-        warnings.push({
-          code: 'JOURNAL_ENTRY_NOT_POSTED',
-          message: 'Invoice was marked sent but the journal entry posting failed. Check fiscal period and engine logs; the verifikation must be created for BFL 5 kap compliance.',
-        })
+        const rolledBack = await rollbackToDraft()
+        if (!rolledBack) {
+          return v1ErrorResponseFromCode('INVOICE_MARK_SENT_ROLLBACK_FAILED', ctx.log, {
+            requestId: ctx.requestId,
+          })
+        }
+        return v1ErrorResponse(err, ctx.log, { requestId: ctx.requestId })
       }
     }
 

@@ -402,6 +402,7 @@ describe('executeRecurringSchedule auto-send', () => {
     enqueue({ data: null, error: null }) // invoice_items insert
     enqueue({ data: makeCompleteInvoice(), error: null }) // re-fetch with relations
     enqueue({ data: company, error: null }) // company_settings (auto-send)
+    enqueue({ data: [{ id: 'fp-1' }], error: null }) // fiscal-period pre-flight
     enqueue({ data: null, error: null }) // status flip to sent
     enqueue({ data: null, error: null }) // journal_entry_id write-back
   }
@@ -549,6 +550,59 @@ describe('executeRecurringSchedule auto-send', () => {
     expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
     expect(mockRenderToBuffer).not.toHaveBeenCalled()
     expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
+  // backoffice#94: an auto-sent invoice must never go out unbooked.
+  it('does not auto-send when no open fiscal period covers invoice_date', async () => {
+    enqueue({ data: customer, error: null })
+    enqueue({ data: { vat_registered: true }, error: null }) // company_settings VAT gate
+    enqueue({ data: makeInsertedInvoice(), error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompleteInvoice(), error: null })
+    enqueue({ data: company, error: null }) // company_settings (auto-send)
+    enqueue({ data: [], error: null }) // fiscal-period pre-flight: none open
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toContain('Auto-utskick misslyckades')
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockCreateJE).not.toHaveBeenCalled()
+    expect(supabase.from).toHaveBeenCalledWith('fiscal_periods')
+  })
+
+  it('auto-sends a kontantmetod invoice without a fiscal-period check or booking', async () => {
+    enqueue({ data: customer, error: null })
+    enqueue({ data: { vat_registered: true }, error: null }) // company_settings VAT gate
+    enqueue({ data: makeInsertedInvoice(), error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompleteInvoice(), error: null })
+    enqueue({ data: { ...company, accounting_method: 'cash' }, error: null }) // company_settings (auto-send)
+    enqueue({ data: null, error: null }) // status flip to sent
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(true)
+    expect(supabase.from).not.toHaveBeenCalledWith('fiscal_periods')
+    expect(mockCreateJE).not.toHaveBeenCalled()
+  })
+
+  it('does not book at send when the company defers invoice booking (#967)', async () => {
+    enqueue({ data: customer, error: null })
+    enqueue({ data: { vat_registered: true }, error: null }) // company_settings VAT gate
+    enqueue({ data: makeInsertedInvoice(), error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompleteInvoice(), error: null })
+    enqueue({ data: { ...company, defer_invoice_booking: true }, error: null }) // company_settings (auto-send)
+    enqueue({ data: null, error: null }) // status flip to sent
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(true)
+    expect(supabase.from).not.toHaveBeenCalledWith('fiscal_periods')
+    expect(mockCreateJE).not.toHaveBeenCalled()
   })
 
   it('never auto-sends from a sandbox company; invoice stays a numbered draft', async () => {

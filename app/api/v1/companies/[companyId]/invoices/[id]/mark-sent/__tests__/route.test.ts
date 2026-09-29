@@ -66,6 +66,10 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
+  // Records every .update() payload per table, in call order, so tests can
+  // assert the rollback-to-draft update actually ran (and what it sent)
+  // instead of only checking the response.
+  const updates: Record<string, unknown[]> = {}
   const buildChain = (table: string): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
@@ -76,12 +80,17 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
             resolve(next)
           }
         }
-        return (..._args: unknown[]) => buildChain(table)
+        return (...args: unknown[]) => {
+          if (prop === 'update') {
+            ;(updates[table] ??= []).push(args[0])
+          }
+          return buildChain(table)
+        }
       },
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)) }
+  return { from: vi.fn((table: string) => buildChain(table)), updates }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -109,6 +118,7 @@ const DRAFT_INVOICE = {
   customer_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
   invoice_date: '2026-05-12',
   due_date: '2026-06-11',
+  updated_at: '2026-05-10T08:00:00.000Z',
   status: 'draft',
   document_type: 'invoice',
   currency: 'SEK',
@@ -151,6 +161,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
           data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
           error: null,
         },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -356,21 +367,100 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(body.error.details.field).toBe('moms_ruta')
   })
 
-  it('surfaces a warning in the response when journal entry creation fails', async () => {
-    mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        invoices: [
-          { data: DRAFT_INVOICE, error: null },
-          { data: SENT_INVOICE, error: null },
-        ],
-        company_settings: {
-          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
-          error: null,
-        },
-      }),
+  it('backoffice#94: blocks BEFORE allocating a number when no fiscal period covers the invoice date', async () => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: { data: DRAFT_INVOICE, error: null }, // pre-flight fetch only
+      company_settings: {
+        data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+        error: null,
+      },
+      // findFiscalPeriod: no open period covers invoice_date.
+      fiscal_periods: { data: [], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
     )
-    // Force the journal-entry generator to throw.
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_MARK_SENT_NO_FISCAL_PERIOD')
+    // No silent 200: the invoice was never left 'sent' without a verifikat,
+    // and the response carries no "warnings" success shape at all.
+    expect(body.data).toBeUndefined()
+    // Blocked before ANY allocation or mutation: no number, no status flip,
+    // no delivery history. Nothing to roll back, nothing to gap.
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(supabase.updates.invoices ?? []).toHaveLength(0)
+  })
+
+  it('backoffice#94: rolls back to draft when the fiscal period closes in the race window after the pre-flight check', async () => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null }, // pre-flight fetch
+        { data: SENT_INVOICE, error: null }, // status flip to 'sent'
+        { data: [{ id: INVOICE_ID }], error: null }, // rollback update succeeds
+      ],
+      company_settings: {
+        data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+        error: null,
+      },
+      fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    // The pre-flight check passed, but the engine still returns null (never
+    // throws) for "no open fiscal period": the only way to reach this now is
+    // the period closing in the narrow window between the two checks.
+    mockCreateJournalEntry.mockResolvedValueOnce(null)
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_MARK_SENT_NO_FISCAL_PERIOD')
+    expect(body.data).toBeUndefined()
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    // The rollback update actually ran (not just asserted via the response):
+    // it restores status to 'draft' and the pre-mutation updated_at, guarded
+    // by status='sent' AND journal_entry_id IS NULL (enforced via the mock's
+    // .eq/.is chain, verified here by asserting the update payload itself).
+    expect(supabase.updates.invoices).toHaveLength(2)
+    expect(supabase.updates.invoices[1]).toEqual({
+      status: 'draft',
+      updated_at: DRAFT_INVOICE.updated_at,
+    })
+  })
+
+  it('backoffice#94: fails closed with the underlying error when journal entry creation throws', async () => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null },
+        { data: SENT_INVOICE, error: null },
+        { data: [{ id: INVOICE_ID }], error: null }, // rollback update succeeds
+      ],
+      company_settings: {
+        data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+        error: null,
+      },
+      fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    // A thrown error (e.g. period locked) is a different failure mode than
+    // the null "no fiscal period" return, but must fail closed the same way.
     mockCreateJournalEntry.mockRejectedValueOnce(new Error('Period closed'))
 
     const res = await markSent(
@@ -380,14 +470,48 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
       detailParams(COMPANY_ID, INVOICE_ID),
     )
 
-    expect(res.status).toBe(200)
+    expect(res.status).not.toBe(200)
     const body = await res.json()
-    // Status STILL flips to sent.
-    expect(body.data.status).toBe('sent')
-    expect(body.data.journal_entry_id).toBeNull()
-    // But the caller is warned.
-    expect(body.data.warnings).toBeDefined()
-    expect(body.data.warnings[0].code).toBe('JOURNAL_ENTRY_NOT_POSTED')
+    expect(body.data).toBeUndefined()
+    expect(body.error).toBeDefined()
+    expect(body.error.code).not.toBe('INVOICE_MARK_SENT_ROLLBACK_FAILED')
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
+    expect(supabase.updates.invoices[1]).toEqual({
+      status: 'draft',
+      updated_at: DRAFT_INVOICE.updated_at,
+    })
+  })
+
+  it('backoffice#94: returns 500 INVOICE_MARK_SENT_ROLLBACK_FAILED when the compensating rollback also fails', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: DRAFT_INVOICE, error: null },
+          { data: SENT_INVOICE, error: null },
+          { data: [], error: null }, // rollback update matches 0 rows: the invoice
+          // is left 'sent' with no journal entry, exactly what backoffice#94 bars.
+        ],
+        company_settings: {
+          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
+      }),
+    )
+    mockCreateJournalEntry.mockRejectedValueOnce(new Error('Period closed'))
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_MARK_SENT_ROLLBACK_FAILED')
+    expect(mockRecordManualInvoiceDelivery).not.toHaveBeenCalled()
   })
 
   it('returns 404 when the invoice does not belong to the company', async () => {
@@ -439,6 +563,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
           data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
           error: null,
         },
+        fiscal_periods: { data: [{ id: 'fp-1' }], error: null },
       }),
     )
 
@@ -458,6 +583,34 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(body.data.preview.accounting_method).toBe('accrual')
     // No mutation calls.
     expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('backoffice#94: dry-run also fails when no fiscal period covers the invoice date', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: {
+          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
+        fiscal_periods: { data: [], error: null },
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent?dry_run=true`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    // A dry-run that could not actually commit must not report success:
+    // the pre-flight check runs on both paths.
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_MARK_SENT_NO_FISCAL_PERIOD')
+    expect(body.data).toBeUndefined()
   })
 
   it('does NOT create a journal entry when accounting_method=cash', async () => {

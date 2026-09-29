@@ -139,7 +139,7 @@ Response carries the allocated invoice number and the id of the posted journal e
 }
 \`\`\`
 
-If any post-email step degraded, \`data.warnings\` is present (e.g. \`JOURNAL_ENTRY_NOT_POSTED\`); the invoice is marked \`sent\` regardless.
+If the company books at issue and no open fiscal period covers \`invoice_date\`, the request fails with 400 \`INVOICE_SEND_NO_FISCAL_PERIOD\` before any email is sent or number allocated: create the fiscal year, then retry with a new \`Idempotency-Key\`. If a post-email step degraded, \`data.warnings\` is present and the invoice is marked \`sent\` regardless; \`JOURNAL_ENTRY_NOT_POSTED\` there only occurs if the fiscal period closed between that check and the booking, and the invoice must then be booked manually.
 
 ## 5. Mark it paid
 

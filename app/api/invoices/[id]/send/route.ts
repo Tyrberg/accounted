@@ -17,6 +17,7 @@ import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { createSchedulesForCustomerInvoice } from '@/lib/bookkeeping/accruals/from-invoices'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { hasOpenPeriodForIssueBooking } from '@/lib/invoices/issue-booking-preflight'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
   issueCreditNote,
@@ -207,6 +208,28 @@ export const POST = withRouteContext(
 
     if (!hasRequiredSellerVatNumber(company as CompanySettings, invoice as Invoice)) {
       return errorResponseFromCode('INVOICE_SEND_VAT_NUMBER_MISSING', opLog, { requestId })
+    }
+
+    const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
+
+    // Fiscal-period pre-flight (backoffice#94): once the email is delivered
+    // nothing can be undone, so when this send will book the invoice, an
+    // open period must cover invoice_date BEFORE the preflight render, the
+    // delivery reservation, the F-series allocation and the email. Otherwise
+    // createInvoiceJournalEntry returns null after the fact and the invoice
+    // goes out 'sent' without a verifikat. Credit notes are exempt: they
+    // book through issueCreditNote before delivery and abort on failure.
+    if (
+      !isCreditNote
+      && !(await hasOpenPeriodForIssueBooking(supabase, companyId!, invoice, company as CompanySettings))
+    ) {
+      opLog.warn('send: no open fiscal period covers invoice_date', {
+        invoiceDate: invoice.invoice_date,
+      })
+      return errorResponseFromCode('INVOICE_SEND_NO_FISCAL_PERIOD', opLog, {
+        requestId,
+        details: { invoice_date: invoice.invoice_date },
+      })
     }
 
     const hasAdditionalRecipients =
@@ -576,7 +599,6 @@ export const POST = withRouteContext(
       }
     }
 
-    const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
     let createdJournalEntryId: string | undefined = creditJournalEntryId ?? undefined
 
     // #967: deferred companies send WITHOUT booking; ekonomi books later via
@@ -647,6 +669,14 @@ export const POST = withRouteContext(
               })
             }
           }
+        } else {
+          // Only reachable if the period closed between the pre-flight check
+          // and here: the email is out, so surface it instead of staying silent.
+          opLog.error('invoice sent but journal entry was not posted (no open fiscal period)', new Error('JOURNAL_ENTRY_NOT_POSTED'))
+          partialFailures.push({
+            step: 'journal_entry',
+            reason: 'Fakturans verifikat kunde inte skapas.',
+          })
         }
       } catch (err) {
         opLog.error('failed to create invoice journal entry on send', err as Error)

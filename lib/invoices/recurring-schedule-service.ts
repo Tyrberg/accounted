@@ -20,8 +20,10 @@ import { eventBus } from '@/lib/events'
 import { getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { hasOpenPeriodForIssueBooking } from '@/lib/invoices/issue-booking-preflight'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
+import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
 import {
@@ -613,6 +615,18 @@ async function sendInvoiceFromSchedule(
     })
     return false
   }
+  // Fiscal-period pre-flight (backoffice#94): the email cannot be recalled,
+  // so an invoice that books at issue is never auto-sent without an open
+  // period to book it in. It stays a numbered draft with the manual-send
+  // warning, like the other guards above.
+  const bookedAtIssue = booksInvoicesOnIssue(company)
+  if (!(await hasOpenPeriodForIssueBooking(supabase, companyId, invoice, company))) {
+    log.warn('no open fiscal period covers invoice_date; recurring schedule cannot auto-send', {
+      invoiceId: invoice.id,
+      invoiceDate: invoice.invoice_date,
+    })
+    return false
+  }
   let deliveryId: string
   try {
     deliveryId = await reserveInvoiceDelivery({
@@ -738,9 +752,9 @@ async function sendInvoiceFromSchedule(
     .eq('id', invoice.id)
     .eq('company_id', companyId)
 
-  const accountingMethod = (company as { accounting_method?: string }).accounting_method
+  // Same gate as the pre-flight above and every other issuing path.
   let journalEntryId: string | undefined
-  if (!accountingMethod || accountingMethod === 'accrual') {
+  if (bookedAtIssue) {
     try {
       const journalEntry = await createInvoiceJournalEntry(
         supabase,
@@ -755,6 +769,12 @@ async function sendInvoiceFromSchedule(
           .from('invoices')
           .update({ journal_entry_id: journalEntry.id })
           .eq('id', invoice.id)
+      } else {
+        // Only reachable if the period closed after the pre-flight above.
+        log.error('recurring invoice sent but journal entry not posted (no open fiscal period)', new Error('JOURNAL_ENTRY_NOT_POSTED'), {
+          invoiceId: invoice.id,
+          invoiceDate: invoice.invoice_date,
+        })
       }
     } catch (err) {
       log.error('failed to create journal entry for recurring invoice', err as Error, {

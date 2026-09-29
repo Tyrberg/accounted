@@ -115,6 +115,14 @@ vi.mock('@/lib/bookkeeping/invoice-entries', () => ({
     mockCreateInvoiceJournalEntry(...args),
 }))
 
+// Fiscal-period pre-flight (backoffice#94): kept out of the queued-mock
+// sequence; each test decides whether an open period covers invoice_date.
+const mockFindFiscalPeriod = vi.fn()
+vi.mock('@/lib/bookkeeping/engine', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/bookkeeping/engine')>()),
+  findFiscalPeriod: (...args: unknown[]) => mockFindFiscalPeriod(...args),
+}))
+
 const mockIssueCreditNote = vi.fn()
 vi.mock('@/lib/invoices/issue-credit-note', () => ({
   issueCreditNote: (...args: unknown[]) => mockIssueCreditNote(...args),
@@ -173,6 +181,7 @@ describe('POST /api/invoices/[id]/send', () => {
     mockIsConfigured.mockReturnValue(true)
     mockRenderToBuffer.mockResolvedValue(Buffer.from('fake-pdf'))
     mockCreateSchedules.mockResolvedValue({ created: 0, failed: 0 })
+    mockFindFiscalPeriod.mockResolvedValue('fp-1')
     mockIssueCreditNote.mockResolvedValue({
       complete: true,
       journalEntryId: 'credit-je-1',
@@ -738,6 +747,77 @@ describe('POST /api/invoices/[id]/send', () => {
     expect(status).toBe(200)
     expect(body.success).toBe(true)
     expect(mockCreateInvoiceJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('backoffice#94: blocks BEFORE the preflight render, allocation, or email when no open fiscal period covers the invoice date', async () => {
+    const draftWithoutNumber = makeInvoice({
+      id: 'inv-1',
+      status: 'draft',
+      invoice_number: null,
+      invoice_date: '2026-09-10',
+      customer,
+      items: invoice.items,
+    })
+    enqueue({ data: draftWithoutNumber, error: null })
+    enqueue({ data: company, error: null })
+    mockFindFiscalPeriod.mockResolvedValue(null)
+
+    const request = createMockRequest('/api/invoices/inv-1/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { invoice_date?: string } }
+    }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('INVOICE_SEND_NO_FISCAL_PERIOD')
+    expect(body.error.details?.invoice_date).toBe('2026-09-10')
+    expect(mockFindFiscalPeriod).toHaveBeenCalledWith(expect.anything(), 'company-1', '2026-09-10')
+    // Nothing happened: no render, no reservation, no number, no email,
+    // no status flip, no booking attempt.
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+    expect(mockReserveInvoiceDelivery).not.toHaveBeenCalled()
+    expect(mockSupabase.rpc).not.toHaveBeenCalledWith('generate_invoice_number', expect.anything())
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockCreateInvoiceJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('does not require a fiscal period when the company does not book at issue (cash method)', async () => {
+    const cashCompany = makeCompanySettings({ accounting_method: 'cash', bankgiro: '123-4567' })
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: cashCompany, error: null })
+    mockFindFiscalPeriod.mockResolvedValue(null)
+    mockSendEmail.mockResolvedValue({ success: true, messageId: 'msg-cash' })
+    enqueue({ data: [{ id: 'inv-1' }], error: null })
+
+    const request = createMockRequest('/api/invoices/inv-1/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(mockFindFiscalPeriod).not.toHaveBeenCalled()
+    expect(mockSendEmail).toHaveBeenCalled()
+  })
+
+  it('surfaces a journal_entry partial failure when no entry is posted after the email left (period closed in the race window)', async () => {
+    enqueue({ data: invoice, error: null })
+    enqueue({ data: company, error: null })
+    mockSendEmail.mockResolvedValue({ success: true, messageId: 'msg-race-period' })
+    // Pre-flight passed, but the period closed before booking.
+    mockCreateInvoiceJournalEntry.mockResolvedValue(null)
+    enqueue({ data: [{ id: 'inv-1' }], error: null })
+
+    const request = createMockRequest('/api/invoices/inv-1/send', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'inv-1' }))
+    const { status, body } = await parseJsonResponse<{
+      success: boolean
+      partial?: boolean
+      partial_failures?: Array<{ step: string }>
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.partial).toBe(true)
+    expect(body.partial_failures?.some((f) => f.step === 'journal_entry')).toBe(true)
+    expect(mockLinkToJournalEntry).not.toHaveBeenCalled()
   })
 
   it('does not fail when journal entry creation fails (non-blocking)', async () => {

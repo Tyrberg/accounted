@@ -1094,10 +1094,55 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'Fakturan kunde inte bokföras och ligger kvar som utkast.',
     message_en: 'The invoice could not be posted and remains a draft.',
   },
+  // v1 twin of INVOICE_BOOK_NO_FISCAL_PERIOD / INVOICE_PAID_NO_FISCAL_PERIOD.
+  // The v1 mark-sent route checks findFiscalPeriod() BEFORE allocating the
+  // F-series number or flipping status (backoffice#94): an invoice can
+  // never end up 'sent' without its verifikat through this route, and
+  // nothing needs to be rolled back for this specific failure, since
+  // nothing was allocated yet.
+  INVOICE_MARK_SENT_NO_FISCAL_PERIOD: {
+    httpStatus: 400,
+    message_sv:
+      'Inget öppet räkenskapsår täcker fakturadatumet. Fakturan förblir ett utkast. Skapa räkenskapsåret och försök igen.',
+    message_en:
+      'No open fiscal period covers the invoice date. The invoice remains a draft. Create the fiscal year and retry.',
+    remediation: {
+      description:
+        'Create or open the fiscal period covering invoice_date, then retry with a NEW Idempotency-Key. No F-series number was allocated, so there is nothing to reuse; retrying with the SAME key replays the cached 400 for up to 24h instead of re-attempting the request.',
+    },
+  },
+  // Same check, but on the send routes (v1 :send and the dashboard
+  // /api/invoices/[id]/send), before the PDF is emailed to the customer
+  // (backoffice#94 follow-up): unlike :mark-sent, send cannot roll back once
+  // the email has left, so this must fail BEFORE that point.
+  INVOICE_SEND_NO_FISCAL_PERIOD: {
+    httpStatus: 400,
+    message_sv:
+      'Inget öppet räkenskapsår täcker fakturadatumet. Fakturan skickas inte. Skapa räkenskapsåret och försök igen.',
+    message_en:
+      'No open fiscal period covers the invoice date. The invoice was not sent. Create the fiscal year and retry.',
+    remediation: {
+      description:
+        'Create or open the fiscal period covering invoice_date, then retry. On the v1 API, retry with a NEW Idempotency-Key (the failed response is cached under the original key for up to 24h).',
+    },
+  },
   INVOICE_MARK_SENT_REPAIR_REQUIRED: {
     httpStatus: 500,
     message_sv: 'Verifikatet skapades, men kopplingen till fakturan måste återställas. Kontakta support.',
     message_en: 'The voucher was created, but its invoice link must be repaired. Contact support.',
+  },
+  // Distinct from INVOICE_MARK_SENT_REPAIR_REQUIRED: that code covers a
+  // posted voucher whose link back to the invoice failed to write. This one
+  // covers the rarer case where booking failed AND the compensating
+  // rollback-to-draft update also failed (or matched 0 rows): the invoice is
+  // left 'sent' with no journal entry, which is the exact state backoffice#94
+  // exists to prevent. Requires manual reconciliation.
+  INVOICE_MARK_SENT_ROLLBACK_FAILED: {
+    httpStatus: 500,
+    message_sv:
+      'Fakturans bokföring misslyckades och återställningen till utkast misslyckades också. Fakturan kan stå kvar som skickad utan verifikat. Kontakta support.',
+    message_en:
+      'Booking the invoice failed, and restoring it to draft also failed. The invoice may be left sent with no journal entry. Contact support.',
   },
   INVOICE_BOOK_ALREADY_BOOKED: {
     httpStatus: 400,

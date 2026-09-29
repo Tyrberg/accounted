@@ -16,6 +16,14 @@
  *   4. Cancelled invoices are rejected: sending one would silently
  *      re-activate it (the status flip below has no race guard tightening
  *      `cancelled`). Returns 400 INVOICE_SEND_CANCELLED.
+ *   4b. Fiscal-period pre-flight (backoffice#94): if the company books at
+ *      issue (faktureringsmetoden without defer_invoice_booking) AND
+ *      document_type='invoice', an open fiscal period must cover
+ *      invoice_date. Unlike :mark-sent, :send cannot roll back once the
+ *      email has gone out, so this check runs here, BEFORE the preflight
+ *      PDF render, the F-series allocation, and the email send: nothing
+ *      below has happened yet, so failing here leaves nothing to undo.
+ *      No open period → 400 INVOICE_SEND_NO_FISCAL_PERIOD.
  *   5. Preflight PDF render (with a placeholder F-PREVIEW number) validates
  *      the rendering pipeline BEFORE consuming an F-series number. Fail →
  *      500 INVOICE_SEND_PDF_RENDER_FAILED, no number burned.
@@ -31,12 +39,17 @@
  *      same orphan-window as :mark-sent (architecturally tracked).
  *   9. POINT OF NO RETURN. Steps below are best-effort; failures surface
  *      as `warnings` on the response. Status flip → 'sent', journal entry
- *      (book-at-issue + real invoice), PDF archival via uploadDocument,
- *      invoice.sent event emission.
+ *      (book-at-issue + real invoice; the pre-flight at step 4b means a
+ *      JOURNAL_ENTRY_NOT_POSTED warning here should only ever come from the
+ *      narrow race where the period closed after step 4b), PDF archival via
+ *      uploadDocument, invoice.sent event emission.
  *
- * Idempotent (mandatory Idempotency-Key). Dry-runnable: dry-run goes
- * through steps 1-5 (validation + preflight PDF) without allocating a
- * number, sending email, or mutating state.
+ * Idempotent (mandatory Idempotency-Key). A 4xx response is cached under
+ * that key for 24h (see with-api-v1.ts): retry with a NEW Idempotency-Key
+ * after fixing the underlying problem, not the same one. Dry-runnable:
+ * dry-run goes through steps 1-5 (validation + preflight PDF, including the
+ * 4b fiscal-period check) without allocating a number, sending email, or
+ * mutating state.
  */
 
 import { z } from 'zod'
@@ -61,6 +74,7 @@ import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { hasOpenPeriodForIssueBooking } from '@/lib/invoices/issue-booking-preflight'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
   reserveInvoiceDelivery,
@@ -131,12 +145,13 @@ registerEndpoint({
   doNotUseFor:
     'Re-sending an already-sent invoice (returns 409 INVOICE_UPDATE_NOT_DRAFT). Sending a delivery note (no F-series lifecycle). Sending a credit note (use the :credit endpoint to issue the kreditfaktura; subsequent re-send of the credit note via :mark-sent is the supported path).',
   pitfalls: [
-    'Idempotency-Key is mandatory.',
+    'Idempotency-Key is mandatory. A retried send with the same key replays the cached response, INCLUDING a cached error: after fixing the problem that caused a 4xx, retry with a NEW Idempotency-Key, not the same one.',
     'Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL (or an SMTP relay via EMAIL_PROVIDER=smtp) the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.',
     'Customer must have an email address. 400 INVOICE_SEND_NO_CUSTOMER_EMAIL otherwise.',
     'A cancelled invoice is rejected (400 INVOICE_SEND_CANCELLED): its F-series number is preserved for compliance but the document is not a valid faktura.',
+    'When the company books at issue and no open fiscal period covers invoice_date, the request fails with 400 INVOICE_SEND_NO_FISCAL_PERIOD before any email is sent or number allocated: no invoice ever goes out unbooked through this route. Create the fiscal period, then retry with a new Idempotency-Key.',
     'Email failure before the status flip leaves the F-series number consumed but the invoice in `draft` status. Same orphan window as :mark-sent (architecturally tracked, matches internal route).',
-    'After the email succeeds, journal-entry/archive/event failures become warnings on the response; the invoice IS marked sent regardless.',
+    'After the email succeeds, journal-entry/archive/event failures become warnings on the response; the invoice IS marked sent regardless. A JOURNAL_ENTRY_NOT_POSTED warning here should only occur if the fiscal period closed in the narrow race window after the pre-flight check above.',
     'additional_cc and additional_bcc require the API key user to be an owner or admin of the company.',
     'The deprecated cc response field contains only the first address. Use cc_addresses for the complete CC list.',
     'BCC recipients are retained only in the restricted delivery archive and are omitted from normal and dry-run responses.',
@@ -362,6 +377,34 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       return v1ErrorResponseFromCode('INVOICE_SEND_VAT_NUMBER_MISSING', ctx.log, {
         requestId: ctx.requestId,
       })
+    }
+
+    // isRealInvoice / willCreateJournalEntry gate booking for the rest of
+    // this handler (step 9b below reuses both).
+    const isRealInvoice = !typed.document_type || typed.document_type === 'invoice'
+    const willCreateJournalEntry = isRealInvoice && booksInvoicesOnIssue(settings)
+
+    // Pre-flight (backoffice#94): unlike :mark-sent, :send cannot roll back
+    // once the email has been delivered to the customer, so the fiscal-
+    // period check must run BEFORE any side effect at all: before the
+    // preflight PDF render, before the delivery reservation, before the
+    // F-series number is allocated, and before the email is sent. No open
+    // period covering invoice_date → 400 INVOICE_SEND_NO_FISCAL_PERIOD and
+    // nothing has happened yet: no number consumed, no email sent, the
+    // invoice untouched.
+    // Same shared gate as every other issuing path (issue-booking-preflight.ts).
+    if (willCreateJournalEntry) {
+      if (!(await hasOpenPeriodForIssueBooking(ctx.supabase, ctx.companyId!, typed, settings))) {
+        ctx.log.warn('invoices.send: no open fiscal period covers invoice_date', {
+          invoiceId,
+          companyId: ctx.companyId,
+          invoiceDate: typed.invoice_date,
+        })
+        return v1ErrorResponseFromCode('INVOICE_SEND_NO_FISCAL_PERIOD', ctx.log, {
+          requestId: ctx.requestId,
+          details: { invoice_date: typed.invoice_date },
+        })
+      }
     }
 
     const hasAdditionalRecipients =
@@ -719,10 +762,12 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
 
     // Step 9b: journal entry for real invoices when the company books at
     // issue. Kontantmetoden books at payment; defer_invoice_booking (#967)
-    // books via the explicit Bokför step. Same gate as the dashboard.
+    // books via the explicit Bokför step. Same gate as the dashboard, and
+    // the same gate the fiscal-period pre-flight above already checked: a
+    // null result below should now only happen on the narrow race where the
+    // period closed between the pre-flight and this call.
     let journalEntryId: string | null = null
-    const isRealInvoice = !typed.document_type || typed.document_type === 'invoice'
-    if (isRealInvoice && booksInvoicesOnIssue(settings)) {
+    if (willCreateJournalEntry) {
       try {
         const entry = await createInvoiceJournalEntry(
           ctx.supabase,
@@ -750,9 +795,12 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
             })
           }
         } else {
+          // The fiscal-period pre-flight above already confirmed an open
+          // period; reaching null here means it closed in the race window
+          // since then.
           warnings.push({
             code: 'JOURNAL_ENTRY_NOT_POSTED',
-            message: 'Invoice was sent but the journal entry was not posted (likely no open fiscal period). Reconcile before period close.',
+            message: 'Invoice was sent but the journal entry was not posted (the fiscal period closed after the pre-flight check). Reconcile before period close.',
           })
         }
       } catch (err) {

@@ -149,6 +149,7 @@ import {
   resolveInvoiceEmailRecipients,
 } from '@/lib/invoices/email-recipients'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { hasOpenPeriodForIssueBooking } from '@/lib/invoices/issue-booking-preflight'
 import { convertToInvoice } from '@/lib/invoices/convert-to-invoice'
 import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
 import {
@@ -2916,6 +2917,20 @@ async function commitSendInvoice(
     }
   }
 
+  // Fiscal-period pre-flight (backoffice#94), before the preflight render,
+  // delivery reservation, number allocation and email: a delivered email
+  // cannot be recalled, so an invoice that would book at issue must never
+  // leave without an open period to book it in.
+  if (!(await hasOpenPeriodForIssueBooking(supabase, companyId, invoice as Invoice, company))) {
+    return {
+      error:
+        getErrorEntry('INVOICE_SEND_NO_FISCAL_PERIOD')?.message_sv
+        ?? 'Inget öppet räkenskapsår täcker fakturadatumet. Fakturan skickas inte.',
+      errorCode: 'INVOICE_SEND_NO_FISCAL_PERIOD',
+      status: 400,
+    }
+  }
+
   const items = (invoice.items as InvoiceItem[]).sort(
     (a: InvoiceItem, b: InvoiceItem) => a.sort_order - b.sort_order
   )
@@ -3072,6 +3087,7 @@ async function commitSendInvoice(
 
   const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
   let createdJournalEntryId: string | undefined
+  let journalEntryWarning: string | undefined
   // #967: kontantmetoden and defer_invoice_booking companies send WITHOUT
   // booking; the verifikat comes at payment or via the explicit Bokför step.
   if (isRealInvoice && booksInvoicesOnIssue(company)) {
@@ -3082,9 +3098,19 @@ async function commitSendInvoice(
       if (je) {
         createdJournalEntryId = je.id
         await supabase.from('invoices').update({ journal_entry_id: je.id }).eq('id', invoiceId)
+      } else {
+        // Only reachable if the period closed after the pre-flight above: the
+        // email is out, so record and surface it instead of staying silent.
+        log.error('agent send: invoice sent but journal entry not posted (no open fiscal period)', new Error('JOURNAL_ENTRY_NOT_POSTED'), {
+          companyId,
+          invoiceId,
+        })
+        await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'send_invoice', new Error('no open fiscal period'))
+        journalEntryWarning = 'Fakturan skickades men verifikatet kunde inte skapas. Bokför fakturan manuellt.'
       }
     } catch (err) {
       await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'send_invoice', err)
+      journalEntryWarning = 'Fakturan skickades men verifikatet kunde inte skapas. Bokför fakturan manuellt.'
     }
   }
 
@@ -3099,8 +3125,13 @@ async function commitSendInvoice(
   return {
     data: {
       message: `Invoice ${invoice.invoice_number} sent to ${customer.email}`,
-      ...(result.trackingWarning
-        ? { warning: 'Delivery history requires reconciliation.' }
+      journal_entry_id: createdJournalEntryId ?? null,
+      ...(journalEntryWarning || result.trackingWarning
+        ? {
+            warning: [journalEntryWarning, result.trackingWarning ? 'Delivery history requires reconciliation.' : null]
+              .filter(Boolean)
+              .join(' '),
+          }
         : {}),
     },
   }
@@ -3162,6 +3193,19 @@ async function commitMarkInvoiceSent(
     }
   }
 
+  // Fiscal-period pre-flight (backoffice#94), before the F-series number is
+  // allocated or the status flipped: an invoice that books at issue must
+  // never end up 'sent' without its verifikat.
+  if (!(await hasOpenPeriodForIssueBooking(supabase, companyId, invoice as Invoice, settings))) {
+    return {
+      error:
+        getErrorEntry('INVOICE_MARK_SENT_NO_FISCAL_PERIOD')?.message_sv
+        ?? 'Inget öppet räkenskapsår täcker fakturadatumet. Fakturan förblir ett utkast.',
+      errorCode: 'INVOICE_MARK_SENT_NO_FISCAL_PERIOD',
+      status: 400,
+    }
+  }
+
   try {
     await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
   } catch (err) {
@@ -3172,18 +3216,6 @@ async function commitMarkInvoiceSent(
     .from('invoices').update({ status: 'sent' }).eq('id', invoiceId).eq('company_id', companyId)
 
   if (updateError) return { error: 'Failed to update invoice status', status: 500 }
-
-  let deliveryHistoryWarning: string | undefined
-  try {
-    await recordManualInvoiceDelivery({ supabase, companyId, userId, invoiceId })
-  } catch (err) {
-    log.error('failed to persist manual invoice delivery from pending operation', err as Error, {
-      companyId,
-      userId,
-      invoiceId,
-    })
-    deliveryHistoryWarning = 'Fakturan markerades som skickad men utskickshistoriken kunde inte sparas.'
-  }
 
   const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
   let journalEntryId: string | null = null
@@ -3203,6 +3235,57 @@ async function commitMarkInvoiceSent(
     } catch (err) {
       await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'mark_invoice_sent', err)
     }
+
+    // Fail closed like the dashboard (issue-and-book-invoice.ts) and v1
+    // :mark-sent: nothing has left the building, so restore the draft instead
+    // of reporting a 'sent' invoice with no verifikat. The allocated number
+    // stays on the draft; ensureInvoiceNumber reuses it on retry (no gap).
+    if (!journalEntryId) {
+      const { data: rolledBack, error: rollbackError } = await supabase
+        .from('invoices')
+        .update({ status: 'draft', updated_at: invoice.updated_at })
+        .eq('id', invoiceId)
+        .eq('company_id', companyId)
+        .eq('status', 'sent')
+        .is('journal_entry_id', null)
+        .select('id')
+      if (rollbackError || !rolledBack || rolledBack.length === 0) {
+        log.error('agent mark-sent: rollback to draft after booking failure failed', (rollbackError ?? new Error('0 rows matched')) as Error, {
+          companyId,
+          invoiceId,
+        })
+        return {
+          error:
+            getErrorEntry('INVOICE_MARK_SENT_ROLLBACK_FAILED')?.message_sv
+            ?? 'Fakturans bokföring misslyckades och återställningen till utkast misslyckades också.',
+          errorCode: 'INVOICE_MARK_SENT_ROLLBACK_FAILED',
+          status: 500,
+        }
+      }
+      return {
+        error:
+          getErrorEntry('INVOICE_MARK_SENT_BOOK_FAILED')?.message_sv
+          ?? 'Fakturan kunde inte bokföras och ligger kvar som utkast.',
+        errorCode: 'INVOICE_MARK_SENT_BOOK_FAILED',
+        status: 400,
+      }
+    }
+  }
+
+  // Recorded only once the invoice is definitively 'sent' (booked or not
+  // booking at issue), like v1 :mark-sent and issue-and-book-invoice.ts: the
+  // delivery row is immutable, so writing it before a rollback to draft
+  // would leave a stale row per retry.
+  let deliveryHistoryWarning: string | undefined
+  try {
+    await recordManualInvoiceDelivery({ supabase, companyId, userId, invoiceId })
+  } catch (err) {
+    log.error('failed to persist manual invoice delivery from pending operation', err as Error, {
+      companyId,
+      userId,
+      invoiceId,
+    })
+    deliveryHistoryWarning = 'Fakturan markerades som skickad men utskickshistoriken kunde inte sparas.'
   }
 
   return {
