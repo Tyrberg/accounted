@@ -216,6 +216,37 @@ describe('POST /items/:id/convert', () => {
     expect(body.data.inbox_item_id).toBe('item-1')
   })
 
+  it('carries the mailed invoice attachment and due date onto the supplier invoice', async () => {
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({
+      data: makeInvoiceInboxItem({ status: 'received', document_id: 'doc-mail-1', source: 'email' }),
+    })
+    enqueue({ data: makeSupplier({ id: 'supplier-1' }) })
+    enqueue({ data: 42 })
+    enqueue({ data: { id: 'invoice-1', status: 'registered' } })
+    enqueue({ data: null, error: null })
+    enqueue({ data: makeCompanySettings({ accounting_method: 'cash' }) })
+    enqueue({ data: null, error: null })
+
+    const ctx = buildCtx(supabase)
+    const request = createMockRequest('/items/item-1/convert', {
+      method: 'POST',
+      body: VALID_CONVERT_BODY,
+      searchParams: { _id: 'item-1' },
+    })
+    const res = await route.handler(request, ctx)
+    const { status } = await parseJsonResponse(res)
+
+    expect(status).toBe(200)
+    const insertArgs = findCall('supplier_invoices', 'insert')
+    expect(insertArgs?.[0]).toMatchObject({
+      document_id: 'doc-mail-1',
+      due_date: '2024-07-15',
+      status: 'registered',
+      company_id: 'company-1',
+    })
+  })
+
   it('defaults the supplier invoice notes to the rendered WhatsApp channel context', async () => {
     const { supabase, enqueue, findCall } = createQueuedMockSupabase()
     enqueue({
