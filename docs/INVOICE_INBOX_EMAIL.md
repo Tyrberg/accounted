@@ -17,7 +17,7 @@ Tabellerna är tomma i prod idag eftersom ingen har skickat något dit ännu; de
 1. **Domän för inkommande mejl** (förslag: `inbox.bohed.com`, en subdomän som inte används för vanlig mejl). Lägg den i Resend under Domains.
 2. **MX-post** för subdomänen enligt värdet Resend visar (Resend Inbound). Lägg även SPF/DKIM som Resend anger om domänen ska kunna skicka.
 3. **Webhook i Resend:** händelse `email.received`, URL `https://bokforing.bohed.com/api/extensions/ext/invoice-inbox/inbound`. Kopiera signeringshemligheten (`whsec_...`).
-4. **Miljövariabler i Vercel (prod):** `RESEND_API_KEY` (med läsrätt för mottagna mejl), `RESEND_INBOUND_DOMAIN` (t.ex. `inbox.bohed.com`), `RESEND_INBOUND_WEBHOOK_SECRET`.
+4. **Miljövariabler i prod** (prod körs på boxen, bokforing.bohed.com: lägg dem i `/opt/gnubok/app.env` och starta om med `docker compose -f docker-compose.app.yml -p gnubok-app up -d`; inte Vercel): `RESEND_API_KEY` (med läsrätt för mottagna mejl), `RESEND_INBOUND_DOMAIN` (t.ex. `inbox.bohed.com`), `RESEND_INBOUND_WEBHOOK_SECRET`.
 5. **Aktivera extensionen** `invoice-inbox` i `extensions.config.json` om den inte redan är på.
 6. **Driftsättning kräver Mattias OK.** Ingen automatisk deploy görs; ändringar här är enbart dokumentation och test.
 
