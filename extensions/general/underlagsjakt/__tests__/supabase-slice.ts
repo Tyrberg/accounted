@@ -25,7 +25,7 @@ export interface LeveransSupabaseSlice {
    * What the org-number lookup finds. `[]` is the "no such company" path and
    * two rows the ambiguous one, both of which stop a delivery.
    */
-  companyRows: { id: string }[]
+  companyRows: { id: string; name?: string }[]
   /** Non-null makes the company lookup itself fail. */
   companyError: { message: string } | null
   /** The owner `company_members` returns; null is a company with nobody to attribute the write to. */
@@ -46,13 +46,25 @@ export interface LeveransSupabaseSlice {
 
 export function createLeveransSupabaseSlice(): LeveransSupabaseSlice {
   function companiesChain() {
+    let requested: string[] = []
     const chain = {
-      select: () => chain,
+      select: (columns: string) => {
+        requested = columns.split(',').map((c) => c.trim())
+        return chain
+      },
       in: (_column: string, values: unknown[]) => {
         slice.inFilters = values
         return chain
       },
-      is: () => Promise.resolve({ data: slice.companyRows, error: slice.companyError }),
+      // Like PostgREST, hand back only the columns the query asked for, so a
+      // query that drops one (e.g. `name`) is seen by the code under test.
+      is: () =>
+        Promise.resolve({
+          data: slice.companyRows.map((row) =>
+            Object.fromEntries(Object.entries(row).filter(([column]) => requested.includes(column))),
+          ),
+          error: slice.companyError,
+        }),
     }
     return chain
   }
