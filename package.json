@@ -24,6 +24,7 @@
     "validate:registry": "tsx scripts/validate-registry.ts",
     "check:lint": "node scripts/checks/no-new-lint-errors.mjs",
     "check:types": "node scripts/checks/no-new-type-errors.mjs",
+    "check:private-info": "tsx scripts/check-private-info.ts",
     "test": "vitest run --project unit",
     "test:pg": "vitest run --project pg-real",
     "tools:pg:reset": "bash scripts/tool-pg/reset.sh",

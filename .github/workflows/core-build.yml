@@ -29,6 +29,7 @@ jobs:
           # Nothing here pushes, so leaving the token in .git/config only widens
           # what a compromised dependency in the build could reach.
           persist-credentials: false
+          fetch-depth: 0
       - uses: ./.github/actions/setup-core
 
       - name: Verify skill bodies are in sync with the seed migration
@@ -108,6 +109,12 @@ jobs:
             echo "$VIOLATIONS"
             exit 1
           fi
+
+      - name: Check no private information in diff
+        # Scans the PR diff for real personal names, org numbers, IPs, email
+        # addresses to real domains, and other private data patterns. Configured
+        # via .github/private-info-allowlist.txt for false positives.
+        run: npm run check:private-info "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
 
   build:
     name: Build (zero extensions)

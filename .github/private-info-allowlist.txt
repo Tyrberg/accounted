@@ -1,0 +1,4 @@
+# Allowlist for private-info check: false positives that are known to be safe
+# Format: file:value
+# Use when pattern matches generic data (test fixtures, documentation examples)
+# Never add real names, real org numbers, real IPs, or real domains

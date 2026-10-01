@@ -32,6 +32,18 @@ turns out to matter more.
 
 ---
 
+## 0. Public repository: no private information
+
+The fork is public (`github.com/Tyrberg/accounted`). Never commit real personal
+names, company names, Swedish org numbers, personal ID numbers, bank accounts,
+IBAN numbers, internal hostnames, internal IP addresses, or customer data to
+code, comments, tests, fixtures, or documentation. Use fictional examples
+instead (e.g. "Company A", test org numbers, `example.com`). The CI gate
+`npm run check:private-info` validates this on every PR; see
+`.github/private-info-allowlist.txt` for documented false positives.
+
+---
+
 ## 1. The situation
 
 This is not our project. It is `erp-base`, copyright Arcim, licensed
@@ -542,16 +554,16 @@ it cannot be mistaken for done.
 | Set `FORK_SYNC_ALERT_REPO`, authenticate `gh`     | Same                                          |
 | Create the external heartbeat check and set `FORK_SYNC_HEARTBEAT_URL` | Same                  |
 | First real `sync` run against a checkout that has the `upstream` remote | Same. Until then the upstream half of the routine has never executed end to end |
-| Decide q657-1 (pin the image vs take the migrations) | Mattias, per section 3                     |
+| Decide q657-1 (pin the image vs take the migrations) | Operator, per section 3                     |
 | The 611-migration schema jump, if any environment is still on the old schema | Follows from q657-1  |
 | Revoke and remove the GitLab `glpat-` token       | Whoever has GitLab admin, per section 9       |
 | Archive the GitLab project as read-only           | Same                                          |
-| Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Mattias, after this fork is deployed to his instance. Until then no real post has been shown there |
+| Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Operator, after this fork is deployed to the operator's instance. Until then no real post has been shown there |
 | Underlagsjakt automatic delivery: all five switch-on steps in [section 11](#11-switching-on-the-underlagsjakt-delivery), from minting the token to scheduling the standing check. Concretely: `UNDERLAGSJAKT_LEVERANS_TOKEN` + `UNDERLAGSJAKT_LEVERANS_ORGNR` in the Accounted box's `.env`; `GNUBOK_API_URL` + `GNUBOK_API_KEY` in bertil's; `/etc/cron.d/underlagsjakt-leverans` installed on bertil's box; one real export and one real answer carried; then `/etc/cron.d/underlagsjakt-status` plus its own external heartbeat check on the Accounted box | Whoever administers the two boxes. Four of the five steps happen outside this repository, and nothing in a pull request can reach either machine. Until `npx tsx extensions/general/underlagsjakt/leverans-status.ts` exits 0 on the box, the delivery is code that has never run, and the box says so on every run rather than leaving it to this table. Step 5 is what keeps it saying so without anyone remembering to ask |
 | Underlagsjakt: teach the extension bertil's next contract version once bertil#180 (the `reglering` field) is merged; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
-| Underlagsjakt: the upload option in the answer form is OFF (not shown, and `POST /svar/underlag` answers 403) until `UNDERLAGSJAKT_UPLOAD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.5 and the `uppladdat_underlag` svarstyp (spec: docs/underlagsjakt-export-schema.md, "Answers"). Only an answer file that holds an upload is written as 1.5; every other file stays 1.4, so nothing changes for bertil before then. Until it is on, Mattias still has no way to hand over the receipt in the form | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
-| Underlagsjakt: choosing more than one document for a `val_kandidat` answer (e.g. one payment, two people's löneunderlag) is OFF: the form stays single-choice, and a second selection is refused with 403 `FEATURE_DISABLED`, until `UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.6 and the `vald_kandidater` field (spec: docs/underlagsjakt-export-schema.md, "val_kandidat with more than one document"). Only an answer file where a `val_kandidat` beslut actually chose more than one document is written as 1.6; every other file stays 1.4/1.5, so nothing changes for bertil before then. Until it is on, the löneutbetalning case is still forced to a single choice: Mattias picks one of the two löneunderlag and the other stays without a linked document | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
-| Underlagsjakt: the "reglerar en bokförd skuld" answer (task 1482, a payment that settles a debt already booked in a prior verifikat, e.g. a lön payout against 2893) is OFF: the mode is not shown, and `POST /svar` answers 403 `FEATURE_DISABLED` on `reglerar_skuld`, until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.7 and the `reglerar_skuld` svarstyp (spec: docs/underlagsjakt-export-schema.md, "reglerar_skuld"), and books each verifikat's description ending with `(netto via avräkning)`, matching the wording already used in Mattias's own bookkeeping for avräkningskonto payouts. Only an answer file that holds a `reglerar_skuld` beslut is written as 1.7; every other file stays 1.4/1.5/1.6, so nothing changes for bertil before then. Until it is on, a payment settling an already-booked debt (e.g. löneutbetalning against an avräkningskonto) has no correct answer in the form and risks being booked as a duplicate cost | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
+| Underlagsjakt: the upload option in the answer form is OFF (not shown, and `POST /svar/underlag` answers 403) until `UNDERLAGSJAKT_UPLOAD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.5 and the `uppladdat_underlag` svarstyp (spec: docs/underlagsjakt-export-schema.md, "Answers"). Only an answer file that holds an upload is written as 1.5; every other file stays 1.4, so nothing changes for bertil before then. Until it is on, the operator still has no way to hand over the receipt in the form | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
+| Underlagsjakt: choosing more than one document for a `val_kandidat` answer (e.g. one payment, two people's löneunderlag) is OFF: the form stays single-choice, and a second selection is refused with 403 `FEATURE_DISABLED`, until `UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.6 and the `vald_kandidater` field (spec: docs/underlagsjakt-export-schema.md, "val_kandidat with more than one document"). Only an answer file where a `val_kandidat` beslut actually chose more than one document is written as 1.6; every other file stays 1.4/1.5, so nothing changes for bertil before then. Until it is on, the löneutbetalning case is still forced to a single choice: one of the two löneunderlag is chosen and the other stays without a linked document | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
+| Underlagsjakt: the "reglerar en bokförd skuld" answer (task 1482, a payment that settles a debt already booked in a prior verifikat, e.g. a lön payout against 2893) is OFF: the mode is not shown, and `POST /svar` answers 403 `FEATURE_DISABLED` on `reglerar_skuld`, until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.7 and the `reglerar_skuld` svarstyp (spec: docs/underlagsjakt-export-schema.md, "reglerar_skuld"), and books each verifikat's description ending with `(netto via avräkning)`, matching the operator's convention for avräkningskonto payouts. Only an answer file that holds a `reglerar_skuld` beslut is written as 1.7; every other file stays 1.4/1.5/1.6, so nothing changes for bertil before then. Until it is on, a payment settling an already-booked debt (e.g. löneutbetalning against an avräkningskonto) has no correct answer in the form and risks being booked as a duplicate cost | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
 
 ---
 
@@ -630,7 +642,7 @@ stored.
 
 ```bash
 curl -s -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
-  -d '{}' https://bokforing.bohed.com/api/extensions/ext/underlagsjakt/export
+  -d '{}' https://<gnubok-instance>/api/extensions/ext/underlagsjakt/export
 ```
 
 | Answer | What it means |
@@ -647,7 +659,7 @@ acknowledged. Never send a probe acknowledgement for an answer bertil has not in
 In bertil's `.env`:
 
 ```
-GNUBOK_API_URL=https://bokforing.bohed.com
+GNUBOK_API_URL=https://<gnubok-instance>
 GNUBOK_API_KEY=<the same value from step 1>
 ```
 
@@ -684,12 +696,12 @@ skipped: everything above is configuration, and configuration that has never
 carried a real export is not a working delivery.
 
 1. Run the client by hand once: `python underlagsjakt_export_client.py`.
-2. Open `https://bokforing.bohed.com/e/general/underlagsjakt` without touching
-   a file. The line under the summary must read "Automatisk leverans från
-   bertil är påslagen för det här bolaget. Den här exporten kom hit av sig
-   själv." If it says "lästes in som fil", the page is still showing an older
-   hand-uploaded export and the delivery did not land: check the client's log
-   for the status code and look it up in the table in step 2.
+2. Open the Underlagsjakt delivery page at `https://<gnubok-instance>/e/general/underlagsjakt`
+   without touching a file. The line under the summary must read "Automatisk
+   leverans från bertil är påslagen för det här bolaget. Den här exporten kom
+   hit av sig själv." If it says "lästes in som fil", the page is still
+   showing an older hand-uploaded export and the delivery did not land: check
+   the client's log for the status code and look it up in the table in step 2.
 3. Answer one question in that surface.
 4. Let the client run again (or wait for the 06:17 tick) and confirm the
    answer is in bertil's knowledge base as a learned rule.
