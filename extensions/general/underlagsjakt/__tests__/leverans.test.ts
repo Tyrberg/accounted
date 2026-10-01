@@ -316,6 +316,30 @@ describe('authenticateLeverans', () => {
     expect(body.error.code).toBe('LEVERANS_COMPANY_AMBIGUOUS')
   })
 
+  it('ignores an ARKIV copy sharing the org number and binds to the active company', async () => {
+    slice.companyRows = [
+      { id: 'company-1', name: 'Tyrberg Group AB' },
+      { id: 'company-archive', name: 'Tyrberg Group AB (ARKIV 2023-2024)' },
+    ]
+    const result = await auth()
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.ctx.companyId).toBe('company-1')
+  })
+
+  it('still stops when two active companies share the org number', async () => {
+    slice.companyRows = [
+      { id: 'company-1', name: 'Tyrberg Group AB' },
+      { id: 'company-2', name: 'Tyrberg Group Holding AB' },
+      { id: 'company-archive', name: 'Tyrberg Group AB (ARKIV 2023-2024)' },
+    ]
+    const result = await auth()
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    const { body } = await parse<{ error: { code: string } }>(result.response)
+    expect(body.error.code).toBe('LEVERANS_COMPANY_AMBIGUOUS')
+  })
+
   it('says which env var to fix when no company matches', async () => {
     slice.companyRows = []
     const result = await auth()

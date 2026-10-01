@@ -257,7 +257,7 @@ async function resolveLeveransCompany(
   // company created before normalizeOrgNumber may still carry.
   const { data: companies, error } = await supabase
     .from('companies')
-    .select('id')
+    .select('id, name')
     .in('org_number', [config.orgnr, formatOrgNumberDisplay(config.orgnr)])
     .is('archived_at', null)
 
@@ -268,7 +268,12 @@ async function resolveLeveransCompany(
       message: 'Bolaget för leveransen kunde inte slås upp.',
     }
   }
-  const rows = (companies ?? []) as { id: string }[]
+  // An archive copy of a bolag (e.g. "Tyrberg Group AB (ARKIV 2023-2024)")
+  // shares the org number but is not archived_at-flagged. Same rule as the
+  // backoffice's ar_arkiv: ARKIV as a word of its own in the name.
+  const rows = ((companies ?? []) as { id: string; name?: string | null }[]).filter(
+    (c) => !/\bARKIV\b/i.test(c.name ?? ''),
+  )
   if (rows.length === 0) {
     return {
       ok: false,
