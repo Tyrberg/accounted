@@ -101,7 +101,7 @@ export function PostAnswerPanel({
   // candidate delivered by bertil is fetched and its bytes checked against
   // the candidate's own sha256 (the same proof a disk-picked file already had
   // to pass) before display, so a stored document is never shown without the
-  // same guarantee a manually matched one has (task 1483).
+  // same guarantee a manually matched one has.
   const [showViewer, setShowViewer] = useState(false)
   const [viewerFilnamn, setViewerFilnamn] = useState<string | null>(null)
   const [viewerUrl, setViewerUrl] = useState<string | null>(null)
@@ -189,7 +189,7 @@ export function PostAnswerPanel({
   // The user's own just-picked file for `uppladdat_underlag`: there is no
   // candidate or sha256 to check it against (it IS the underlag), so it is
   // shown exactly as picked, through the same viewer a delivered or
-  // disk-matched candidate uses (task 1483).
+  // disk-matched candidate uses.
   const openViewerForLocalFile = async (localFile: File) => {
     const data = await localFile.arrayBuffer()
     showBlob(data, localFile.name, localFile.type)

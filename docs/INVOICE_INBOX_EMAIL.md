@@ -12,21 +12,21 @@ Varje bolag i Accounted har en egen inkorgsadress. Leverantörsfakturor som mejl
 
 Tabellerna är tomma i prod idag eftersom ingen har skickat något dit ännu; det är inte ett kodfel.
 
-## Vad som behövs från Mattias (DNS och Resend)
+## Vad som behövs från operatören (DNS och Resend)
 
-1. **Domän för inkommande mejl** (förslag: `inbox.bohed.com`, en subdomän som inte används för vanlig mejl). Lägg den i Resend under Domains.
+1. **Domän för inkommande mejl** (förslag: `inbox.example.com`, en subdomän som inte används för vanlig mejl). Lägg den i Resend under Domains.
 2. **MX-post** för subdomänen enligt värdet Resend visar (Resend Inbound). Lägg även SPF/DKIM som Resend anger om domänen ska kunna skicka.
-3. **Webhook i Resend:** händelse `email.received`, URL `https://bokforing.bohed.com/api/extensions/ext/invoice-inbox/inbound`. Kopiera signeringshemligheten (`whsec_...`).
-4. **Miljövariabler i prod** (prod körs på boxen, bokforing.bohed.com: lägg dem i `/opt/gnubok/app.env` och starta om med `docker compose -f docker-compose.app.yml -p gnubok-app up -d`; inte Vercel): `RESEND_API_KEY` (med läsrätt för mottagna mejl), `RESEND_INBOUND_DOMAIN` (t.ex. `inbox.bohed.com`), `RESEND_INBOUND_WEBHOOK_SECRET`.
+3. **Webhook i Resend:** händelse `email.received`, URL `https://gnubok.example.com/api/extensions/ext/invoice-inbox/inbound`. Kopiera signeringshemligheten (`whsec_...`).
+4. **Miljövariabler i prod** (prod körs på boxen, gnubok.example.com: lägg dem i `/opt/gnubok/app.env` och starta om med `docker compose -f docker-compose.app.yml -p gnubok-app up -d`; inte Vercel): `RESEND_API_KEY` (med läsrätt för mottagna mejl), `RESEND_INBOUND_DOMAIN` (t.ex. `inbox.example.com`), `RESEND_INBOUND_WEBHOOK_SECRET`.
 5. **Aktivera extensionen** `invoice-inbox` i `extensions.config.json` om den inte redan är på.
-6. **Driftsättning kräver Mattias OK.** Ingen automatisk deploy görs; ändringar här är enbart dokumentation och test.
+6. **Driftsättning kräver operatörens OK.** Ingen automatisk deploy görs; ändringar här är enbart dokumentation och test.
 
 ## Sätta upp adressen för ett bolag
 
 1. Öppna bolaget i Accounted och gå till Dokumentinkorg. Adressen finns redan; visas den inte, välj "Aktivera inkorgsadress".
 2. Kopiera adressen och lägg den som mottagare för fakturamejl hos leverantörerna (eller som vidarebefordran från befintlig fakturaadress).
 3. Skicka en testfaktura och kontrollera att den syns i inkorgen med bilaga och förfallodatum.
-4. Öppna posten, kontrollera leverantör, konto och förfallodag och välj Registrera. Betalning signeras alltid av Mattias själv i separat steg.
+4. Öppna posten, kontrollera leverantör, konto och förfallodag och välj Registrera. Betalning signeras alltid av operatören själv i separat steg.
 
 ## Kontroll efter driftsättning
 

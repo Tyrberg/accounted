@@ -11,7 +11,7 @@
  * `loadState` / `saveSvar` / `saveExport` are the only I/O.
  */
 import type { ExtensionSettings } from '@/lib/extensions/types'
-import { motpartRegelNyckel, type Beslut, type ParsedExport, type Post, type Reglering, type Sammanstallning } from './contract'
+import { aliasLegacyExportKeys, motpartRegelNyckel, type Beslut, type ParsedExport, type Post, type Reglering, type Sammanstallning } from './contract'
 
 export const EXPORT_KEY = 'export'
 export const SVAR_KEY = 'svar'
@@ -90,7 +90,7 @@ export async function loadState(settings: ExtensionSettings): Promise<State> {
     settings.get<StoredExport>(EXPORT_KEY),
     settings.get<SvarMap>(SVAR_KEY),
   ])
-  return { export: exp ?? null, svar: svar ?? {} }
+  return { export: exp ? aliasLegacyExportKeys(exp) : null, svar: svar ?? {} }
 }
 
 export function allPosts(exp: StoredExport | null): Post[] {

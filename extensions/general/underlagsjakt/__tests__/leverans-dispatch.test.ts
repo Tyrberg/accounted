@@ -54,8 +54,8 @@ const { underlagsjaktExtension } = await import('@/extensions/general/underlagsj
 const mockCreateClient = vi.mocked(createClient)
 
 const TOKEN = 'kLq7Z2m9Xr4vBn6TpW8sEyHu3Ac1Df5G'
-const ORGNR = '556012-5790'
-const CANONICAL = '5560125790'
+const ORGNR = '556677-8899'
+const CANONICAL = '5566778899'
 
 /** The dispatcher takes the URL tail as params; mirror how Next.js supplies it. */
 const pathParams = (...path: string[]) => ({ params: Promise.resolve({ path }) })
@@ -136,10 +136,10 @@ describe('bertil delivering through the extension dispatcher', () => {
       machineRequest(['underlagsjakt', 'export'], { method: 'POST', body: fixture }),
       pathParams('underlagsjakt', 'export'),
     )
-    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
+    const answerId = '2026-09-19T08:00:00.000Z:tx-alfa-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
-      'tx-moank-20260821': {
-        beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
+      'tx-alfa-20260821': {
+        beslut: { transaction_id: 'tx-alfa-20260821', svarstyp: 'osaker' },
         reglering: null,
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
@@ -157,7 +157,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     const { status, body } = await parseJsonResponse<{ beslut: { transaction_id: string }[] }>(response)
 
     expect(status).toBe(200)
-    expect(body.beslut.map((b) => b.transaction_id)).toEqual(['tx-moank-20260821'])
+    expect(body.beslut.map((b) => b.transaction_id)).toEqual(['tx-alfa-20260821'])
     // No acknowledgement after a failed consumer: the next poll must retry.
     const retry = await GET(machineRequest(['underlagsjakt', 'svar']), pathParams('underlagsjakt', 'svar'))
     expect(await retry.json()).toEqual(body)
@@ -174,7 +174,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     expect(await retained.json()).toEqual(body)
     const ack = await POST(
       machineRequest(['underlagsjakt', 'svar', 'kvittens'], {
-        method: 'POST', body: { transaction_id: 'tx-moank-20260821', answer_id: answerId },
+        method: 'POST', body: { transaction_id: 'tx-alfa-20260821', answer_id: answerId },
       }),
       pathParams('underlagsjakt', 'svar', 'kvittens'),
     )
@@ -223,13 +223,13 @@ describe('bertil delivering through the extension dispatcher', () => {
   const humanRoutes = [
     ['GET', ['underlagsjakt'], undefined],
     ['POST', ['underlagsjakt', 'export', 'fil'], fixture],
-    ['POST', ['underlagsjakt', 'svar'], { svarstyp: 'osaker', transaction_id: 'tx-moank-20260821' }],
-    ['POST', ['underlagsjakt', 'svar', 'underlag'], { transaction_id: 'tx-moank-20260821' }],
-    ['POST', ['underlagsjakt', 'svar', 'bulk'], { svarstyp: 'levererar_sjalv', transaction_id: 'tx-moank-20260821', motpart: 'MOANK AVIZION', bekrafta_antal: 1 }],
+    ['POST', ['underlagsjakt', 'svar'], { svarstyp: 'osaker', transaction_id: 'tx-alfa-20260821' }],
+    ['POST', ['underlagsjakt', 'svar', 'underlag'], { transaction_id: 'tx-alfa-20260821' }],
+    ['POST', ['underlagsjakt', 'svar', 'bulk'], { svarstyp: 'levererar_sjalv', transaction_id: 'tx-alfa-20260821', motpart: 'ALFA LEVERANS', bekrafta_antal: 1 }],
     ['POST', ['underlagsjakt', 'documents', 'signed-url'], { storagePath: 'documents/company-1/test.pdf' }],
-    ['DELETE', ['underlagsjakt', 'svar', 'tx-moank-20260821'], undefined],
+    ['DELETE', ['underlagsjakt', 'svar', 'tx-alfa-20260821'], undefined],
     ['GET', ['underlagsjakt', 'svarsfil'], undefined],
-    ['POST', ['underlagsjakt', 'svarsfil', 'levererad'], { transaction_ids: ['tx-moank-20260821'] }],
+    ['POST', ['underlagsjakt', 'svarsfil', 'levererad'], { transaction_ids: ['tx-alfa-20260821'] }],
   ] as const
 
   it.each(humanRoutes)(
@@ -253,7 +253,7 @@ describe('bertil delivering through the extension dispatcher', () => {
     const actual = underlagsjaktExtension
       .apiRoutes!.filter((r) => !r.skipAuth)
       // `:param` patterns are listed above with a concrete id in their place.
-      .map((r) => `${r.method} ${r.path.replace(':transactionId', 'tx-moank-20260821')}`)
+      .map((r) => `${r.method} ${r.path.replace(':transactionId', 'tx-alfa-20260821')}`)
 
     expect(listed.slice().sort()).toEqual(actual.slice().sort())
   })

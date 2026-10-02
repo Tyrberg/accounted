@@ -2,7 +2,7 @@
  * The bertil <-> Accounted underlagsjakt contract.
  *
  * Source of truth: `docs/underlagsjakt-export-schema.md` in the bertil repo
- * (merged in bertil#179). This file mirrors that document and nothing else:
+ * (merged there). This file mirrors that document and nothing else:
  * every field here is named there. When the contract version moves, the
  * version lists below are the only place that decides whether we read it.
  *
@@ -24,9 +24,9 @@ import { accountClass } from '@/lib/invariants/account-number'
  * before this file has ever seen it. A different major is refused outright.
  */
 export const MIN_SUPPORTED_EXPORT_VERSION = '1.1'
-export const MAX_SUPPORTED_EXPORT_VERSION = '1.5'
+export const MAX_SUPPORTED_EXPORT_VERSION = '1.6'
 /** Export versions this extension has been built and tested against, for error messages. */
-export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4', '1.5'] as const
+export const SUPPORTED_EXPORT_VERSIONS = ['1.1', '1.2', '1.3', '1.4', '1.5', '1.6'] as const
 /**
  * Answer version this extension writes. 1.4 adds reglering to fel_bolag beslut only.
  * A file with no upload in it stays 1.4, so a reader that predates 1.5 keeps
@@ -60,7 +60,7 @@ export const ANSWER_VERSION_MULTI_KANDIDAT = '1.6'
  * (needs a NEW document), `osaker` (defers) or "no underlag needed" (the
  * underlag is last year's verifikat, which does exist) fit that case.
  * Written only to a file that holds one, so a 1.6 reader loses nothing it
- * did not already lose (task 1482, Mattias 2026-09-21/22).
+ * did not already lose (operator decision 2026-09-21/22).
  */
 export const ANSWER_VERSION_REGLERAR_SKULD = '1.7'
 
@@ -112,8 +112,8 @@ export const MOMSTYPER = ['svensk_25', 'eu_reverse_charge', 'utland', 'represent
 export type Momstyp = (typeof MOMSTYPER)[number]
 
 /**
- * How a wrong-company payment should be settled. Mattias decision 2026-09-17.
- * Added to export in 1.2 (bertil#180), included in answer schema from 1.4.
+ * How a wrong-company payment should be settled. Operator decision 2026-09-17.
+ * Added to export in 1.2, included in answer schema from 1.4.
  */
 export const REGLERINGAR = ['vidarefakturera', 'mellanhavande'] as const
 export type Reglering = (typeof REGLERINGAR)[number]
@@ -134,7 +134,48 @@ export const UNDERLAG_UPLOAD_MIME_TYPES = [
 /** `kalla` on an uploaded underlag beslut: where the document came from, in bertil's vocabulary. */
 export const UPPLADDAT_KALLA = 'gnubok_uppladdning'
 
-export const POST_KATEGORIER = ['behover_mattias', 'tvetydig', 'fel_bolag'] as const
+export const POST_KATEGORIER = ['behover_beslut', 'tvetydig', 'fel_bolag'] as const
+
+/**
+ * Export 1.6 renamed the "needs a decision" category, in `kategori` and in
+ * `sammanfattning`, to `behover_beslut`: the old name was a person's name,
+ * which does not belong in a public contract. Read alias during the
+ * transition: exports before 1.6, and exports already stored, still carry the
+ * old key, so any other `behover_*` key is read as `behover_beslut` (there
+ * was only ever one). The old literal is deliberately not spelled out here.
+ */
+export const BEHOVER_BESLUT = 'behover_beslut'
+
+function isLegacyBehoverKey(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('behover_') && value !== BEHOVER_BESLUT
+}
+
+function aliasKategori(value: unknown): unknown {
+  return isLegacyBehoverKey(value) ? BEHOVER_BESLUT : value
+}
+
+function aliasSammanfattning(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const legacy = Object.keys(value).find(isLegacyBehoverKey)
+  if (legacy === undefined) return value
+  const { [legacy]: count, ...rest } = value as Record<string, unknown>
+  return BEHOVER_BESLUT in rest ? rest : { ...rest, [BEHOVER_BESLUT]: count }
+}
+
+/**
+ * The same read alias for an export stored before the rename: parseExport
+ * already normalizes what it reads, this covers what was saved earlier.
+ */
+export function aliasLegacyExportKeys<T extends { sammanstallningar: Sammanstallning[] }>(exp: T): T {
+  return {
+    ...exp,
+    sammanstallningar: exp.sammanstallningar.map((s) => ({
+      ...s,
+      sammanfattning: aliasSammanfattning(s.sammanfattning) as Sammanstallning['sammanfattning'],
+      posts: s.posts.map((p) => ({ ...p, kategori: aliasKategori(p.kategori) as Post['kategori'] })),
+    })),
+  }
+}
 
 const SHA256_RE = /^[0-9a-f]{64}$/i
 
@@ -163,8 +204,8 @@ const kandidatSchema = z
      * New in export 1.5. A reference, never the file itself: the key an
      * object was archived under by `POST /export/underlag`, the machine
      * route bertil must call to deliver this candidate's bytes BEFORE
-     * sending the export line that names it (operator decision 2026-09-22,
-     * task 1483). Absent when the document is only described (filename,
+     * sending the export line that names it (operator decision 2026-09-22).
+     * Absent when the document is only described (filename,
      * source, hash) and the user picks it from their disk, which is every
      * export to date: bertil does not call `/export/underlag` yet, so this
      * field is never actually sent. Wiring bertil's exporter to upload
@@ -203,7 +244,7 @@ const postSchema = z
     konto_identitet: z.string(),
     typ: z.string(),
     saldo: z.number().nullable(),
-    kategori: z.enum(POST_KATEGORIER),
+    kategori: z.preprocess(aliasKategori, z.enum(POST_KATEGORIER)),
     // The doc shows an object; bertil's exporter writes null when foresla() had nothing.
     forslag: z
       .object({
@@ -221,20 +262,22 @@ const postSchema = z
   .passthrough()
 export type Post = z.infer<typeof postSchema>
 
-const sammanfattningSchema = z
-  .object({
+const sammanfattningSchema = z.preprocess(
+  aliasSammanfattning,
+  z.object({
     totalt: z.number(),
     med_underlag: z.number(),
     hittad_i_mejl: z.number(),
     sjalvforklarande: z.number(),
     inlard_regel: z.number(),
-    behover_mattias: z.number(),
+    behover_beslut: z.number(),
     tvetydig: z.number(),
     fel_bolag: z.number(),
     uppskjuten: z.number(),
     lost_svar: z.number(),
   })
-  .passthrough()
+  .passthrough(),
+)
 
 /**
  * Optional list of transaction_ids whose promised (`levererar_sjalv`) document
@@ -441,7 +484,7 @@ export type Beslut =
        * journal_entries.id in Accounted: the verifikat that already booked this
        * debt. A real, server-checked reference (the post's own company, posted
        * status), never free text, so the correction is traceable rather than a
-       * note (task 1482).
+       * note.
        */
       ursprungsverifikat_id: string
       /** The verifikat's own label (e.g. "A217"), resolved server-side from ursprungsverifikat_id. */
@@ -450,7 +493,7 @@ export type Beslut =
        * The liability account this payment settles. Never a cost account: the
        * cost was booked once already, when the debt was. When bertil books
        * this verifikat, its description must end with "(netto via
-       * avräkning)", matching the wording already used in Mattias's own
+       * avräkning)", matching the wording already used in the operator's own
        * bookkeeping for avräkningskonto payouts (docs/underlagsjakt-export-schema.md, "reglerar_skuld").
        */
       bas_konto: string
@@ -477,7 +520,7 @@ const levererarSjalvSchema = z.object({
  * stop this payment from being booked as a new cost (the cost was booked once
  * already, when the debt was): a class 3-8 account here would recreate the
  * exact double-counting bug the answer type is for, whether typed in the
- * form or posted directly against the API (task 1482).
+ * form or posted directly against the API.
  */
 const liabilityAccountSchema = accountNumberSchema.refine((v) => accountClass(v) === 2, {
   message: 'Kontot måste vara ett skuldkonto (BAS-klass 2): kostnaden bokfördes redan när skulden uppstod',

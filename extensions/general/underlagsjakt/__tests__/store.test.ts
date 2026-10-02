@@ -14,6 +14,8 @@ import {
   felBolagRows,
   bolagChoices,
   pendingBeslut,
+  loadState,
+  EXPORT_KEY,
   type SvarMap,
   type SvarRecord,
   type StoredExport,
@@ -30,7 +32,7 @@ const makePost = (overrides?: Partial<Post>): Post => ({
   konto_identitet: 'test-konto',
   typ: 'utgift',
   saldo: null,
-  kategori: 'behover_mattias',
+  kategori: 'behover_beslut',
   forslag: null,
   kandidater: [],
   tvetydiga_alternativ: [],
@@ -84,7 +86,7 @@ const makeStoredExport = (posts: Post[] = []): StoredExport => ({
         hittad_i_mejl: 0,
         sjalvforklarande: 0,
         inlard_regel: 0,
-        behover_mattias: posts.length,
+        behover_beslut: posts.length,
         tvetydig: 0,
         fel_bolag: 0,
         uppskjuten: 0,
@@ -390,7 +392,7 @@ describe('store', () => {
         answer_id: 'test-answer-1',
         transaction_id: 'tx-1',
         svarstyp: 'levererar_sjalv',
-        motpart: 'HI3G',
+        motpart: 'EXAMPLE',
         underlag_hittat_at: null,
       }
       const svar: SvarMap = {
@@ -417,7 +419,7 @@ describe('store', () => {
         answer_id: 'test-answer-1',
         transaction_id: 'tx-1',
         svarstyp: 'levererar_sjalv',
-        motpart: 'HI3G',
+        motpart: 'EXAMPLE',
         underlag_hittat_at: '2026-09-20T14:00:00Z',
       }
       const svar: SvarMap = {
@@ -552,7 +554,7 @@ describe('store', () => {
               hittad_i_mejl: 0,
               sjalvforklarande: 0,
               inlard_regel: 0,
-              behover_mattias: 1,
+              behover_beslut: 1,
               tvetydig: 0,
               fel_bolag: 0,
               uppskjuten: 0,
@@ -599,7 +601,7 @@ describe('store', () => {
               hittad_i_mejl: 0,
               sjalvforklarande: 0,
               inlard_regel: 0,
-              behover_mattias: 2,
+              behover_beslut: 2,
               tvetydig: 0,
               fel_bolag: 0,
               uppskjuten: 0,
@@ -640,7 +642,7 @@ describe('store', () => {
               hittad_i_mejl: 0,
               sjalvforklarande: 0,
               inlard_regel: 0,
-              behover_mattias: 1,
+              behover_beslut: 1,
               tvetydig: 0,
               fel_bolag: 0,
               uppskjuten: 0,
@@ -659,7 +661,7 @@ describe('store', () => {
               hittad_i_mejl: 0,
               sjalvforklarande: 0,
               inlard_regel: 0,
-              behover_mattias: 1,
+              behover_beslut: 1,
               tvetydig: 0,
               fel_bolag: 0,
               uppskjuten: 0,
@@ -680,44 +682,44 @@ describe('store', () => {
 })
 
 describe('bulkTargets: one "I will deliver it myself" for a whole motpart', () => {
-  const hi3g = (n: number, overrides?: Partial<Post>) =>
-    makePost({ transaction_id: `hi3g-${n}`, motpart: 'HI3G', ...overrides })
+  const example = (n: number, overrides?: Partial<Post>) =>
+    makePost({ transaction_id: `example-${n}`, motpart: 'EXAMPLE', ...overrides })
 
   it('covers every open post with the same motpart, the anchor included', () => {
-    const open = [hi3g(1), hi3g(2), hi3g(3), makePost({ transaction_id: 'other', motpart: 'Telia' })]
-    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['hi3g-1', 'hi3g-2', 'hi3g-3'])
+    const open = [example(1), example(2), example(3), makePost({ transaction_id: 'other', motpart: 'Telia' })]
+    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['example-1', 'example-2', 'example-3'])
   })
 
   it('matches exact normalized text: case and spacing do not split a vendor, a different name does', () => {
     const open = [
-      hi3g(1),
-      hi3g(2, { motpart: '  hi3g ' }),
-      hi3g(3, { motpart: 'HI3G  ' }),
-      hi3g(4, { motpart: 'HI3G SWEDEN' }),
-      hi3g(5, { motpart: 'HI3' }),
+      example(1),
+      example(2, { motpart: '  example ' }),
+      example(3, { motpart: 'EXAMPLE  ' }),
+      example(4, { motpart: 'EXAMPLE SWEDEN' }),
+      example(5, { motpart: 'HI3' }),
     ]
-    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['hi3g-1', 'hi3g-2', 'hi3g-3'])
+    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['example-1', 'example-2', 'example-3'])
   })
 
   it('never sweeps in a fel_bolag post, even with the same motpart', () => {
-    const open = [hi3g(1), hi3g(2, { kategori: 'fel_bolag' }), hi3g(3)]
-    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['hi3g-1', 'hi3g-3'])
+    const open = [example(1), example(2, { kategori: 'fel_bolag' }), example(3)]
+    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['example-1', 'example-3'])
   })
 
   it('still counts the anchor when the user answers a fel_bolag post themselves', () => {
-    const open = [hi3g(1, { kategori: 'fel_bolag' }), hi3g(2), hi3g(3, { kategori: 'fel_bolag' })]
-    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['hi3g-1', 'hi3g-2'])
+    const open = [example(1, { kategori: 'fel_bolag' }), example(2), example(3, { kategori: 'fel_bolag' })]
+    expect(bulkTargets(open, open[0]).map((p) => p.transaction_id)).toEqual(['example-1', 'example-2'])
   })
 
-  it('reports 1 for a reference-number motpart (task 1438): the OCR number is the key and only one post has it', () => {
-    const open = ['100003645765', '100003645766', '100003645767'].map((ocr, i) =>
+  it('reports 1 for a reference-number motpart: the OCR number is the key and only one post has it', () => {
+    const open = ['100004000005', '100004000006', '100004000007'].map((ocr, i) =>
       makePost({ transaction_id: `seb-${i}`, motpart: ocr }),
     )
     for (const anchor of open) expect(bulkTargets(open, anchor)).toEqual([anchor])
   })
 
   it('does not group posts with a blank motpart', () => {
-    const open = [hi3g(1, { motpart: '' }), hi3g(2, { motpart: ' ' })]
+    const open = [example(1, { motpart: '' }), example(2, { motpart: ' ' })]
     expect(bulkTargets(open, open[0])).toEqual([open[0]])
   })
 
@@ -726,12 +728,12 @@ describe('bulkTargets: one "I will deliver it myself" for a whole motpart', () =
       export_version: '1.4',
       generated_at: '2026-09-21T00:00:00Z',
       imported_at: '2026-09-21T00:00:00Z',
-      sammanstallningar: [{ posts: [hi3g(1), hi3g(2), hi3g(3)] }],
+      sammanstallningar: [{ posts: [example(1), example(2), example(3)] }],
     } as unknown as StoredExport
-    const answered = recordAnswer({}, hi3g(2), makeBeslut({ transaction_id: 'hi3g-2' }), null, 'u', '2026-09-21T00:00:00Z')
+    const answered = recordAnswer({}, example(2), makeBeslut({ transaction_id: 'example-2' }), null, 'u', '2026-09-21T00:00:00Z')
     if (!answered.ok) throw new Error('setup')
     const open = openPosts(exp, answered.svar)
-    expect(bulkTargets(open, hi3g(1)).map((p) => p.transaction_id)).toEqual(['hi3g-1', 'hi3g-3'])
+    expect(bulkTargets(open, example(1)).map((p) => p.transaction_id)).toEqual(['example-1', 'example-3'])
   })
 })
 
@@ -742,7 +744,7 @@ describe('markUnderlagHittat: waiting becomes "with document" without asking aga
         answer_id: `a-${id}`,
         transaction_id: id,
         svarstyp: 'levererar_sjalv',
-        motpart: 'HI3G',
+        motpart: 'EXAMPLE',
         underlag_hittat_at: hittat,
       },
     })
@@ -768,5 +770,34 @@ describe('markUnderlagHittat: waiting becomes "with document" without asking aga
   it('does not touch the answer identity, so acknowledgements still match', () => {
     const svar: SvarMap = { a: { ...sjalv('a'), answer_id: 'x' } }
     expect(markUnderlagHittat(svar, ['a'], '2026-09-30T00:00:00Z').a.answer_id).toBe('x')
+  })
+})
+
+describe('loadState', () => {
+  it('reads an export stored before export 1.6 with the category key as behover_beslut', async () => {
+    // Stand-in for the pre-1.6 key: every other behover_* key is its alias.
+    const legacy = 'behover_tidigare'
+    const stored = {
+      export_version: '1.4',
+      generated_at: '2026-09-21T00:00:00Z',
+      imported_at: '2026-09-21T00:00:00Z',
+      sammanstallningar: [
+        {
+          sammanfattning: { totalt: 1, [legacy]: 1 },
+          posts: [{ ...makePost(), kategori: legacy }],
+        },
+      ],
+    }
+    const values: Record<string, unknown> = { [EXPORT_KEY]: stored }
+    const settings = {
+      get: async (key: string) => values[key] ?? null,
+      set: async () => {},
+      clear: async () => {},
+    } as unknown as Parameters<typeof loadState>[0]
+
+    const state = await loadState(settings)
+    const s = state.export!.sammanstallningar[0]
+    expect(s.posts[0].kategori).toBe('behover_beslut')
+    expect(s.sammanfattning).toEqual({ totalt: 1, behover_beslut: 1 })
   })
 })

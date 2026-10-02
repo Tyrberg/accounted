@@ -111,10 +111,18 @@ jobs:
           fi
 
       - name: Check no private information in diff
-        # Scans the PR diff for real personal names, org numbers, IPs, email
-        # addresses to real domains, and other private data patterns. Configured
-        # via .github/private-info-allowlist.txt for false positives.
-        run: npm run check:private-info "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+        # Scans the PR diff with generic patterns (org numbers and personal IDs
+        # with valid checksum, bankgiro/plusgiro, IBAN, private IPs, email to
+        # real domains) plus a denylist of real names, companies and hosts read
+        # from the PRIVATE_INFO_DENYLIST secret, never from the repo. Without
+        # the secret (e.g. PRs from forks) the job warns instead of passing
+        # silently. False positives go in .github/private-info-allowlist.txt.
+        # The SHAs pass through env, never interpolated into the script.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PRIVATE_INFO_DENYLIST: ${{ secrets.PRIVATE_INFO_DENYLIST }}
+        run: npm run check:private-info -- "$BASE_SHA" "$HEAD_SHA"
 
   build:
     name: Build (zero extensions)

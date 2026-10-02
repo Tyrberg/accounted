@@ -36,11 +36,22 @@ turns out to matter more.
 
 The fork is public (`github.com/Tyrberg/accounted`). Never commit real personal
 names, company names, Swedish org numbers, personal ID numbers, bank accounts,
-IBAN numbers, internal hostnames, internal IP addresses, or customer data to
-code, comments, tests, fixtures, or documentation. Use fictional examples
-instead (e.g. "Company A", test org numbers, `example.com`). The CI gate
-`npm run check:private-info` validates this on every PR; see
-`.github/private-info-allowlist.txt` for documented false positives.
+IBAN numbers, internal hostnames, internal IP addresses, customer data or
+internal task references to code, comments, tests, fixtures, decision logs,
+documentation, PR text or commit messages. Use fictional examples instead
+("Example AB", "Company A", org number `556677-8899`, `example.com`); refer to
+people by role ("the operator") and to the running instance as "the gnubok
+instance".
+
+The CI gate `npm run check:private-info` checks every PR diff with generic
+patterns only, plus a denylist of real names, companies and hosts that never
+lives in the repository: CI reads it from the `PRIVATE_INFO_DENYLIST` secret
+(one term per line), a local run from the untracked `.private-info-denylist` at
+the repo root (or the file named by `PRIVATE_INFO_DENYLIST_FILE`). Without a
+denylist the job prints a warning instead of passing silently.
+`.github/private-info-allowlist.txt` lists documented false positives; a PR
+that edits it is flagged in the job output. `npm run check:private-info -- --all`
+scans the whole tree as if every line were new.
 
 ---
 
@@ -560,10 +571,10 @@ it cannot be mistaken for done.
 | Archive the GitLab project as read-only           | Same                                          |
 | Underlagsjakt: bertil's `--json` export read into `/e/general/underlagsjakt`, answers downloaded and fed to `--mottak-svar` | Operator, after this fork is deployed to the operator's instance. Until then no real post has been shown there |
 | Underlagsjakt automatic delivery: all five switch-on steps in [section 11](#11-switching-on-the-underlagsjakt-delivery), from minting the token to scheduling the standing check. Concretely: `UNDERLAGSJAKT_LEVERANS_TOKEN` + `UNDERLAGSJAKT_LEVERANS_ORGNR` in the Accounted box's `.env`; `GNUBOK_API_URL` + `GNUBOK_API_KEY` in bertil's; `/etc/cron.d/underlagsjakt-leverans` installed on bertil's box; one real export and one real answer carried; then `/etc/cron.d/underlagsjakt-status` plus its own external heartbeat check on the Accounted box | Whoever administers the two boxes. Four of the five steps happen outside this repository, and nothing in a pull request can reach either machine. Until `npx tsx extensions/general/underlagsjakt/leverans-status.ts` exits 0 on the box, the delivery is code that has never run, and the box says so on every run rather than leaving it to this table. Step 5 is what keeps it saying so without anyone remembering to ask |
-| Underlagsjakt: teach the extension bertil's next contract version once bertil#180 (the `reglering` field) is merged; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
+| Underlagsjakt: teach the extension bertil's next contract version once the `reglering` field is merged there; until then the settlement is kept in Accounted only | Whoever takes the follow-up task |
 | Underlagsjakt: the upload option in the answer form is OFF (not shown, and `POST /svar/underlag` answers 403) until `UNDERLAGSJAKT_UPLOAD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.5 and the `uppladdat_underlag` svarstyp (spec: docs/underlagsjakt-export-schema.md, "Answers"). Only an answer file that holds an upload is written as 1.5; every other file stays 1.4, so nothing changes for bertil before then. Until it is on, the operator still has no way to hand over the receipt in the form | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
 | Underlagsjakt: choosing more than one document for a `val_kandidat` answer (e.g. one payment, two people's löneunderlag) is OFF: the form stays single-choice, and a second selection is refused with 403 `FEATURE_DISABLED`, until `UNDERLAGSJAKT_MULTI_KANDIDAT_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.6 and the `vald_kandidater` field (spec: docs/underlagsjakt-export-schema.md, "val_kandidat with more than one document"). Only an answer file where a `val_kandidat` beslut actually chose more than one document is written as 1.6; every other file stays 1.4/1.5, so nothing changes for bertil before then. Until it is on, the löneutbetalning case is still forced to a single choice: one of the two löneunderlag is chosen and the other stays without a linked document | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
-| Underlagsjakt: the "reglerar en bokförd skuld" answer (task 1482, a payment that settles a debt already booked in a prior verifikat, e.g. a lön payout against 2893) is OFF: the mode is not shown, and `POST /svar` answers 403 `FEATURE_DISABLED` on `reglerar_skuld`, until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.7 and the `reglerar_skuld` svarstyp (spec: docs/underlagsjakt-export-schema.md, "reglerar_skuld"), and books each verifikat's description ending with `(netto via avräkning)`, matching the operator's convention for avräkningskonto payouts. Only an answer file that holds a `reglerar_skuld` beslut is written as 1.7; every other file stays 1.4/1.5/1.6, so nothing changes for bertil before then. Until it is on, a payment settling an already-booked debt (e.g. löneutbetalning against an avräkningskonto) has no correct answer in the form and risks being booked as a duplicate cost | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
+| Underlagsjakt: the "reglerar en bokförd skuld" answer (a payment that settles a debt already booked in a prior verifikat, e.g. a lön payout against 2893) is OFF: the mode is not shown, and `POST /svar` answers 403 `FEATURE_DISABLED` on `reglerar_skuld`, until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set in the Accounted box's `.env`. Set it only after bertil's `mottak_svar_fran_ui` reads answer version 1.7 and the `reglerar_skuld` svarstyp (spec: docs/underlagsjakt-export-schema.md, "reglerar_skuld"), and books each verifikat's description ending with `(netto via avräkning)`, matching the operator's convention for avräkningskonto payouts. Only an answer file that holds a `reglerar_skuld` beslut is written as 1.7; every other file stays 1.4/1.5/1.6, so nothing changes for bertil before then. Until it is on, a payment settling an already-booked debt (e.g. löneutbetalning against an avräkningskonto) has no correct answer in the form and risks being booked as a duplicate cost | Whoever takes the bertil task, then whoever administers the Accounted box. Nothing in this repository can change bertil or the box |
 
 ---
 
@@ -590,7 +601,7 @@ openssl rand -base64 24    # 32 characters; the app refuses anything shorter
 ```
 
 It goes into two `.env` files and nowhere else: never into this repository,
-never into bertil's, never into a ticket (task 1453 is why).
+never into bertil's, never into a ticket (a leak once made that rule necessary).
 
 ### Step 2: the Accounted box
 

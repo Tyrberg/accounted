@@ -218,7 +218,7 @@ export default function UnderlagsjaktWorkspace(_props: WorkspaceComponentProps) 
               med_underlag: s.sammanfattning.med_underlag,
               sjalvforklarande: s.sammanfattning.sjalvforklarande,
               inlard_regel: s.sammanfattning.inlard_regel,
-              fragor: s.sammanfattning.behover_mattias + s.sammanfattning.tvetydig + s.sammanfattning.fel_bolag,
+              fragor: s.sammanfattning.behover_beslut + s.sammanfattning.tvetydig + s.sammanfattning.fel_bolag,
               uppskjuten: s.sammanfattning.uppskjuten,
               lost_svar: s.sammanfattning.lost_svar,
             })}
@@ -463,7 +463,7 @@ function PostRows({
         </td>
         <td className={TD_CLASS} data-ph-mask="">
           <span className="mr-2">{post.motpart}</span>
-          {post.kategori !== 'behover_mattias' && (
+          {post.kategori !== 'behover_beslut' && (
             <Badge variant="warning">{t(`kategori_post_${post.kategori}`)}</Badge>
           )}
         </td>

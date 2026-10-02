@@ -103,7 +103,7 @@ describe('withRcBasisGapFindings', () => {
 })
 
 describe('withRcBasisGapFindings, correction-voucher tiering', () => {
-  // The Orto Engineering case (2026-08): a refund correction chain left the
+  // A customer case (2026-08): a refund correction chain left the
   // period per-rate identity exactly consistent while three moms-only
   // correction vouchers carried fiktiv moms whose basbelopp lived in other
   // (partly reversed) verifikat. No arrangement of vouchers can satisfy both

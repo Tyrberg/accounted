@@ -1,6 +1,6 @@
 /**
  * READ-ONLY: propose which posted verifikat in other companies may belong to a
- * company that is being set up (task 1479: Mölleborgen AB).
+ * company that is being set up (e.g. Exempelgården AB).
  *
  * Writes NOTHING. Prints a Markdown list, one row per candidate verifikat with
  * date, amount, accounts, current company and why it matched, for the owner to
@@ -10,15 +10,15 @@
  *
  * Searches by text, motpart (supplier/customer), bank account,
  * fastighetsbeteckning and hyresgäst. Repeat a flag to pass several terms.
- * "Mölleborgen" and "Molleborgen" match each other.
+ * "Exempelgården" and "Exempelgarden" match each other.
  *
  * .env.local points at the production database. This script only selects, but
  * confirm with the owner before pointing it at prod.
  *
  * Usage:
  *   npx tsx scripts/propose-company-move.ts \
- *     --name "Mölleborgen AB" --org-number 5565771069 \
- *     --text mölleborgen --property "<beteckning>" --tenant "<hyresgäst>" \
+ *     --name "Exempelgården AB" --org-number 5566778899 \
+ *     --text exempelgården --property "<beteckning>" --tenant "<hyresgäst>" \
  *     --counterparty "<leverantör/kund>" --bank "<iban/bankgiro>"
  */
 

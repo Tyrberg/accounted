@@ -11,7 +11,7 @@ import { PostAnswerPanel } from '../PostAnswerPanel'
 function renderPanel(locale: 'sv' | 'en', account: string | null = null) {
   const post: Post = {
     ...fixture.sammanstallningar[0].posts[0],
-    kategori: 'behover_mattias',
+    kategori: 'behover_beslut',
     forslag: { kategori: 'bankavgift', bas_konto: account, momstyp: null, varfor: '' },
   }
   return renderToStaticMarkup(
@@ -59,7 +59,7 @@ function renderFelBolagPanel(locale: 'sv' | 'en') {
   )
 }
 
-describe('answer panel settlement explanations (task 1485)', () => {
+describe('answer panel settlement explanations', () => {
   it.each(['sv', 'en'] as const)('explains what each reglering choice does and shows the not-booked note at the choice, in %s', (locale) => {
     const messages = locale === 'sv' ? sv : en
     const html = renderFelBolagPanel(locale)

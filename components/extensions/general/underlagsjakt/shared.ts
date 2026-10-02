@@ -33,7 +33,7 @@ export interface WorkspaceData {
         hittad_i_mejl: number
         sjalvforklarande: number
         inlard_regel: number
-        behover_mattias: number
+        behover_beslut: number
         tvetydig: number
         fel_bolag: number
         uppskjuten: number
@@ -116,8 +116,8 @@ export function deriveTillBolag(tillBolagChoice: string | undefined, externalBol
 
 /**
  * A `reglerar_skuld` answer must debit a BAS class 2 (liability) account,
- * never a cost account: the cost was booked once already, when the debt was
- * (task 1482). Applies to both the suggested account and one typed by hand,
+ * never a cost account: the cost was booked once already, when the debt was.
+ * Applies to both the suggested account and one typed by hand,
  * so the server-side restriction (contract.ts's `liabilityAccountSchema`)
  * cannot be the only thing standing between a free-text field and a
  * duplicated cost.
@@ -375,7 +375,7 @@ export interface VerifikatSearchResult {
 /**
  * Looks up posted verifikat by voucher number or description text, for the
  * "reglerar_skuld" picker: the debt being settled must be a real, existing
- * verifikat the user finds and points at, never a free-text note (task 1482).
+ * verifikat the user finds and points at, never a free-text note.
  * Reuses the core journal-entries list/search route rather than a new
  * endpoint. Isolated from the component (and its request-sequencing) so the
  * fetch/parse outcome is directly testable without a DOM.
@@ -427,7 +427,7 @@ export async function searchReglerarSkuldVerifikat(
  * display the wrong document. This is the same proof a disk-picked file
  * already has to pass (`matchesCandidate`); a stored document gets no less
  * of it just because the bytes came from Accounted's own archive instead of
- * the user's disk (task 1483). Injectable `fetchFn`, so the fetch/hash
+ * the user's disk. Injectable `fetchFn`, so the fetch/hash
  * outcome is directly testable without a DOM.
  */
 export async function fetchAndVerifyStoredDocument(

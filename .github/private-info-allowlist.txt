@@ -1,4 +1,10 @@
-# Allowlist for private-info check: false positives that are known to be safe
-# Format: file:value
-# Use when pattern matches generic data (test fixtures, documentation examples)
-# Never add real names, real org numbers, real IPs, or real domains
+# Allowlist for the private-info check: generic-pattern matches that are known
+# to be safe (fictional test fixtures, documentation examples).
+#
+# Format: <file>:<value>, or *:<value> to allow the value in every file.
+# Known fictional values (the fictional org number 556677-8899, IBAN
+# registry examples) are built into scripts/check-private-info.ts already.
+#
+# Never add real names, real org numbers, real IPs or real domains. This file
+# is itself scanned against the denylist, and every PR that edits it is
+# flagged in the job output for review.

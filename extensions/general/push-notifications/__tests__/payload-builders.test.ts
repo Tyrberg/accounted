@@ -10,7 +10,7 @@ describe('invoice notification payloads', () => {
   })
 
   it('labels non-SEK amounts with their ISO code instead of kr', () => {
-    const payload = createInvoiceOverduePayload('1043', 'Odin Aero GmbH', 9800, 'EUR', '2026-07-01', 'inv-2')
+    const payload = createInvoiceOverduePayload('1043', 'Example GmbH', 9800, 'EUR', '2026-07-01', 'inv-2')
     expect(payload.body).toContain(`${(9800).toLocaleString('sv-SE')} EUR`)
     expect(payload.body).not.toContain('kr (')
   })

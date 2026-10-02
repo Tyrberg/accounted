@@ -1,8 +1,8 @@
 /**
  * Create a company through the one shared creation path (createCompanyCore),
  * the same sequence POST /api/v1/companies uses: company + owner membership,
- * chart of accounts, settings, first fiscal period, tax deadlines. Task 1479:
- * Mölleborgen AB (organisationsnummer 556577-1069).
+ * chart of accounts, settings, first fiscal period, tax deadlines. Example:
+ * Exempelgården AB (organisationsnummer 556677-8899).
  *
  * Dry-run by default: prints what would be created and writes nothing. Pass
  * --apply to create. A company without verifikat is cheap to reject, so the
@@ -23,7 +23,7 @@
  *
  * Usage:
  *   npx tsx scripts/create-company.ts --user-id <owner uuid> \
- *     --name "Molleborgen Aktiebolag" --org-number 5565771069 \
+ *     --name "Exempelgarden Aktiebolag" --org-number 5566778899 \
  *     --vat-registered true --moms-period quarterly --f-skatt true \
  *     [--fiscal-year-start-month 1] [--team-id <uuid>] [--apply]
  */

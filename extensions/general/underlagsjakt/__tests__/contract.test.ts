@@ -1,7 +1,7 @@
 /**
  * The contract mirror. The fixture is generated from bertil's
- * docs/underlagsjakt-export-schema.md (version 1.1), with the MOANK/Avizion
- * wrong-company case from Mattias's decision 2026-09-17.
+ * docs/underlagsjakt-export-schema.md (version 1.1), with the ALFA/Alfaleverans
+ * wrong-company case from the operator's decision 2026-09-17.
  */
 import { describe, it, expect, afterEach } from 'vitest'
 import fixture from './fixtures/export-1.1.json'
@@ -11,6 +11,8 @@ import {
   ANSWER_VERSION_MULTI_KANDIDAT,
   ANSWER_VERSION_REGLERAR_SKULD,
   ANSWER_VERSION_UPLOAD,
+  MAX_SUPPORTED_EXPORT_VERSION,
+  aliasLegacyExportKeys,
   buildAnswerFile,
   buildBeslut,
   buildUppladdatBeslut,
@@ -41,7 +43,7 @@ describe('parseExport', () => {
     expect(parsed.ok).toBe(true)
     if (!parsed.ok) return
     expect(parsed.export.sammanstallningar).toHaveLength(2)
-    expect(parsed.export.sammanstallningar[0].posts[0].konto_identitet).toBe('SEB Företagskonto 5609 11 241 10')
+    expect(parsed.export.sammanstallningar[0].posts[0].konto_identitet).toBe('SEB Företagskonto 5000 00 000 01')
   })
 
   it('reads a single sammanstallning (the root schema) as a one-element export', () => {
@@ -60,6 +62,69 @@ describe('parseExport', () => {
   it('accepts a newer minor version within the same major (new fields are additive)', () => {
     const raw = { ...clone(fixture), export_version: '1.5' }
     expect(parseExport(raw).ok).toBe(true)
+  })
+
+  it('reads export 1.6, the version that renamed the category to behover_beslut', () => {
+    expect(MAX_SUPPORTED_EXPORT_VERSION).toBe('1.6')
+    const raw = { ...clone(fixture), export_version: '1.6' }
+    raw.sammanstallningar.forEach((s) => (s.export_version = '1.6'))
+    const parsed = parseExport(raw)
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.export.sammanstallningar[0].sammanfattning.behover_beslut).toBe(1)
+  })
+
+  describe('read alias for the pre-1.6 category key', () => {
+    // Stand-in for the old key: the alias matches every other behover_* key,
+    // so the person-named original never has to appear in this repository.
+    const LEGACY_KEY = 'behover_tidigare'
+
+    function withLegacyKey(): unknown {
+      const raw = clone(fixture) as unknown as {
+        sammanstallningar: { sammanfattning: Record<string, unknown>; posts: { kategori: string }[] }[]
+      }
+      for (const s of raw.sammanstallningar) {
+        s.sammanfattning[LEGACY_KEY] = s.sammanfattning.behover_beslut
+        delete s.sammanfattning.behover_beslut
+        for (const p of s.posts) if (p.kategori === 'behover_beslut') p.kategori = LEGACY_KEY
+      }
+      return raw
+    }
+
+    it('reads the old key in kategori and sammanfattning as behover_beslut', () => {
+      const parsed = parseExport(withLegacyKey())
+      expect(parsed.ok).toBe(true)
+      if (!parsed.ok) return
+      const s = parsed.export.sammanstallningar[0]
+      expect(s.sammanfattning.behover_beslut).toBe(1)
+      expect(s.sammanfattning).not.toHaveProperty(LEGACY_KEY)
+      expect(s.posts.map((p) => p.kategori)).toContain('behover_beslut')
+      expect(s.posts.map((p) => p.kategori)).not.toContain(LEGACY_KEY)
+    })
+
+    it('normalizes an export stored before the rename the same way', () => {
+      const stored = withLegacyKey() as Parameters<typeof aliasLegacyExportKeys>[0]
+      const s = aliasLegacyExportKeys(stored).sammanstallningar[0]
+      expect(s.sammanfattning.behover_beslut).toBe(1)
+      expect(s.sammanfattning).not.toHaveProperty(LEGACY_KEY)
+      expect(s.posts.map((p) => p.kategori)).not.toContain(LEGACY_KEY)
+    })
+
+    it('keeps behover_beslut when both keys are present', () => {
+      const raw = clone(fixture) as unknown as { sammanstallningar: { sammanfattning: Record<string, unknown> }[] }
+      raw.sammanstallningar[0].sammanfattning[LEGACY_KEY] = 99
+      const parsed = parseExport(raw)
+      expect(parsed.ok).toBe(true)
+      if (!parsed.ok) return
+      expect(parsed.export.sammanstallningar[0].sammanfattning.behover_beslut).toBe(1)
+    })
+
+    it('still refuses a kategori outside the contract', () => {
+      const raw = clone(fixture)
+      raw.sammanstallningar[0].posts[0].kategori = 'okand'
+      const parsed = parseExport(raw)
+      expect(parsed.ok).toBe(false)
+    })
   })
 
   it('refuses a file without a version', () => {
@@ -99,9 +164,9 @@ describe('parseExport', () => {
   })
 
   it('accepts export with unknown fields (leverantor_sokord on posts)', () => {
-    const moankPost = post('tx-moank-20260821', fixture14)
+    const alfaPost = post('tx-alfa-20260821', fixture14)
     const googlePost = post('tx-google-20260803', fixture14)
-    expect(moankPost.transaction_id).toBe('tx-moank-20260821')
+    expect(alfaPost.transaction_id).toBe('tx-alfa-20260821')
     expect(googlePost.transaction_id).toBe('tx-google-20260803')
     // leverantor_sokord is in the fixture but not destructured into the Post type;
     // the fixture parses successfully despite the unknown field
@@ -148,8 +213,8 @@ describe('svarInputSchema', () => {
     const r = svarInputSchema.safeParse({
       svarstyp: 'fel_bolag',
       transaction_id: 'tx',
-      fel_bolag_mottagare: 'Villa Viola AB',
-      till_bolag: 'Villa Viola',
+      fel_bolag_mottagare: 'Omega Bolag AB',
+      till_bolag: 'Omega Bolag',
       reglering: null,
     })
     expect(r.success).toBe(false)
@@ -159,7 +224,7 @@ describe('svarInputSchema', () => {
     const r = svarInputSchema.safeParse({
       svarstyp: 'fel_bolag',
       transaction_id: 'tx',
-      fel_bolag_mottagare: 'Villa Viola AB',
+      fel_bolag_mottagare: 'Omega Bolag AB',
       till_bolag: null,
       reglering: null,
     })
@@ -234,19 +299,19 @@ describe('buildBeslut', () => {
         svarstyp: 'val_kandidat',
         vald_kandidat: 'google_workspace_augusti.pdf',
         sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
-        kalla: 'gmail:bohed',
+        kalla: 'gmail:inkorg',
         vald_kandidater: [
           {
             filnamn: 'google_workspace_augusti.pdf',
             sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
-            kalla: 'gmail:bohed',
+            kalla: 'gmail:inkorg',
           },
         ],
         motpart: 'GOOGLE*WORKSPACE',
         kategori: 'leverantor',
         bas_konto: '5420',
         momstyp: 'eu_reverse_charge',
-        bolag: 'Tyrberg Group',
+        bolag: 'Exempel Group',
         bankkonto: null,
         belopp: null,
       },
@@ -280,12 +345,12 @@ describe('buildBeslut', () => {
       {
         filnamn: 'google_workspace_augusti.pdf',
         sha256: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
-        kalla: 'gmail:bohed',
+        kalla: 'gmail:inkorg',
       },
       {
         filnamn: 'google_workspace_juli.pdf',
         sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
-        kalla: 'gmail:bohed',
+        kalla: 'gmail:inkorg',
       },
     ])
   })
@@ -317,7 +382,7 @@ describe('buildBeslut', () => {
       svarstyp: 'val_kandidat',
       transaction_id: p.transaction_id,
       sha256: [],
-      motpart: '100003645765',
+      motpart: '100004000005',
       kategori: 'skatt',
       bas_konto: null,
       momstyp: null,
@@ -369,7 +434,7 @@ describe('buildBeslut', () => {
   })
 
   it('refuses a candidate whose exported hash is malformed (bertil would reject it)', () => {
-    const p = clone(post('tx-moank-20260821'))
+    const p = clone(post('tx-alfa-20260821'))
     p.kandidater[0].sha256 = 'not-a-hash'
     const result = buildBeslut(p, {
       svarstyp: 'val_kandidat',
@@ -386,12 +451,12 @@ describe('buildBeslut', () => {
   })
 
   it('stores the settlement in a fel_bolag beslut when company is known', () => {
-    const p = post('tx-moank-20260821')
+    const p = post('tx-alfa-20260821')
     const result = buildBeslut(p, {
       svarstyp: 'fel_bolag',
       transaction_id: p.transaction_id,
-      fel_bolag_mottagare: 'Villa Viola AB',
-      till_bolag: 'Villa Viola',
+      fel_bolag_mottagare: 'Omega Bolag AB',
+      till_bolag: 'Omega Bolag',
       reglering: 'mellanhavande',
     }, 'test-answer-id')
     expect(result).toEqual({
@@ -399,10 +464,10 @@ describe('buildBeslut', () => {
       reglering: 'mellanhavande',
       beslut: {
         answer_id: 'test-answer-id',
-        transaction_id: 'tx-moank-20260821',
+        transaction_id: 'tx-alfa-20260821',
         svarstyp: 'fel_bolag',
-        fel_bolag_mottagare: 'Villa Viola AB',
-        till_bolag: 'Villa Viola',
+        fel_bolag_mottagare: 'Omega Bolag AB',
+        till_bolag: 'Omega Bolag',
         reglering: 'mellanhavande',
       },
     })
@@ -456,32 +521,32 @@ describe('buildAnswerFile', () => {
   })
 
   it('includes reglering in fel_bolag beslut', () => {
-    const p = post('tx-moank-20260821')
+    const p = post('tx-alfa-20260821')
     const result = buildBeslut(p, {
       svarstyp: 'fel_bolag',
       transaction_id: p.transaction_id,
-      fel_bolag_mottagare: 'Villa Viola AB',
-      till_bolag: 'Villa Viola',
+      fel_bolag_mottagare: 'Omega Bolag AB',
+      till_bolag: 'Omega Bolag',
       reglering: 'mellanhavande',
     }, 'test-answer-id')
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.beslut).toEqual({
       answer_id: 'test-answer-id',
-      transaction_id: 'tx-moank-20260821',
+      transaction_id: 'tx-alfa-20260821',
       svarstyp: 'fel_bolag',
-      fel_bolag_mottagare: 'Villa Viola AB',
-      till_bolag: 'Villa Viola',
+      fel_bolag_mottagare: 'Omega Bolag AB',
+      till_bolag: 'Omega Bolag',
       reglering: 'mellanhavande',
     })
   })
 
   it('omits reglering from fel_bolag when company is unknown', () => {
-    const p = post('tx-moank-20260821')
+    const p = post('tx-alfa-20260821')
     const result = buildBeslut(p, {
       svarstyp: 'fel_bolag',
       transaction_id: p.transaction_id,
-      fel_bolag_mottagare: 'Villa Viola AB',
+      fel_bolag_mottagare: 'Omega Bolag AB',
       till_bolag: null,
       reglering: null,
     }, 'test-answer-id')
@@ -489,9 +554,9 @@ describe('buildAnswerFile', () => {
     if (!result.ok) return
     expect(result.beslut).toEqual({
       answer_id: 'test-answer-id',
-      transaction_id: 'tx-moank-20260821',
+      transaction_id: 'tx-alfa-20260821',
       svarstyp: 'fel_bolag',
-      fel_bolag_mottagare: 'Villa Viola AB',
+      fel_bolag_mottagare: 'Omega Bolag AB',
       till_bolag: null,
     })
     expect(result.beslut).not.toHaveProperty('reglering')
@@ -567,7 +632,7 @@ describe('levererar_sjalv: "I will deliver the document myself"', () => {
   const p = posts(fixture14 as typeof fixture)[0]
 
   it('validates as a svar input', () => {
-    const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: p.transaction_id, motpart: 'HI3G' }
+    const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: p.transaction_id, motpart: 'EXAMPLE' }
     expect(svarInputSchema.safeParse(input).success).toBe(true)
   })
 
@@ -576,7 +641,7 @@ describe('levererar_sjalv: "I will deliver the document myself"', () => {
   })
 
   it('builds a beslut with the vendor name and null underlag_hittat_at', () => {
-    const input = svarInputSchema.parse({ svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G' })
+    const input = svarInputSchema.parse({ svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'EXAMPLE' })
     const built = buildBeslut(p, input, 'answer-1')
     expect(built.ok).toBe(true)
     if (!built.ok) return
@@ -584,7 +649,7 @@ describe('levererar_sjalv: "I will deliver the document myself"', () => {
       answer_id: 'answer-1',
       transaction_id: p.transaction_id,
       svarstyp: 'levererar_sjalv',
-      motpart: 'HI3G',
+      motpart: 'EXAMPLE',
       underlag_hittat_at: null,
     })
   })
@@ -592,7 +657,7 @@ describe('levererar_sjalv: "I will deliver the document myself"', () => {
 
 describe('bulkSvarInputSchema', () => {
   const p = posts(fixture14 as typeof fixture)[0]
-  const valid = { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G', bekrafta_antal: 3 }
+  const valid = { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'EXAMPLE', bekrafta_antal: 3 }
 
   it('takes the anchor post, the motpart and the promised count, and nothing that names other posts', () => {
     const parsed = bulkSvarInputSchema.parse({ ...valid, transaction_ids: ['a', 'b'] })
@@ -605,7 +670,7 @@ describe('bulkSvarInputSchema', () => {
     ['fel_bolag', { ...valid, svarstyp: 'fel_bolag' }],
     ['a zero count', { ...valid, bekrafta_antal: 0 }],
     ['a fractional count', { ...valid, bekrafta_antal: 1.5 }],
-    ['a missing count', { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'HI3G' }],
+    ['a missing count', { svarstyp: 'levererar_sjalv', transaction_id: p.transaction_id, motpart: 'EXAMPLE' }],
     ['a blank motpart', { ...valid, motpart: '  ' }],
     ['a missing anchor', { ...valid, transaction_id: '' }],
   ])('rejects %s', (_label, body) => {
@@ -615,7 +680,7 @@ describe('bulkSvarInputSchema', () => {
 
 describe('answer file version', () => {
   const osaker = { answer_id: 'a', transaction_id: 't1', svarstyp: 'osaker' } as const
-  const sjalv = { answer_id: 'b', transaction_id: 't2', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: null } as const
+  const sjalv = { answer_id: 'b', transaction_id: 't2', svarstyp: 'levererar_sjalv', motpart: 'EXAMPLE', underlag_hittat_at: null } as const
 
   it('stays 1.4 for a file bertil already reads', () => {
     expect(buildAnswerFile([osaker]).version).toBe('1.4')
@@ -826,12 +891,12 @@ describe('multiKandidatEnabled', () => {
 
 describe('motpartRegelNyckel', () => {
   it('is the existing rule key with bolag, bankkonto and belopp all empty', () => {
-    expect(motpartRegelNyckel('HI3G')).toBe('hi3g|bolag=|bankkonto=|belopp=')
+    expect(motpartRegelNyckel('EXAMPLE')).toBe('example|bolag=|bankkonto=|belopp=')
   })
 
   it('ignores case, surrounding and repeated spaces, but nothing else', () => {
-    expect(motpartRegelNyckel('  Hi3G   Sweden ')).toBe(motpartRegelNyckel('HI3G SWEDEN'))
-    expect(motpartRegelNyckel('HI3G')).not.toBe(motpartRegelNyckel('HI3G SWEDEN'))
+    expect(motpartRegelNyckel('  Example   Sweden ')).toBe(motpartRegelNyckel('EXAMPLE SWEDEN'))
+    expect(motpartRegelNyckel('EXAMPLE')).not.toBe(motpartRegelNyckel('EXAMPLE SWEDEN'))
   })
 })
 

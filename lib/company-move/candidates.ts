@@ -1,6 +1,6 @@
 /**
  * Move proposal: which posted verifikat in OTHER companies might belong to a
- * company that is being set up (Mölleborgen AB, task 1479).
+ * company that is being set up (e.g. Exempelgården AB).
  *
  * This module only PROPOSES. It reads nothing and writes nothing: the caller
  * hands in rows, gets back candidates and a Markdown list the owner can answer
@@ -73,7 +73,7 @@ export interface Candidate {
 
 /**
  * Lowercase and fold å/ä/ö to a/a/o. The same company shows up as
- * "Mölleborgen" and "Molleborgen" in bank text, Dropbox folder names and
+ * "Exempelgården" and "Exempelgarden" in bank text, Dropbox folder names and
  * bertil's config, so a match must not depend on which spelling was used.
  */
 export function foldForMatch(value: string): string {
@@ -194,7 +194,7 @@ function cell(value: string): string {
 }
 
 /**
- * The list Mattias answers ja/nej to. One row per verifikat with date, amount,
+ * The list the owner answers ja/nej to. One row per verifikat with date, amount,
  * accounts, current company and the reason it was suggested. Every row starts
  * unanswered: only an explicit "ja" makes a row eligible to move.
  */

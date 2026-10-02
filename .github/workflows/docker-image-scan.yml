@@ -41,7 +41,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: tyrberg/accounted  # forkens image (docker-publish.yml); upstreams image skannades tidigare, task 1445
+  IMAGE_NAME: tyrberg/accounted  # forkens image (docker-publish.yml); upstreams image skannades tidigare
 
 jobs:
   scan:

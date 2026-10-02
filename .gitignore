@@ -36,6 +36,9 @@ yarn-error.log*
 !.env.example
 !.env.docker.example
 
+# private-info check denylist: real names never go in the public repo
+.private-info-denylist
+
 # vercel
 .vercel
 
