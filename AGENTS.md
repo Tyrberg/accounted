@@ -8,7 +8,7 @@ This file is the entry point for Codex and other agents that do not read `CLAUDE
 
 `CLAUDE.md` at the repo root holds everything that applies to every agent, and it wins whenever this file and it disagree:
 
-- **Hard Rules**: the seven accounting invariants (the two sanctioned correction paths, storno and inline rättelse; engine-only journal writes; balanced entries; period locks; document retention; money math; account numbers as strings) and the general prohibitions (migrations, extension imports, dependencies, the gnubok → Accounted rename, `.env.local`, diff scope, no em or en dashes).
+- **Hard Rules**: the seven accounting invariants (the two sanctioned correction paths, storno and inline rättelse; engine-only journal writes; balanced entries; period locks; document retention; money math; account numbers as strings) and the general prohibitions (migrations, extension imports, dependencies, the gnubok → Accounted rename, `.env.local`, diff scope, no em or en dashes, no private information in the public repo).
 - **When Uncertain**: stop and ask; Swedish domain questions go through the `swedish-*` skills, never training data.
 - **Definition of Done**: all nine items, including the last one: the last mile is verified in-session (migration applied, PR merged, routine observed firing), or the final output states exactly what is not live yet.
 - **Commands**, **Architecture** (tenancy resolution, application-side MFA plus server-enforced session limits, event bus, Supabase clients, extensions, the 150+ MCP tools), **Repository Map**, **Testing**, and the **Decision Log** (`DECISIONS.md`).

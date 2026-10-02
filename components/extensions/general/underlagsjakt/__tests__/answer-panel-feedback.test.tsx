@@ -248,10 +248,10 @@ describe('submitAnswer: uppladdat_underlag', () => {
 
 describe('levererar_sjalv: "I will deliver the underlag myself"', () => {
   const BASE = { ...BASE_VAL_KANDIDAT, mode: 'levererar_sjalv' as const }
-  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'HI3G' }
+  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'EXAMPLE' }
 
   it('needs only a motpart: no candidate, kategori or BAS account', () => {
-    expect(buildAnswerInput({ ...BASE, hasCandidate: false, motpart: 'HI3G' })).toEqual({ input })
+    expect(buildAnswerInput({ ...BASE, hasCandidate: false, motpart: 'EXAMPLE' })).toEqual({ input })
     expect(buildAnswerInput({ ...BASE, motpart: '  ' })).toEqual({ missing: ['missing_motpart'] })
   })
 
@@ -259,13 +259,13 @@ describe('levererar_sjalv: "I will deliver the underlag myself"', () => {
     const messages = locale === 'sv' ? sv : en
     const translate = createTranslator({ locale, messages, namespace: 'underlagsjakt' }) as T
     const rec = (hittat: string | null) =>
-      ({ ...SVAR_RECORD, beslut: { answer_id: 'a', transaction_id: 't1', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: hittat } }) as SvarRecord
+      ({ ...SVAR_RECORD, beslut: { answer_id: 'a', transaction_id: 't1', svarstyp: 'levererar_sjalv', motpart: 'EXAMPLE', underlag_hittat_at: hittat } }) as SvarRecord
     const waiting = answerSummary(translate, rec(null))
     const found = answerSummary(translate, rec('2026-09-30T00:00:00Z'))
-    expect(waiting).toContain('HI3G')
-    expect(found).toContain('HI3G')
+    expect(waiting).toContain('EXAMPLE')
+    expect(found).toContain('EXAMPLE')
     expect(waiting).not.toBe(found)
-    expect(waiting).toBe(translate('answer_levererar_sjalv_waiting', { motpart: 'HI3G' }))
+    expect(waiting).toBe(translate('answer_levererar_sjalv_waiting', { motpart: 'EXAMPLE' }))
     expect(waiting).not.toBe(answerSummary(translate, { ...SVAR_RECORD, beslut: { answer_id: 'a', transaction_id: 't1', svarstyp: 'osaker' } } as SvarRecord))
   })
 })
@@ -344,7 +344,7 @@ describe('the sum shown against selected underlag', () => {
 })
 
 describe('submitBulkAnswer', () => {
-  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'HI3G' }
+  const input = { svarstyp: 'levererar_sjalv' as const, transaction_id: 't1', motpart: 'EXAMPLE' }
   const respond = (ok: boolean, body: unknown) => vi.fn().mockResolvedValue({ ok, json: async () => body })
 
   it('posts the anchor answer and the promised count to /svar/bulk, and names no other post', async () => {
@@ -360,7 +360,7 @@ describe('submitBulkAnswer', () => {
     expect(JSON.parse(init.body as string)).toEqual({ ...input, bekrafta_antal: 7 })
     expect(outcomes).toHaveLength(1)
     expect(outcomes[0].toast.variant).toBeUndefined()
-    expect(outcomes[0].toast.description).toBe('levererar_sjalv_bulk_saved:{"count":7,"motpart":"HI3G"}')
+    expect(outcomes[0].toast.description).toBe('levererar_sjalv_bulk_saved:{"count":7,"motpart":"EXAMPLE"}')
     expect(outcomes[0].refresh).toBe(true)
     expect(onAnswered).toHaveBeenCalledTimes(1)
   })
@@ -568,7 +568,7 @@ const SVAR_RECORD_BASE = {
     typ: 'bankavgift',
   },
   besvarad_at: '2026-09-18T10:00:00.000Z',
-  besvarad_av: 'mattias@meme.com',
+  besvarad_av: 'operator@example.com',
   answer_id: '2026-09-18T10:00:00.000Z:t1',
   erbjudet_at: null,
   levererad_at: null,
@@ -650,10 +650,10 @@ describe('answerSummary', () => {
       ...SVAR_RECORD,
       beslut: {
         ...SVAR_RECORD.beslut,
-        vald_kandidat: 'lon_mattias.pdf',
+        vald_kandidat: 'lon_anstalld.pdf',
         vald_kandidater: [
-          { filnamn: 'lon_mattias.pdf', sha256: 'a'.repeat(64), kalla: 'gmail:löner' },
-          { filnamn: 'lon_jennie.pdf', sha256: 'b'.repeat(64), kalla: 'gmail:löner' },
+          { filnamn: 'lon_anstalld.pdf', sha256: 'a'.repeat(64), kalla: 'gmail:löner' },
+          { filnamn: 'lon_anstalld_b.pdf', sha256: 'b'.repeat(64), kalla: 'gmail:löner' },
         ],
       },
     } as SvarRecord
@@ -731,7 +731,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
     konto_identitet: '1930',
     saldo: -150,
     typ: 'Betalning',
-    kategori: 'behover_mattias',
+    kategori: 'behover_beslut',
     forslag: { kategori: '', varfor: 'Månadsavgift bankkonto', bas_konto: null, momstyp: null },
     kandidater: [],
     tvetydiga_alternativ: [],
@@ -800,8 +800,8 @@ describe('PostAnswerPanel: rendered correctly', () => {
 
   const TWO_CANDIDATES: Partial<Post> = {
     kandidater: [
-      { filnamn: 'lon_mattias.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'a'.repeat(64) },
-      { filnamn: 'lon_jennie.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'b'.repeat(64) },
+      { filnamn: 'lon_anstalld.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'a'.repeat(64) },
+      { filnamn: 'lon_anstalld_b.pdf', kalla: 'gmail:löner', datum: '2026-09-20', bevisgrund: 'belopp matchar', sha256: 'b'.repeat(64) },
     ],
   }
 
@@ -814,8 +814,8 @@ describe('PostAnswerPanel: rendered correctly', () => {
   it('renders candidates as checkboxes (no radio input left in val_kandidat mode) once multi-select is on and there is more than one candidate', () => {
     const html = renderPanel(TWO_CANDIDATES, undefined, true, false, true)
     expect(html).toContain(msg.candidates_legend_multi_hint)
-    expect(html).toContain('lon_mattias.pdf')
-    expect(html).toContain('lon_jennie.pdf')
+    expect(html).toContain('lon_anstalld.pdf')
+    expect(html).toContain('lon_anstalld_b.pdf')
     // val_kandidat is the default (and only rendered) mode here, so no radio group of any
     // kind (candidates, "none of them", fel_bolag) should remain in the markup.
     expect(html).not.toContain('type="radio"')
@@ -830,7 +830,7 @@ describe('PostAnswerPanel: rendered correctly', () => {
     kandidater: [
       {
         filnamn: 'faktura_google.pdf',
-        kalla: 'gmail:bohed',
+        kalla: 'gmail:inkorg',
         datum: '2026-09-20',
         bevisgrund: 'belopp matchar',
         sha256: 'c'.repeat(64),

@@ -113,7 +113,7 @@ export function describeLeveransProblems(problems: LeveransConfigProblem[]): str
  * The org number splits that same way once more. `normalizeOrgNumber` refuses
  * a company name and a mistyped last digit alike, and those two are not the
  * same news: the operator who fat-fingers one digit of an otherwise perfect
- * `556012-5790` would count ten digits and one hyphen against a sentence
+ * `556677-8899` would count ten digits and one hyphen against a sentence
  * asking for ten digits and a hyphen, and conclude the check is broken. A
  * mistyped digit is the typo this whole message exists to catch, so it gets
  * told the truth: right shape, wrong check digit.
@@ -194,7 +194,7 @@ export async function leveransTargetsCompany(companyId: string, deps: LeveransDe
  * The token as bertil sends it: `Authorization: Bearer <token>`.
  *
  * The `apikey` header is accepted as well because bertil's client
- * (underlagsjakt_export_client.py, bertil#183) sets both, and a delivery
+ * (underlagsjakt_export_client.py) sets both, and a delivery
  * that fails because one of two identical headers was read would be a
  * needlessly obscure outage.
  */
@@ -268,7 +268,7 @@ async function resolveLeveransCompany(
       message: 'Bolaget för leveransen kunde inte slås upp.',
     }
   }
-  // An archive copy of a bolag (e.g. "Tyrberg Group AB (ARKIV 2023-2024)")
+  // An archive copy of a bolag (e.g. "Exempel Group AB (ARKIV 2023-2024)")
   // shares the org number but is not archived_at-flagged. Same rule as the
   // backoffice's ar_arkiv: ARKIV as a word of its own in the name.
   const rows = ((companies ?? []) as { id: string; name?: string | null }[]).filter(

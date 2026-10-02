@@ -43,8 +43,8 @@ export interface VerifikatLineForSuggestion {
  * already posted there. Never from the cost templates above (this payment is
  * not a cost, the cost was booked once already, when the debt was) and never
  * a hardcoded account list: every company's real skuldkonton differ, so the
- * only trustworthy source is the verifikat the user themselves pointed at
- * (task 1482). Usually one match; more than one (e.g. a verifikat crediting
+ * only trustworthy source is the verifikat the user themselves pointed at.
+ * Usually one match; more than one (e.g. a verifikat crediting
  * both 2893 and 2990) is left for the user to pick between.
  */
 export function suggestSkuldkontoFromVerifikat(lines: VerifikatLineForSuggestion[]): string[] {

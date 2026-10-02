@@ -220,7 +220,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
    * session and bertil has none; the handler authenticates the call itself
    * with the delivery token and resolves the company from the server's
    * configuration (see lib/leverans.ts). The URL is the one bertil already
-   * posts to (bertil#183), which is why the human file upload moved to
+   * posts to, which is why the human file upload moved to
    * /export/fil rather than this path keeping both callers.
    */
   {
@@ -251,14 +251,14 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
    * regardless of how many megabytes of PDFs and photographed receipts the
    * period holds, one failed upload never takes the whole export down with
    * it, and a retried run can skip everything already delivered (operator
-   * decision 2026-09-22, task 1483). Must run before `POST /export`: an
+   * decision 2026-09-22). Must run before `POST /export`: an
    * export line pointing at a storage_path nothing has delivered yet shows
    * "visa dokument" with nothing to show, which is the exact bug this task
    * removes, so bertil's export client uploads first and posts the export
    * second.
    *
    * Reuses `acceptUnderlagFile`, the same validation and dedupe-by-hash
-   * `/svar/underlag` runs for a human-uploaded file (task 1481): two upload
+   * `/svar/underlag` runs for a human-uploaded file: two upload
    * paths with their own size caps and storage would drift, which is what
    * happened the first time this route was attempted.
    *
@@ -414,7 +414,7 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
 
       // The referenced verifikat must be real, posted and belong to this
       // company before its label is trusted into the beslut: an id alone,
-      // unchecked, would be a reference in name only (task 1482).
+      // unchecked, would be a reference in name only.
       let reglerarSkuldContext: { ursprungsverifikatNummer: string } | undefined
       if (input.data.svarstyp === 'reglerar_skuld') {
         const { data: verifikat } = await ctx.supabase
@@ -553,8 +553,8 @@ export const underlagsjaktApiRoutes: ApiRouteDefinition[] = [
   /**
    * "I will deliver the documents myself, for every payment from this motpart."
    * Records one `levererar_sjalv` answer per affected post, so acknowledgement
-   * stays per transaction and no document is ever bound to several payments
-   * (task 1435). The affected posts are derived here with `bulkTargets`, the
+   * stays per transaction and no document is ever bound to several payments.
+   * The affected posts are derived here with `bulkTargets`, the
    * same function the browser counts with; the browser only promises how many
    * (`bekrafta_antal`), and a different count is refused with 409 COUNT_CHANGED.
    */

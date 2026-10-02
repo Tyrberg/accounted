@@ -1,6 +1,6 @@
 # Underlagsjakt Export Schema
 
-**Contract version:** export 1.5 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, 1.6 for a file where a `val_kandidat` beslut chose more than one document, or 1.7 for a file holding a `reglerar_skuld` beslut
+**Contract version:** export 1.6 (minimum 1.1); answer 1.4, 1.5 for a file holding an `uppladdat_underlag`, 1.6 for a file where a `val_kandidat` beslut chose more than one document, or 1.7 for a file holding a `reglerar_skuld` beslut
 
 Canonical root form: **wrapper** (one file contains zero or more bolag×period combinations).
 
@@ -29,7 +29,7 @@ One Sammanstallning is the analysis for a single bolag and period.
 ```json
 {
   "export_version": "1.4",
-  "bolag": "Tyrberg Group",
+  "bolag": "Exempel Group",
   "period": "2026-08",
   "generated_at": "2026-09-17T12:12:00+00:00",
   "sammanfattning": { /* summary object */ },
@@ -57,7 +57,7 @@ Summary statistics for the period.
   "hittad_i_mejl": 6,
   "sjalvforklarande": 12,
   "inlard_regel": 4,
-  "behover_mattias": 1,
+  "behover_beslut": 1,
   "tvetydig": 1,
   "fel_bolag": 1,
   "uppskjuten": 1,
@@ -70,7 +70,7 @@ Summary statistics for the period.
 - **`hittad_i_mejl`**: Posts found in email.
 - **`sjalvforklarande`**: Self-explanatory posts.
 - **`inlard_regel`**: Posts matched by a learned rule.
-- **`behover_mattias`**: Posts requiring manual decision.
+- **`behover_beslut`**: Posts requiring manual decision.
 - **`tvetydig`**: Posts with ambiguous candidates.
 - **`fel_bolag`**: Posts with wrong company (wrong-company case).
 - **`uppskjuten`**: Deferred posts.
@@ -82,14 +82,14 @@ One post is a single payment/transaction.
 
 ```json
 {
-  "bolag": "Tyrberg Group",
+  "bolag": "Exempel Group",
   "period": "2026-08",
   "transaction_id": "tx-google-20260803",
   "datum": "2026-08-03",
   "belopp": -1249.0,
   "valuta": "SEK",
   "motpart": "GOOGLE*WORKSPACE",
-  "konto_identitet": "SEB Företagskonto 5609 11 241 10",
+  "konto_identitet": "SEB Företagskonto 5000 00 000 01",
   "typ": "Kortköp",
   "saldo": 95021.0,
   "kategori": "tvetydig",
@@ -115,7 +115,7 @@ One post is a single payment/transaction.
 - **`typ`** (string, required): Transaction type (e.g., "Överföring", "Kortköp", "Autogiro").
 - **`saldo`** (number or null, required): Account balance after transaction, or null if unknown.
 - **`kategori`** (enum, required): Post category. One of:
-  - `behover_mattias`: Requires manual decision.
+  - `behover_beslut`: Requires manual decision.
   - `tvetydig`: Ambiguous candidates.
   - `fel_bolag`: Wrong company.
 - **`forslag`** (object or null, required): Suggested classification (Forslag), or null if no suggestion.
@@ -156,7 +156,7 @@ A supporting document (email, invoice, receipt).
 ```json
 {
   "filnamn": "google_workspace_augusti.pdf",
-  "kalla": "gmail:bohed",
+  "kalla": "gmail:inkorg",
   "datum": "2026-08-02",
   "bevisgrund": "belopp exakt på beloppsraden + motpart google + mejl 2026-08-02",
   "sha256": "b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -164,7 +164,7 @@ A supporting document (email, invoice, receipt).
 ```
 
 - **`filnamn`** (string, required): Document file name.
-- **`kalla`** (string, required): Source identifier (e.g., "gmail:bohed", "outlook:work").
+- **`kalla`** (string, required): Source identifier (e.g., "gmail:inkorg", "outlook:work").
 - **`datum`** (ISO8601 date string or null, required): Document date.
 - **`bevisgrund`** (string, required): Evidence description (why this document matches the post).
 - **`sha256`** (string, required): SHA256 hash of document content (lowercase hex, 64 characters).
@@ -196,12 +196,12 @@ A payment can be backed by several documents at once (e.g. one bank payment cove
   "answer_id": "2026-09-22T09:00:00.000Z:tx-lon-20260925",
   "transaction_id": "tx-lon-20260925",
   "svarstyp": "val_kandidat",
-  "vald_kandidat": "lon_mattias_september.pdf",
+  "vald_kandidat": "lon_anstalld_september.pdf",
   "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
   "kalla": "gmail:löner",
   "vald_kandidater": [
-    { "filnamn": "lon_mattias_september.pdf", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "kalla": "gmail:löner" },
-    { "filnamn": "lon_jennie_september.pdf", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "kalla": "gmail:löner" }
+    { "filnamn": "lon_anstalld_september.pdf", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "kalla": "gmail:löner" },
+    { "filnamn": "lon_anstalld_b_september.pdf", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "kalla": "gmail:löner" }
   ],
   "motpart": "LÖN SEPTEMBER",
   "kategori": "lon",
@@ -213,7 +213,7 @@ A payment can be backed by several documents at once (e.g. one bank payment cove
 }
 ```
 
-`vald_kandidater` is only present with more than one entry when the answer file itself is version 1.6 (see "Version History"); a reader that does not know 1.6 never sees it and keeps working from `vald_kandidat` alone, which is the correct single-document answer for it. This is the opposite situation from Accounted's document-reuse guard (task 1435: one document never backs two payments): here one payment backs several documents, and each of them is still bound in Accounted exactly as a single choice would be, just several at a time.
+`vald_kandidater` is only present with more than one entry when the answer file itself is version 1.6 (see "Version History"); a reader that does not know 1.6 never sees it and keeps working from `vald_kandidat` alone, which is the correct single-document answer for it. This is the opposite situation from Accounted's document-reuse guard (one document never backs two payments): here one payment backs several documents, and each of them is still bound in Accounted exactly as a single choice would be, just several at a time.
 
 ### `uppladdat_underlag`
 
@@ -281,9 +281,9 @@ never guesses a transaction from date and amount.
 - **`bas_konto`** (string): The liability (skuld) account this payment settles, e.g. `2893`. Required, must be BAS class 2 (`2xxx`), and never a cost account: the cost was already booked once, when the debt was booked. Suggested in Accounted from the referenced verifikat's own BAS class 2 lines, never from the cost categories `val_kandidat`/`uppladdat_underlag` use.
 - **`motpart`, `bolag`, `bankkonto`, `belopp`**: As in `val_kandidat`, for the learned rule.
 
-None of `val_kandidat` (expects a *new* document), `osaker` (defers) or "no underlag needed" (which is untrue here: the underlag is last year's verifikat) fit a payment that settles an already-booked debt. Booking it as a new cost would double it: once when the debt was booked, again when it was paid, understating profit and leaving the debt looking unpaid on the balance sheet (task 1482).
+None of `val_kandidat` (expects a *new* document), `osaker` (defers) or "no underlag needed" (which is untrue here: the underlag is last year's verifikat) fit a payment that settles an already-booked debt. Booking it as a new cost would double it: once when the debt was booked, again when it was paid, understating profit and leaving the debt looking unpaid on the balance sheet.
 
-When bertil books the verifikat for a `reglerar_skuld` beslut, its description must end with `(netto via avräkning)`, e.g. `LÖN MATTIAS (netto via avräkning) 2025-01-22`. That is the existing wording already used in Mattias's own bookkeeping for every prior payout against an avräkningskonto (e.g. `2893`); matching it keeps verifikat comparable across years instead of introducing a second, differently-worded convention for the same kind of posting.
+When bertil books the verifikat for a `reglerar_skuld` beslut, its description must end with `(netto via avräkning)`, e.g. `LÖN ANSTÄLLD (netto via avräkning) 2025-01-22`. That is the existing wording already used in the operator's own bookkeeping for every prior payout against an avräkningskonto (e.g. `2893`); matching it keeps verifikat comparable across years instead of introducing a second, differently-worded convention for the same kind of posting.
 
 ## Transport: the automatic delivery
 
@@ -383,7 +383,7 @@ than guessing.
 
 ### What bertil needs
 
-`GNUBOK_API_URL` (e.g. `https://bokforing.bohed.com`) and `GNUBOK_API_KEY` set
+`GNUBOK_API_URL` (e.g. `https://gnubok.example.com`) and `GNUBOK_API_KEY` set
 to the same token. The secret belongs in the box's environment, never in either
 repository.
 
@@ -429,10 +429,14 @@ not configured at all. It writes nothing and never calls `GET /svar`.
 
 ## Version History
 
+### Export 1.6
+- Renamed the "needs a manual decision" category to `behover_beslut`, both as a post `kategori` and as a `sammanfattning` key. The old key was named after a person, which does not belong in a public contract. Nothing else changes.
+- Read alias during the transition: Accounted still reads the pre-1.6 key, in exports before 1.6 and in exports it stored before the rename, by reading any other `behover_*` key as `behover_beslut` (there was only ever one). bertil writes `behover_beslut` from export 1.6 on; that change is made in bertil separately. The alias is removed once no pre-1.6 export can arrive any more.
+
 ### Export 1.5
 - New optional `storage_path`/`mime_type` fields on `Kandidat` (see "Kandidat" above): a reference to a file bertil delivered ahead of the export through the new `POST /export/underlag`, instead of only a filename/source/hash description the user has to match against their own disk copy. Purely additive: a candidate without them behaves exactly as every export has behaved since 1.1.
 - New machine endpoint `POST /export/underlag` (see "Transport" above) to deliver one candidate's file at a time, dedup'd by content, reusing the same archive, size cap and MIME allowlist as a person uploading a document in the workspace.
-- **bertil does not call this endpoint yet.** Its exporter still sends every candidate exactly as in 1.1-1.4 (filename, source, hash, no file), which every reader here already accepts (`storage_path`/`mime_type` are optional). Wiring bertil to upload each candidate's file before posting the export is tracked as bertil's own follow-up task, to be filed once this side of task 1483 is merged: until it lands, `POST /export/underlag` exists in Accounted but nothing calls it, and candidates keep working exactly as they do today (pick the file from disk, hash-verified in the browser).
+- **bertil does not call this endpoint yet.** Its exporter still sends every candidate exactly as in 1.1-1.4 (filename, source, hash, no file), which every reader here already accepts (`storage_path`/`mime_type` are optional). Wiring bertil to upload each candidate's file before posting the export is tracked as bertil's own follow-up task, to be filed once this side is merged: until it lands, `POST /export/underlag` exists in Accounted but nothing calls it, and candidates keep working exactly as they do today (pick the file from disk, hash-verified in the browser).
 
 ### Answer 1.7
 - Written only when the file holds a `reglerar_skuld` beslut; every other answer file stays at whatever 1.4/1.5/1.6 rule already applied. The answer type is off until `UNDERLAGSJAKT_REGLERAR_SKULD_ENABLED=true` is set on the box, which is done once bertil reads 1.7 and the type.

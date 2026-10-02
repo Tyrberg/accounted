@@ -208,14 +208,14 @@ describe('the committed manifest', () => {
     //   ENTRYPOINT literal: without it declared too, a future upstream merge
     //   that drops the guard goes undetected while the Dockerfile check alone
     //   stays green.
-    // - underlagsjakt-extension: a tier 1 extension (Mattias decision
+    // - underlagsjakt-extension: a tier 1 extension (operator decision
     //   2026-09-17). Its code is new files only, but enabling it through the
     //   extension seam modifies extensions.config.json, the committed registry
     //   under lib/extensions/_generated/ and the pinned count in
     //   lib/extensions/__tests__/sectors.test.ts, and its UI strings must live
     //   in messages/*.json (the message-keys test); each is named on purpose.
     // - docker-publish-ghcr-namespace: a tier 2 one-line change to
-    //   .github/workflows/docker-publish.yml (Mattias decision 2026-09-17).
+    //   .github/workflows/docker-publish.yml (operator decision 2026-09-17).
     //   Upstream's GHCR namespace is scoped to an App installation this fork
     //   does not have, so every publish failed at push-by-digest and the fork
     //   never produced an image at all. IMAGE_NAME has to name a namespace we
@@ -223,7 +223,7 @@ describe('the committed manifest', () => {
     // - docker-publish-latest-forward-only: the merge job only tags latest
     //   when its commit is still the tip of main, because two parallel main
     //   builds left latest on the older commit (2026-09-21). Operator
-    //   dispensation for task 1480, limited to the tagging step.
+    //   dispensation, limited to the tagging step.
     // - docker-extensions-preset-underlagsjakt: the image build copies
     //   docker/extensions.<preset>.json over extensions.config.json, so the
     //   underlagsjakt-extension registration is discarded at build time and

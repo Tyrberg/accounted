@@ -63,8 +63,8 @@ vi.mock('@/lib/core/documents/document-service', async (importOriginal) => ({
 const { underlagsjaktExtension } = await import('@/extensions/general/underlagsjakt')
 
 const TOKEN = 'kLq7Z2m9Xr4vBn6TpW8sEyHu3Ac1Df5G'
-const ORGNR = '556012-5790'
-const CANONICAL = '5560125790'
+const ORGNR = '556677-8899'
+const CANONICAL = '5566778899'
 
 const env = (overrides: Record<string, string | undefined> = {}) => ({
   [TOKEN_ENV]: TOKEN,
@@ -130,13 +130,13 @@ describe('readLeveransConfig', () => {
 
   it('refuses an org number that is not one', () => {
     expect(readLeveransConfig(env({ [ORGNR_ENV]: '556012-5791' }))).toBeNull()
-    expect(readLeveransConfig(env({ [ORGNR_ENV]: 'Tyrberg Group AB' }))).toBeNull()
+    expect(readLeveransConfig(env({ [ORGNR_ENV]: 'Exempel Group AB' }))).toBeNull()
   })
 
   it('normalizes the company to the canonical ten digits', () => {
     expect(readLeveransConfig(env())?.orgnr).toBe(CANONICAL)
     expect(readLeveransConfig(env({ [ORGNR_ENV]: CANONICAL }))?.orgnr).toBe(CANONICAL)
-    expect(readLeveransConfig(env({ [ORGNR_ENV]: '165560125790' }))?.orgnr).toBe(CANONICAL)
+    expect(readLeveransConfig(env({ [ORGNR_ENV]: '165566778899' }))?.orgnr).toBe(CANONICAL)
   })
 
 })
@@ -174,7 +174,7 @@ describe('inspectLeveransConfig', () => {
   })
 
   it('says a set org number is not one, not that it is missing', () => {
-    const lines = problems({ [ORGNR_ENV]: 'Tyrberg Group AB' })
+    const lines = problems({ [ORGNR_ENV]: 'Exempel Group AB' })
     expect(lines).toHaveLength(1)
     expect(lines[0].kind).toBe('invalid')
     expect(lines[0].message).toContain('är inte ett organisationsnummer')
@@ -267,7 +267,7 @@ describe('authenticateLeverans', () => {
   })
 
   it('answers 503 naming the variable that is wrong, not both variables', async () => {
-    const result = await auth(undefined, { [ORGNR_ENV]: 'Tyrberg Group AB' })
+    const result = await auth(undefined, { [ORGNR_ENV]: 'Exempel Group AB' })
     expect(result.ok).toBe(false)
     if (result.ok) return
     const { status, body } = await parse<{ error: { code: string; message: string } }>(result.response)
@@ -303,7 +303,7 @@ describe('authenticateLeverans', () => {
     expect(result.ctx.companyId).toBe('company-1')
     expect(result.ctx.userId).toBe('owner-1')
     expect(result.ctx.extensionId).toBe('underlagsjakt')
-    expect(slice.inFilters).toEqual([CANONICAL, '556012-5790'])
+    expect(slice.inFilters).toEqual([CANONICAL, '556677-8899'])
   })
 
   it('stops rather than guessing when the org number matches several companies', async () => {
@@ -318,8 +318,8 @@ describe('authenticateLeverans', () => {
 
   it('ignores an ARKIV copy sharing the org number and binds to the active company', async () => {
     slice.companyRows = [
-      { id: 'company-1', name: 'Tyrberg Group AB' },
-      { id: 'company-archive', name: 'Tyrberg Group AB (ARKIV 2023-2024)' },
+      { id: 'company-1', name: 'Exempel Group AB' },
+      { id: 'company-archive', name: 'Exempel Group AB (ARKIV 2023-2024)' },
     ]
     const result = await auth()
     expect(result.ok).toBe(true)
@@ -329,9 +329,9 @@ describe('authenticateLeverans', () => {
 
   it('still stops when two active companies share the org number', async () => {
     slice.companyRows = [
-      { id: 'company-1', name: 'Tyrberg Group AB' },
-      { id: 'company-2', name: 'Tyrberg Group Holding AB' },
-      { id: 'company-archive', name: 'Tyrberg Group AB (ARKIV 2023-2024)' },
+      { id: 'company-1', name: 'Exempel Group AB' },
+      { id: 'company-2', name: 'Exempel Group Holding AB' },
+      { id: 'company-archive', name: 'Exempel Group AB (ARKIV 2023-2024)' },
     ]
     const result = await auth()
     expect(result.ok).toBe(false)
@@ -407,10 +407,10 @@ describe('the delivery routes', () => {
   it('GET /svar retries failed ingestion until an explicit, idempotent acknowledgement', async () => {
     await route('POST', '/export').handler(request({ body: fixture }))
     // The import writes an (empty) svar row of its own; answer one post in it.
-    const answerId = '2026-09-19T08:00:00.000Z:tx-moank-20260821'
+    const answerId = '2026-09-19T08:00:00.000Z:tx-alfa-20260821'
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
-      'tx-moank-20260821': {
-        beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
+      'tx-alfa-20260821': {
+        beslut: { transaction_id: 'tx-alfa-20260821', svarstyp: 'osaker' },
         reglering: null,
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
@@ -426,10 +426,10 @@ describe('the delivery routes', () => {
     )
     expect(first.status).toBe(200)
     expect(first.body.version).toBe('1.4')
-    expect(first.body.beslut.map((b) => b.transaction_id)).toEqual(['tx-moank-20260821'])
+    expect(first.body.beslut.map((b) => b.transaction_id)).toEqual(['tx-alfa-20260821'])
 
     const svar = storedValue('svar') as Record<string, { levererad_at: string | null }>
-    expect(svar['tx-moank-20260821'].levererad_at).toBeNull()
+    expect(svar['tx-alfa-20260821'].levererad_at).toBeNull()
 
     const ingest = vi.fn().mockRejectedValue(new Error('ingestion failed'))
     await expect(ingest(first.body)).rejects.toThrow('ingestion failed')
@@ -438,13 +438,13 @@ describe('the delivery routes', () => {
     expect(second.body).toEqual(first.body)
     expect((await gatherEvidence()).lastAcknowledgedAt).toBeNull()
     const acknowledge = () => route('POST', '/svar/kvittens').handler(
-      request({ body: { transaction_id: 'tx-moank-20260821', answer_id: answerId } }),
+      request({ body: { transaction_id: 'tx-alfa-20260821', answer_id: answerId } }),
     )
     expect((await acknowledge()).status).toBe(200)
     const acknowledged = structuredClone(storedValue('svar')) as Record<string, { levererad_at: string | null }>
-    expect(acknowledged['tx-moank-20260821'].levererad_at).toEqual(expect.any(String))
+    expect(acknowledged['tx-alfa-20260821'].levererad_at).toEqual(expect.any(String))
     const receipt = (await gatherEvidence()).lastAcknowledgedAt
-    expect(receipt).toBe(acknowledged['tx-moank-20260821'].levererad_at)
+    expect(receipt).toBe(acknowledged['tx-alfa-20260821'].levererad_at)
     expect((await acknowledge()).status).toBe(200)
     expect((await gatherEvidence()).lastAcknowledgedAt).toBe(receipt)
     expect(storedValue('svar')).toEqual(acknowledged)
@@ -465,8 +465,8 @@ describe('the delivery routes', () => {
   it('does not count manual delivery or legacy delivery timestamps as machine acknowledgement', async () => {
     await route('POST', '/export').handler(request({ body: fixture }))
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
-      'tx-moank-20260821': {
-        beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
+      'tx-alfa-20260821': {
+        beslut: { transaction_id: 'tx-alfa-20260821', svarstyp: 'osaker' },
         reglering: null,
         post: {},
         besvarad_at: new Date().toISOString(),
@@ -478,11 +478,11 @@ describe('the delivery routes', () => {
     expect(auth.ok).toBe(true)
     if (!auth.ok) throw new Error('Expected authenticated context')
     const delivered = await route('POST', '/svarsfil/levererad').handler(
-      request({ body: { transaction_ids: ['tx-moank-20260821'] } }), auth.ctx,
+      request({ body: { transaction_ids: ['tx-alfa-20260821'] } }), auth.ctx,
     )
     expect(delivered.status).toBe(200)
     expect(storedValue('svar')).toMatchObject({
-      'tx-moank-20260821': { levererad_at: expect.any(String) },
+      'tx-alfa-20260821': { levererad_at: expect.any(String) },
     })
     await route('GET', '/svar').handler(request())
     const evidence = await gatherEvidence()
@@ -547,13 +547,13 @@ describe('the delivery routes', () => {
     expect(Date.parse(empty.senast_hamtad_at)).not.toBeNaN()
 
     slice.dataRows.find((r) => r.key === 'svar')!.value = {
-      'tx-moank-20260821': {
-        beslut: { transaction_id: 'tx-moank-20260821', svarstyp: 'osaker' },
+      'tx-alfa-20260821': {
+        beslut: { transaction_id: 'tx-alfa-20260821', svarstyp: 'osaker' },
         reglering: null,
         post: {},
         besvarad_at: '2026-09-19T08:00:00.000Z',
         besvarad_av: 'owner-1',
-        answer_id: '2026-09-19T08:00:00.000Z:tx-moank-20260821',
+        answer_id: '2026-09-19T08:00:00.000Z:tx-alfa-20260821',
         erbjudet_at: null,
         levererad_at: null,
       },
@@ -720,7 +720,7 @@ describe('describeLeveransStatus', () => {
 
   it('names the variable that is wrong rather than telling the operator to set both again', () => {
     const report = describeLeveransStatus(
-      evidence({ configProblems: configProblems({ [ORGNR_ENV]: 'Tyrberg Group AB' }) }),
+      evidence({ configProblems: configProblems({ [ORGNR_ENV]: 'Exempel Group AB' }) }),
       NOW,
     )
     expect(report.exitCode).toBe(4)
@@ -1116,7 +1116,7 @@ describe('promised documents (levererar_sjalv waiting list)', () => {
       levererad_at: null,
     })
     const waiting = (id: string, besvarad_at: string, hittat: string | null = null) =>
-      answered(id, besvarad_at, { svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: hittat })
+      answered(id, besvarad_at, { svarstyp: 'levererar_sjalv', motpart: 'EXAMPLE', underlag_hittat_at: hittat })
 
     it('counts only promised answers bertil has not found, and reports the oldest', async () => {
       await route('POST', '/export').handler(request({ body: fixture }))
@@ -1154,7 +1154,7 @@ describe('promised documents (levererar_sjalv waiting list)', () => {
       const answerId = '2026-09-05T08:00:00.000Z:promise-1'
       slice.dataRows.find((r) => r.key === 'svar')!.value = {
         'promise-1': {
-          beslut: { transaction_id: 'promise-1', svarstyp: 'levererar_sjalv', motpart: 'HI3G', underlag_hittat_at: null },
+          beslut: { transaction_id: 'promise-1', svarstyp: 'levererar_sjalv', motpart: 'EXAMPLE', underlag_hittat_at: null },
           reglering: null,
           post: {},
           besvarad_at: daysAgo(30),

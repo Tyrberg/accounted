@@ -23,7 +23,7 @@ function entry(over: Partial<CandidateEntry> = {}): CandidateEntry {
   return {
     id: 'e1',
     company_id: 'c1',
-    company_name: 'Tyrberg Fastigheter',
+    company_name: 'Exempel Fastigheter',
     voucher_series: 'A',
     voucher_number: 12,
     entry_date: '2025-03-01',
@@ -37,10 +37,10 @@ function entry(over: Partial<CandidateEntry> = {}): CandidateEntry {
 }
 
 describe('foldForMatch / containsTerm', () => {
-  it('treats Mölleborgen and Molleborgen as the same name', () => {
-    expect(foldForMatch('MÖLLEBORGEN AB')).toBe('molleborgen ab')
-    expect(containsTerm('Hyra Molleborgen jan', 'Mölleborgen')).toBe(true)
-    expect(containsTerm('Hyra Mölleborgen jan', 'molleborgen')).toBe(true)
+  it('treats Exempelgården and Exempelgarden as the same name', () => {
+    expect(foldForMatch('EXEMPELGÅRDEN AB')).toBe('exempelgarden ab')
+    expect(containsTerm('Hyra Exempelgarden jan', 'Exempelgården')).toBe(true)
+    expect(containsTerm('Hyra Exempelgården jan', 'exempelgarden')).toBe(true)
   })
 
   it('never matches an empty term or empty text', () => {
@@ -61,16 +61,16 @@ describe('containsAccountIdentifier', () => {
 
 describe('matchEntryText', () => {
   it('reports the axis, term and field of each hit', () => {
-    const e = entry({ description: 'Hyra Mölleborgen', lines: [
+    const e = entry({ description: 'Hyra Exempelgården', lines: [
       { account_number: '3010', debit_amount: 0, credit_amount: 1, line_description: 'Mollen 4' },
     ] })
     const matches = matchEntryText(e, {
       ...noTerms,
-      text: ['molleborgen'],
+      text: ['exempelgarden'],
       properties: ['Mollen 4'],
     })
     expect(matches).toEqual([
-      { axis: 'text', term: 'molleborgen', via: 'verifikattext' },
+      { axis: 'text', term: 'exempelgarden', via: 'verifikattext' },
       { axis: 'property', term: 'Mollen 4', via: 'rad 1' },
     ])
   })
@@ -78,9 +78,9 @@ describe('matchEntryText', () => {
 
 describe('buildCandidates', () => {
   it('drops entries without any match and rounds the amount to öre', () => {
-    const hit = entry({ id: 'a', description: 'Mölleborgen hyra' })
+    const hit = entry({ id: 'a', description: 'Exempelgården hyra' })
     const miss = entry({ id: 'b', description: 'Kontorsmaterial' })
-    const result = buildCandidates([hit, miss], [], { ...noTerms, text: ['Mölleborgen'] })
+    const result = buildCandidates([hit, miss], [], { ...noTerms, text: ['Exempelgården'] })
     expect(result.map((c) => c.entry.id)).toEqual(['a'])
     expect(result[0].amount).toBe(1000.3)
   })
@@ -107,23 +107,23 @@ describe('buildCandidates', () => {
 
 describe('renderProposal', () => {
   it('states that nothing is moved and gives every row an unanswered ja / nej', () => {
-    const cands = buildCandidates([entry({ description: 'Mölleborgen | hyra' })], [], {
+    const cands = buildCandidates([entry({ description: 'Exempelgården | hyra' })], [], {
       ...noTerms,
-      text: ['Mölleborgen'],
+      text: ['Exempelgården'],
     })
-    const md = renderProposal(cands, 'Mölleborgen AB')
+    const md = renderProposal(cands, 'Exempelgården AB')
     expect(md).toContain('Ingenting är flyttat')
-    expect(md).toContain('Tyrberg Fastigheter')
+    expect(md).toContain('Exempel Fastigheter')
     expect(md).toContain('A12')
     expect(md).toContain('2025-03-01')
     expect(md).toContain('ja / nej')
     // A pipe in the verifikattext must not break the table.
-    expect(md).toContain('Mölleborgen / hyra')
+    expect(md).toContain('Exempelgården / hyra')
     expect(md).toContain('Totalt 1 kandidater.')
   })
 
   it('says so when there are no candidates', () => {
-    expect(renderProposal([], 'Mölleborgen AB')).toContain('Inga kandidater hittades.')
+    expect(renderProposal([], 'Exempelgården AB')).toContain('Inga kandidater hittades.')
   })
 })
 
@@ -142,16 +142,16 @@ describe('findLinkedMatches', () => {
     const out = findLinkedMatches(
       {
         ...empty,
-        suppliers: [{ id: 's1', name: 'Fönsterputs Mölleborgen AB' }],
+        suppliers: [{ id: 's1', name: 'Fönsterputs Exempelgården AB' }],
         supplierInvoices: [
           { id: 'si1', supplier_id: 's1', registration_journal_entry_id: 'r', payment_journal_entry_id: 'p' },
         ],
         entrySources: [{ id: 'x', source_type: 'supplier_invoice', source_id: 'si1' }],
       },
-      { ...noTerms, counterparties: ['molleborgen'] },
+      { ...noTerms, counterparties: ['exempelgarden'] },
     )
     expect(out.map((m) => m.entryId).sort()).toEqual(['p', 'r', 'x'])
-    expect(out[0].via).toBe('leverantör Fönsterputs Mölleborgen AB')
+    expect(out[0].via).toBe('leverantör Fönsterputs Exempelgården AB')
   })
 
   it('links a tenant customer through the entry booked from its invoice', () => {
@@ -180,15 +180,15 @@ describe('findLinkedMatches', () => {
         ],
         transactions: [
           { journal_entry_id: 'e1', cash_account_id: 'k1', description: null, original_description: null, merchant_name: null },
-          { journal_entry_id: 'e2', cash_account_id: 'k2', description: 'Hyra Molleborgen', original_description: null, merchant_name: null },
-          { journal_entry_id: null, cash_account_id: 'k1', description: 'Molleborgen', original_description: null, merchant_name: null },
+          { journal_entry_id: 'e2', cash_account_id: 'k2', description: 'Hyra Exempelgarden', original_description: null, merchant_name: null },
+          { journal_entry_id: null, cash_account_id: 'k1', description: 'Exempelgarden', original_description: null, merchant_name: null },
         ],
       },
-      { ...noTerms, text: ['Mölleborgen'], bankAccounts: ['SE45 5000 0000 0583 9825 7466'] },
+      { ...noTerms, text: ['Exempelgården'], bankAccounts: ['SE45 5000 0000 0583 9825 7466'] },
     )
     expect(out).toEqual([
       { entryId: 'e1', axis: 'bank_account', term: 'SE45 5000 0000 0583 9825 7466', via: 'bankkonto Konto A' },
-      { entryId: 'e2', axis: 'text', term: 'Mölleborgen', via: 'banktransaktion' },
+      { entryId: 'e2', axis: 'text', term: 'Exempelgården', via: 'banktransaktion' },
     ])
   })
 })

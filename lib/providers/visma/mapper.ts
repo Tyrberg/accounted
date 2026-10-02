@@ -54,7 +54,7 @@ const SUPPLIER_PS_OVERDUE = new Set([4, 7]);
 /**
  * RemainingAmount is nullable in the eAccounting schema, and in practice the
  * /supplierinvoices LIST payload omits it entirely: reading a missing value as
- * 0 made every migrated supplier invoice look fully settled (ElvaSmultron,
+ * 0 made every migrated supplier invoice look fully settled (a customer case,
  * 290/290 imported as paid). Distinguish "0" from "absent" and let the caller
  * fall back to the PaymentStatus enum / TotalAmount instead.
  */

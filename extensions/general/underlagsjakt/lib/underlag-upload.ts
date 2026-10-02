@@ -2,13 +2,13 @@
  * Filing one underlag file into Accounted's document archive.
  *
  * Two callers need exactly this: a person uploading a document bertil could
- * not find (`POST /svar/underlag`, task 1481) and bertil delivering one of
+ * not find (`POST /svar/underlag`) and bertil delivering one of
  * its own found candidates ahead of the export that references it
- * (`POST /export/underlag`, task 1483). Both must apply the same MIME
+ * (`POST /export/underlag`). Both must apply the same MIME
  * allowlist, the same size cap and the same dedupe-by-hash, because they
  * write into the same archive under the same retention rules; a second copy
  * of this validation is exactly how the two drifted apart once already
- * (task 1483 review round 1: one route said "innehål", the other "innehåll").
+ * (an earlier review round: one route said "innehål", the other "innehåll").
  * One function, two callers.
  */
 import type { SupabaseClient } from '@supabase/supabase-js'

@@ -115,7 +115,7 @@ const readmeCron = cronBlocks('fork/README.md')
 // bertil's export delivery and the standing check that watches it (section
 // 11). The delivery one is why the hand-off is nobody's daily chore, so a
 // line cron silently refuses there means the chain quietly goes back to
-// Mattias uploading a file by hand, and the watcher is what makes that
+// the operator uploading a file by hand, and the watcher is what makes that
 // noticed.
 const everyCronBlock = [...readmeCron, ...cronBlocks('docs/underlagsjakt-export-schema.md')]
 

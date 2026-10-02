@@ -20,7 +20,7 @@ import { GET } from '../route'
 const SUPPLIER = {
   id: 'sup-1',
   company_id: 'company-1',
-  name: 'Odin Aero GmbH',
+  name: 'Example GmbH',
   default_currency: 'EUR',
 }
 

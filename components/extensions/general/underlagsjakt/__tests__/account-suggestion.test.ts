@@ -18,7 +18,7 @@ describe('answer account suggestions from core templates', () => {
     expect(suggestAnswerAccount('leverantor', -100, 'bredband')).toBe('6230')
     expect(suggestAnswerAccount('leverantor', -100, 'Unknown supplier')).toBe(getDefaultAccountForCategory('expense_other'))
   })
-  it.each(['GOOGLE*WORKSPACE', 'MOANK AVIZION', 'SEB MÅNADSAVG', 'Överföring via internet GOOGLE*WORKSPACE'])(
+  it.each(['GOOGLE*WORKSPACE', 'ALFA LEVERANS', 'SEB MÅNADSAVG', 'Överföring via internet GOOGLE*WORKSPACE'])(
     'uses the core ranked match for %s', (motpart) => {
       const matches = findMatchingTemplates(makeTransaction({ amount: -100, description: motpart, merchant_name: motpart, mcc_code: null }))
       const match = matches.find(({ template }) => template.entity_applicability === 'all'
@@ -42,7 +42,7 @@ describe('answer account suggestions from core templates', () => {
 
 describe('suggestSkuldkontoFromVerifikat', () => {
   it('reads the liability account out of the referenced verifikat, e.g. an avräkningskonto like 2893', () => {
-    // Mattias's own booking pattern (Tyrberg Group AB, task 1482): 7210 debit / 2893 credit.
+    // The operator's own booking pattern (Exempel Group AB): 7210 debit / 2893 credit.
     expect(
       suggestSkuldkontoFromVerifikat([
         { account_number: '7210' },
