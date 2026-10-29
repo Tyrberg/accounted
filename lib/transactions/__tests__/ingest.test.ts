@@ -211,6 +211,8 @@ describe('ingestTransactions', () => {
     expect((txInserts[0] as { cash_account_id?: string | null }).cash_account_id).toBe('ca-1931')
   })
 
+  // Preserve ingestion's existing behavior for other callers. The v1 bank-file
+  // route relies on its own account preflight to reject unresolved accounts.
   it('still imports an unbound row when the settlement account lookup misses', async () => {
     const { supabase, enqueue, inserts } = createQueueMockSupabase()
     const raw = makeRaw({ amount: -100 })
@@ -2210,7 +2212,7 @@ describe('ingestTransactions', () => {
   // -----------------------------------------------------------------------
   // Imports never auto-link to existing journal entries.
   // Reconciliation must be an explicit user action (manualLink / runReconciliation).
-  // Regression: viktor@frnzn.com, bank txns from 2026 were silently linked
+  // Regression: user@example.com, bank txns from 2026 were silently linked
   // to SIE-imported vouchers, surfacing them as "bokförda" without action.
   // -----------------------------------------------------------------------
   it('never auto-reconciles imported transactions to existing GL lines', async () => {

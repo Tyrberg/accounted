@@ -116,7 +116,7 @@ function makeRequest(options?: {
   search?: string
   fileContent?: string
   filename?: string
-  settlementAccount?: string
+  settlementAccount?: string | File
 }): Request {
   const fd = new FormData()
   fd.append(
@@ -344,9 +344,30 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     const res = await callRoute({ settlementAccount })
 
     expect(res.status).toBe(400)
-    expect((await res.json()).error.code).toBe('VALIDATION_ERROR')
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(body.error.details.message).toBe('Expected a four-digit ledger account.')
     expect(startOperationMock).not.toHaveBeenCalled()
     expect(ingestMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['', '?settlement_account=1930'])('rejects a file-valued settlement_account before any writes: %s', async (search) => {
+    const res = await callRoute({
+      settlementAccount: new File(['1930'], 'account.txt', { type: 'text/plain' }),
+      search,
+    })
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(body.error.details).toEqual({
+      field: 'settlement_account',
+      message: 'Expected settlement_account as a text field, not a file upload.',
+    })
+    expect(startOperationMock).not.toHaveBeenCalled()
+    expect(ingestMock).not.toHaveBeenCalled()
+    expect(supabase.from).not.toHaveBeenCalledWith('cash_accounts')
+    expect(supabase.calls.some((call) => ['insert', 'upsert', 'update'].includes(call.method))).toBe(false)
   })
 
   it('does not import when the account lookup fails', async () => {
@@ -365,10 +386,11 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
   })
 
   it.each([
-    { settlementAccount: '1930' },
-    { search: '?settlement_account=1930' },
-    {},
-  ])('binds every imported row to the selected or automatic cash account: %j', async (options) => {
+    { options: { settlementAccount: '1940' }, ledgerAccount: '1940' },
+    { options: { search: '?settlement_account=1940' }, ledgerAccount: '1940' },
+    { options: { settlementAccount: '1940', search: '?settlement_account=1930' }, ledgerAccount: '1940' },
+    { options: {}, ledgerAccount: '1940' },
+  ])('binds every imported row to the selected or automatic cash account: %j', async ({ options, ledgerAccount }) => {
     const { ingestTransactions } = await vi.importActual<typeof import('@/lib/transactions/ingest')>(
       '@/lib/transactions/ingest',
     )
@@ -379,7 +401,7 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     supabase = makeSupabase({
       company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
       cash_accounts: () => ++accountLookups === 1
-        ? { data: [{ ledger_account: '1930' }], error: null }
+        ? { data: [{ ledger_account: ledgerAccount }], error: null }
         : { data: { id: 'cash-1' }, error: null },
       transactions: () => {
         const inserts = supabase.calls.filter((call) => call.table === 'transactions' && call.method === 'insert')
@@ -396,6 +418,13 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     const res = await callRoute(options)
 
     expect(res.status).toBe(202)
+    expect(accountLookups).toBe(2)
+    // Both preflight and real ingestion must resolve within this company.
+    const accountFilters = supabase.calls.filter((call) => call.table === 'cash_accounts' && call.method === 'eq')
+    expect(accountFilters.filter((call) => call.args[0] === 'company_id').map((call) => call.args[1]))
+      .toEqual([COMPANY_ID, COMPANY_ID])
+    expect(accountFilters.filter((call) => call.args[0] === 'ledger_account').map((call) => call.args[1]))
+      .toEqual('settlementAccount' in options || 'search' in options ? [ledgerAccount, ledgerAccount] : [ledgerAccount])
     const inserts = supabase.calls.filter((call) => call.table === 'transactions' && call.method === 'insert')
     expect(inserts).toHaveLength(3)
     for (const insert of inserts) {

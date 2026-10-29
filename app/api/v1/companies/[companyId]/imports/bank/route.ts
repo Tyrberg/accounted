@@ -214,10 +214,18 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
     if (!settlementValidation.success) {
       return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
         requestId: ctx.requestId,
-        details: { field: 'settlement_account', message: 'Expected a four-digit ledger account.' },
+        details: {
+          field: 'settlement_account',
+          message: typeof settlementParam === 'string'
+            ? 'Expected a four-digit ledger account.'
+            : 'Expected settlement_account as a text field, not a file upload.',
+        },
       })
     }
 
+    // Only this preflight requires enabled accounts. Ingestion resolves by
+    // company and ledger account without rechecking enabled, so disabling the
+    // account between the lookups still allows the batch to bind to it.
     let accountQuery = ctx.supabase
       .from('cash_accounts')
       .select('ledger_account')
