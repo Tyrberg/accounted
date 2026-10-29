@@ -62,8 +62,8 @@ const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 /** SEB CSV: semicolon-delimited, comma decimals. Auto-detects as format `seb`. */
 const SEB_CSV = [
   'Bokföringsdag;Valutadag;Verifikationsnummer;Text;Belopp;Saldo',
-  '2024-01-15;2024-01-15;12345;SPOTIFY AB;-99,00;12345,67',
-  '2024-01-14;2024-01-14;12346;HEMKÖP FRIDHEMSPLAN;-432,50;12444,67',
+  '2024-01-15;2024-01-15;12345;EXAMPLE SHOP;-99,00;12345,67',
+  '2024-01-14;2024-01-14;12346;EXAMPLE MARKET;-432,50;12444,67',
   '2024-01-13;2024-01-13;12347;LÖNEUTBETALNING;25000,00;12877,17',
 ].join('\n')
 
@@ -75,7 +75,7 @@ const WISE_STATEMENT_CSV = [
 const WISE_TRANSACTION_HISTORY_WITH_UNSAFE_ROW = [
   'ID,Status,Direction,"Created on","Finished on","Source fee amount","Source fee currency","Target fee amount","Target fee currency","Source name","Source amount (after fees)","Source currency","Target name","Target amount (after fees)","Target currency","Exchange rate",Reference,Batch,"Created by",Category,Note',
   'PLAN_ORDER-9,COMPLETED,NEUTRAL,"2026-08-01 10:00:00","2026-08-01 10:00:00",,,,,Wise,100,USD,Wise,900,SEK,9,,,,General,',
-  'TRANSFER-2,COMPLETED,IN,"2026-08-02 10:00:00","2026-08-02 10:00:00",,,,,Example AB,100,SEK,Accounted AB,100,SEK,1,,,,General,',
+  'TRANSFER-2,COMPLETED,IN,"2026-08-02 10:00:00","2026-08-02 10:00:00",,,,,Example AB,100,SEK,Example Recipient,100,SEK,1,,,,General,',
 ].join('\n')
 
 type MockResult = { data?: unknown; error?: unknown }
@@ -292,11 +292,20 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     })
   })
 
-  it('automatically selects the only enabled cash account', async () => {
+  it.each(['1930', '1940'])('automatically selects the only enabled cash account: %s', async (ledgerAccount) => {
+    supabase = makeSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      cash_accounts: { data: [{ ledger_account: ledgerAccount }], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
     const res = await callRoute()
 
     expect(res.status).toBe(202)
-    expect(ingestMock.mock.calls[0][4]).toEqual({ settlementAccount: '1930' })
+    expect(ingestMock.mock.calls[0][4]).toEqual({ settlementAccount: ledgerAccount })
+    expect(supabase.calls).toContainEqual({
+      table: 'cash_accounts', method: 'limit', args: [2],
+    })
   })
 
   it.each([
@@ -355,33 +364,48 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     expect(ingestMock).not.toHaveBeenCalled()
   })
 
-  it.each(['error', 'missing'])('fails without transaction writes when ingestion account lookup returns %s after successful preflight', async (failure) => {
+  it.each([
+    { settlementAccount: '1930' },
+    { search: '?settlement_account=1930' },
+    {},
+  ])('binds every imported row to the selected or automatic cash account: %j', async (options) => {
     const { ingestTransactions } = await vi.importActual<typeof import('@/lib/transactions/ingest')>(
       '@/lib/transactions/ingest',
     )
     ingestMock.mockImplementationOnce(ingestTransactions)
+    // Preflight returns a list; ingestion resolves that account's id.
     let accountLookups = 0
+    let insertedRows = 0
     supabase = makeSupabase({
       company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
       cash_accounts: () => ++accountLookups === 1
         ? { data: [{ ledger_account: '1930' }], error: null }
-        : { data: null, error: failure === 'error' ? { message: 'lookup failed' } : null },
-      transactions: { data: [], error: null },
+        : { data: { id: 'cash-1' }, error: null },
+      transactions: () => {
+        const inserts = supabase.calls.filter((call) => call.table === 'transactions' && call.method === 'insert')
+        if (inserts.length > insertedRows) {
+          insertedRows = inserts.length
+          return { data: { id: `transaction-${insertedRows}`, ...(inserts.at(-1)!.args[0] as object) }, error: null }
+        }
+        return { data: [], error: null }
+      },
       supplier_invoices: { data: [], error: null },
     })
     mockServiceClient.mockReturnValue(supabase)
 
-    const res = await callRoute({ settlementAccount: '1930' })
+    const res = await callRoute(options)
 
-    expect(res.status).toBe(500)
-    expect((await res.json()).error.code).toBe('BANK_IMPORT_FAILED')
-    expect(accountLookups).toBe(2)
-    expect(startOperationMock).toHaveBeenCalledTimes(1)
-    expect(failOperationMock).toHaveBeenCalledTimes(1)
-    expect(completeOperationMock).not.toHaveBeenCalled()
-    expect(supabase.calls.some((call) => call.table === 'transactions'
-      && ['insert', 'upsert', 'update'].includes(call.method))).toBe(false)
-    expect(bankImportUpdatePayload()).toBeUndefined()
+    expect(res.status).toBe(202)
+    const inserts = supabase.calls.filter((call) => call.table === 'transactions' && call.method === 'insert')
+    expect(inserts).toHaveLength(3)
+    for (const insert of inserts) {
+      expect(insert.args[0]).toMatchObject({ company_id: COMPANY_ID, cash_account_id: 'cash-1' })
+    }
+    expect(completeOperationMock).toHaveBeenCalledWith(
+      supabase,
+      expect.objectContaining({ result: expect.objectContaining({ transactions_imported: 3, transactions_errors: 0 }) }),
+      expect.anything(),
+    )
   })
 
   it('stamps every ingested row with the dashboard-equivalent import_source', async () => {
@@ -426,7 +450,7 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     const swedbankCsv = [
       'Kontouppgifter',
       'Clearingnummer,Kontonummer,Datum,Text,Belopp,Saldo',
-      '8123,12345678,2024-01-15,SPOTIFY AB,-99.00,12345.67',
+      '8123,12345678,2024-01-15,EXAMPLE SHOP,-99.00,12345.67',
     ].join('\n')
 
     const res = await callRoute({ fileContent: swedbankCsv, search: '?format=seb' })
@@ -451,12 +475,12 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     await callRoute()
 
     const rows = ingestedRows()
-    const spotify = rows.find((r) => r.description === 'SPOTIFY AB')
-    expect(spotify).toBeDefined()
-    expect(spotify!.date).toBe('2024-01-15')
-    expect(spotify!.amount).toBe(-99)
-    expect(spotify!.currency).toBe('SEK')
-    expect(spotify!.external_id).toMatch(/^seb_/)
+    const transaction = rows.find((r) => r.description === 'EXAMPLE SHOP')
+    expect(transaction).toBeDefined()
+    expect(transaction!.date).toBe('2024-01-15')
+    expect(transaction!.amount).toBe(-99)
+    expect(transaction!.currency).toBe('SEK')
+    expect(transaction!.external_id).toMatch(/^seb_/)
     // external_id must be unique per row or Layer-1 dedup collapses the batch.
     expect(new Set(rows.map((r) => r.external_id)).size).toBe(rows.length)
   })

@@ -233,15 +233,19 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
     if (accounts?.length !== 1) {
+      let message = 'Select an enabled cash account for this company using settlement_account.'
+      if (!accounts?.length) {
+        if (settlementValidation.data === null) {
+          message = 'No enabled cash account exists for this company. Enable a cash account before importing.'
+        } else {
+          message = 'settlement_account does not identify an enabled cash account for this company.'
+        }
+      }
       return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
         requestId: ctx.requestId,
         details: {
           field: 'settlement_account',
-          message: !accounts?.length
-            ? settlementValidation.data === null
-              ? 'No enabled cash account exists for this company. Enable a cash account before importing.'
-              : 'settlement_account does not identify an enabled cash account for this company.'
-            : 'Select an enabled cash account for this company using settlement_account.',
+          message,
         },
       })
     }

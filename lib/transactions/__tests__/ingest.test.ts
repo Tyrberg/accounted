@@ -189,10 +189,15 @@ describe('ingestTransactions', () => {
   // -----------------------------------------------------------------------
   it('stamps cash_account_id on the insert when settlementAccount resolves', async () => {
     const { supabase, enqueue, inserts } = createQueueMockSupabase()
-    const raw = makeRaw({ amount: -100, import_source: 'csv_seb' })
-    enqueue({ data: [] }, { data: [] }, { data: [] }, { data: [] })
-    enqueue({ data: { id: 'ca-1931' } })
-    enqueue({ data: makeTransaction({ id: 'tx-1', external_id: raw.external_id }) })
+    const raw = makeRaw({ amount: -100 })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: { id: 'ca-1931' }, error: null }) // cash_accounts lookup
+    enqueue({ data: inserted, error: null }) // insert
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
     const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
@@ -200,55 +205,35 @@ describe('ingestTransactions', () => {
     })
 
     expect(result.imported).toBe(1)
-    expect(inserts.transactions).toEqual([expect.objectContaining({ cash_account_id: 'ca-1931' })])
+    expect(supabase.from).toHaveBeenCalledWith('cash_accounts')
+    const txInserts = inserts['transactions'] ?? []
+    expect(txInserts).toHaveLength(1)
+    expect((txInserts[0] as { cash_account_id?: string | null }).cash_account_id).toBe('ca-1931')
   })
 
-  it('stamps cash_account_id on every insert in a multi-row batch', async () => {
+  it('still imports an unbound row when the settlement account lookup misses', async () => {
     const { supabase, enqueue, inserts } = createQueueMockSupabase()
-    const rows = [
-      makeRaw({ amount: -100, import_source: 'csv_seb' }),
-      makeRaw({ amount: -200, import_source: 'csv_seb' }),
-    ]
+    const raw = makeRaw({ amount: -100 })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
 
     enqueue({ data: [], error: null }) // booked map
     enqueue({ data: [], error: null }) // unbooked map
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'ca-1931' }, error: null }) // cash_accounts lookup
-    for (const [index, raw] of rows.entries()) {
-      enqueue({ data: makeTransaction({ id: `tx-${index}`, external_id: raw.external_id }), error: null })
-    }
+    enqueue({ data: null, error: null }) // cash_accounts lookup misses
+    enqueue({ data: inserted, error: null }) // insert
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
-    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, rows, {
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
       settlementAccount: '1931',
     })
 
-    expect(result.imported).toBe(rows.length)
+    expect(result.imported).toBe(1)
+    expect(result.errors).toBe(0)
     expect(supabase.from).toHaveBeenCalledWith('cash_accounts')
     const txInserts = inserts['transactions'] ?? []
-    expect(txInserts).toHaveLength(rows.length)
-    for (const inserted of txInserts) {
-      expect(inserted).toMatchObject({ cash_account_id: 'ca-1931' })
-    }
-  })
-
-  it.each([
-    { data: null, error: { message: 'lookup failed' } },
-    { data: { id: 'ca-1931' }, error: { message: 'lookup failed' } },
-    { data: null, error: null },
-  ])('rejects an unresolved settlement account before transaction writes: %j', async (lookup) => {
-    const { supabase, enqueue, inserts, updates } = createQueueMockSupabase()
-    enqueue({ data: [] }, { data: [] }, { data: [] }, { data: [] })
-    enqueue(lookup)
-
-    await expect(ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [makeRaw()], {
-      settlementAccount: '1931',
-    })).rejects.toThrow('Failed to resolve the settlement cash account')
-
-    expect(inserts).toEqual({})
-    expect(updates).toEqual({})
-    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+    expect(txInserts).toHaveLength(1)
+    expect((txInserts[0] as { cash_account_id?: string | null }).cash_account_id).toBeNull()
   })
 
   it('inserts cash_account_id null when no settlementAccount is given', async () => {

@@ -455,23 +455,19 @@ export async function ingestTransactions(
   // ingest call shares a settlement account: enable-banking calls this per
   // account (settlementAccount = account.ledger_account), CSV import passes the
   // single account the user picked. cash_accounts.ledger_account is unique per
-  // company, so this is a single-row lookup. Fail before transaction writes
-  // if a supplied settlement account cannot be resolved, including when an
-  // earlier caller-side preflight succeeded but this lookup fails.
+  // company, so this is a single-row lookup. Tolerate a miss: the row stays
+  // unbound (cash_account_id NULL) and reconciliation falls back to currency.
   // We never auto-create a cash account here; that would race upsertFromPsd2's
   // seed-promotion logic in lib/cash-accounts/service.ts.
   let cashAccountId: string | null = null
   if (options?.settlementAccount) {
-    const { data: ca, error: cashAccountError } = await supabase
+    const { data: ca } = await supabase
       .from('cash_accounts')
       .select('id')
       .eq('company_id', companyId)
       .eq('ledger_account', options.settlementAccount)
       .maybeSingle()
-    if (cashAccountError || !ca?.id) {
-      throw new Error('Failed to resolve the settlement cash account')
-    }
-    cashAccountId = ca.id as string
+    cashAccountId = (ca?.id as string | undefined) ?? null
   }
 
   // ── Shadow-mode same-feed scope-drift precompute (measure only) ──────────
