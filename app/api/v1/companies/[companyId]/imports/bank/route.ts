@@ -21,6 +21,7 @@
  */
 
 import { z } from 'zod'
+import { accountNumberSchema } from '@/lib/invariants/zod'
 import { accepted } from '@/lib/api/v1/response'
 import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
@@ -64,6 +65,7 @@ registerEndpoint({
     'SIE bookkeeping import (use /imports/sie). Auto-bank sync (use the enable-banking extension). Single-transaction creation (use POST /transactions/ingest with a 1-element array).',
   pitfalls: [
     'File size cap: 10 MB. Larger files require splitting client-side.',
+    '`settlement_account` accepts a cash account ledger number (for example, 1930) as a form field or query parameter; the form field takes precedence. It must identify an enabled cash account for this company. If omitted, the only enabled cash account is selected automatically; otherwise VALIDATION_ERROR is returned.',
     '`format` query parameter is optional; auto-detection works for all supported banks. Pass `format` only to force a specific format. Accepted values: seb, swedbank, handelsbanken, nordea, nordea_business, lansforsakringar, ica_banken, skandia, lunar, northmill, wise, wise_statement, generic_csv, camt053.',
     'Wise transaction-history rows with refunded or unknown statuses, unknown directions, or different source and target currencies are rejected instead of guessed. Import the matching per-currency Wise balance statements.',
     'Duplicate detection is by external_id (composed from format + date + description + amount + row index, or the camt.053 entry reference / Wise transfer id where the file carries one); a re-import of the same file typically deduplicates rather than creating doubles.',
@@ -204,6 +206,47 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
 
+    // Resolve the account before any writes so ambiguous imports cannot create
+    // unbound transactions. A form field takes precedence over the query.
+    const settlementParam = formData.get('settlement_account')
+      ?? url.searchParams.get('settlement_account')
+    const settlementValidation = accountNumberSchema.nullable().safeParse(settlementParam)
+    if (!settlementValidation.success) {
+      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+        requestId: ctx.requestId,
+        details: { field: 'settlement_account', message: 'Expected a four-digit ledger account.' },
+      })
+    }
+
+    let accountQuery = ctx.supabase
+      .from('cash_accounts')
+      .select('ledger_account')
+      .eq('company_id', ctx.companyId!)
+      .eq('enabled', true)
+    if (settlementValidation.data !== null) {
+      accountQuery = accountQuery.eq('ledger_account', settlementValidation.data)
+    }
+    const { data: accounts, error: accountsError } = await accountQuery.limit(2)
+    if (accountsError) {
+      return v1ErrorResponseFromCode('INTERNAL_ERROR', ctx.log, {
+        requestId: ctx.requestId,
+      })
+    }
+    if (accounts?.length !== 1) {
+      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+        requestId: ctx.requestId,
+        details: {
+          field: 'settlement_account',
+          message: !accounts?.length
+            ? settlementValidation.data === null
+              ? 'No enabled cash account exists for this company. Enable a cash account before importing.'
+              : 'settlement_account does not identify an enabled cash account for this company.'
+            : 'Select an enabled cash account for this company using settlement_account.',
+        },
+      })
+    }
+    const settlementAccount = accounts[0].ledger_account
+
     const op = await startOperation(
       ctx.supabase,
       {
@@ -309,7 +352,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
         ctx.companyId!,
         ctx.userId,
         raw,
-        importRow?.id ? { bankFileImportId: importRow.id as string } : undefined,
+        {
+          settlementAccount,
+          ...(importRow?.id ? { bankFileImportId: importRow.id as string } : {}),
+        },
       )
 
       // Mark the bank_file_imports row complete. The unique constraint is

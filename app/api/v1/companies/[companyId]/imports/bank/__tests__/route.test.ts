@@ -85,14 +85,17 @@ type RecordedCall = { table: string; method: string; args: unknown[] }
  * Per-table Supabase double that also records every chained call, so a test
  * can assert on the exact payload handed to `.update()` / `.upsert()`.
  */
-function makeSupabase(byTable: Record<string, MockResult>) {
+function makeSupabase(byTable: Record<string, MockResult | (() => MockResult)>) {
   const calls: RecordedCall[] = []
   const buildChain = (table: string): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
         if (prop === 'then') {
+          const result = byTable[table]
           return (resolve: (v: unknown) => void) =>
-            resolve(byTable[table] ?? { data: null, error: null })
+            resolve((typeof result === 'function' ? result() : result) ?? (table === 'cash_accounts'
+              ? { data: [{ ledger_account: '1930' }], error: null }
+              : { data: null, error: null }))
         }
         return (...args: unknown[]) => {
           calls.push({ table, method: String(prop), args })
@@ -113,6 +116,7 @@ function makeRequest(options?: {
   search?: string
   fileContent?: string
   filename?: string
+  settlementAccount?: string
 }): Request {
   const fd = new FormData()
   fd.append(
@@ -123,6 +127,9 @@ function makeRequest(options?: {
       { type: 'text/csv' },
     ),
   )
+  if (options?.settlementAccount !== undefined) {
+    fd.append('settlement_account', options.settlementAccount)
+  }
   const init: RequestInit = {
     method: 'POST',
     body: options?.body ?? fd,
@@ -264,6 +271,119 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     expect(failOperationMock).not.toHaveBeenCalled()
   })
 
+  it.each([
+    { settlementAccount: '1930' },
+    { search: '?settlement_account=1930' },
+    { settlementAccount: '1930', search: '?settlement_account=1940' },
+  ])('passes the selected settlement account for the whole batch: %j', async (options) => {
+    const res = await callRoute(options)
+
+    expect(res.status).toBe(202)
+    expect(ingestedRows()).toHaveLength(3)
+    expect(ingestMock.mock.calls[0][4]).toEqual({ settlementAccount: '1930' })
+    expect(supabase.calls).toContainEqual({
+      table: 'cash_accounts', method: 'eq', args: ['company_id', COMPANY_ID],
+    })
+    expect(supabase.calls).toContainEqual({
+      table: 'cash_accounts', method: 'eq', args: ['enabled', true],
+    })
+    expect(supabase.calls).toContainEqual({
+      table: 'cash_accounts', method: 'eq', args: ['ledger_account', '1930'],
+    })
+  })
+
+  it('automatically selects the only enabled cash account', async () => {
+    const res = await callRoute()
+
+    expect(res.status).toBe(202)
+    expect(ingestMock.mock.calls[0][4]).toEqual({ settlementAccount: '1930' })
+  })
+
+  it.each([
+    {
+      accounts: [{ ledger_account: '1930' }, { ledger_account: '1940' }], search: '',
+      message: 'Select an enabled cash account for this company using settlement_account.',
+    },
+    {
+      accounts: [], search: '',
+      message: 'No enabled cash account exists for this company. Enable a cash account before importing.',
+    },
+    {
+      accounts: [], search: '?settlement_account=1940',
+      message: 'settlement_account does not identify an enabled cash account for this company.',
+    },
+  ])('rejects an ambiguous or unavailable account before any writes: %j', async ({ accounts, search, message }) => {
+    supabase = makeSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      cash_accounts: { data: accounts, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await callRoute({ search })
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(body.error.details.field).toBe('settlement_account')
+    expect(body.error.details.message).toBe(message)
+    expect(startOperationMock).not.toHaveBeenCalled()
+    expect(ingestMock).not.toHaveBeenCalled()
+    expect(supabase.calls.some((call) => ['insert', 'upsert', 'update'].includes(call.method))).toBe(false)
+  })
+
+  it.each(['', '193', 'invalid'])('rejects an invalid settlement_account: %j', async (settlementAccount) => {
+    const res = await callRoute({ settlementAccount })
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.code).toBe('VALIDATION_ERROR')
+    expect(startOperationMock).not.toHaveBeenCalled()
+    expect(ingestMock).not.toHaveBeenCalled()
+  })
+
+  it('does not import when the account lookup fails', async () => {
+    supabase = makeSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      cash_accounts: { data: null, error: { message: 'query failed' } },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await callRoute()
+
+    expect(res.status).toBe(500)
+    expect((await res.json()).error.code).toBe('INTERNAL_ERROR')
+    expect(startOperationMock).not.toHaveBeenCalled()
+    expect(ingestMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['error', 'missing'])('fails without transaction writes when ingestion account lookup returns %s after successful preflight', async (failure) => {
+    const { ingestTransactions } = await vi.importActual<typeof import('@/lib/transactions/ingest')>(
+      '@/lib/transactions/ingest',
+    )
+    ingestMock.mockImplementationOnce(ingestTransactions)
+    let accountLookups = 0
+    supabase = makeSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      cash_accounts: () => ++accountLookups === 1
+        ? { data: [{ ledger_account: '1930' }], error: null }
+        : { data: null, error: failure === 'error' ? { message: 'lookup failed' } : null },
+      transactions: { data: [], error: null },
+      supplier_invoices: { data: [], error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await callRoute({ settlementAccount: '1930' })
+
+    expect(res.status).toBe(500)
+    expect((await res.json()).error.code).toBe('BANK_IMPORT_FAILED')
+    expect(accountLookups).toBe(2)
+    expect(startOperationMock).toHaveBeenCalledTimes(1)
+    expect(failOperationMock).toHaveBeenCalledTimes(1)
+    expect(completeOperationMock).not.toHaveBeenCalled()
+    expect(supabase.calls.some((call) => call.table === 'transactions'
+      && ['insert', 'upsert', 'update'].includes(call.method))).toBe(false)
+    expect(bankImportUpdatePayload()).toBeUndefined()
+  })
+
   it('stamps every ingested row with the dashboard-equivalent import_source', async () => {
     await callRoute()
 
@@ -288,7 +408,7 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     await callRoute()
 
     expect(ingestMock).toHaveBeenCalledTimes(1)
-    expect(ingestMock.mock.calls[0][4]).toEqual({ bankFileImportId: 'import-1' })
+    expect(ingestMock.mock.calls[0][4]).toEqual({ bankFileImportId: 'import-1', settlementAccount: '1930' })
   })
 
   it('still ingests (rows unlinked) when the upsert returns no batch id', async () => {
@@ -296,7 +416,7 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     await callRoute()
 
     expect(ingestMock).toHaveBeenCalledTimes(1)
-    expect(ingestMock.mock.calls[0][4]).toBeUndefined()
+    expect(ingestMock.mock.calls[0][4]).toEqual({ settlementAccount: '1930' })
   })
 
   it('stamps ids and provenance with the fallback format when an explicit override parses nothing', async () => {
