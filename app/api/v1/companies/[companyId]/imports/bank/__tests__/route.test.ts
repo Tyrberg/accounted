@@ -340,8 +340,12 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     expect(supabase.calls.some((call) => ['insert', 'upsert', 'update'].includes(call.method))).toBe(false)
   })
 
-  it.each(['', '193', 'invalid'])('rejects an invalid settlement_account: %j', async (settlementAccount) => {
-    const res = await callRoute({ settlementAccount })
+  it.each(['', '193', 'invalid'].flatMap((value) => [
+    { settlementAccount: value },
+    { search: `?settlement_account=${value}` },
+    { settlementAccount: value, search: '?settlement_account=1930' },
+  ]))('rejects an invalid settlement_account without falling back to another account: %j', async (options) => {
+    const res = await callRoute(options)
 
     expect(res.status).toBe(400)
     const body = await res.json()
@@ -349,6 +353,7 @@ describe('POST /api/v1/companies/:companyId/imports/bank', () => {
     expect(body.error.details.message).toBe('Expected a four-digit ledger account.')
     expect(startOperationMock).not.toHaveBeenCalled()
     expect(ingestMock).not.toHaveBeenCalled()
+    expect(supabase.from).not.toHaveBeenCalledWith('cash_accounts')
   })
 
   it.each(['', '?settlement_account=1930'])('rejects a file-valued settlement_account before any writes: %s', async (search) => {
