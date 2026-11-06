@@ -82,6 +82,39 @@ beforeEach(() => {
 const PERIOD = { period_start: '2026-01-01', period_end: '2026-12-31' }
 
 describe('generateDimensionPnl', () => {
+  it('test__when_class_7_has_tagged_and_long_accounts__then_splits_headings_and_reconciles_subtotals', async () => {
+    mockResults = {
+      fiscal_periods: [{ data: PERIOD }],
+      dimensions: [{ data: null }],
+      journal_entry_lines: [{ data: [
+        { id: 'l1', account_number: '76991', debit_amount: 30, credit_amount: 0, dimensions: { '6': 'P001' } },
+        { id: 'l2', account_number: '7821', debit_amount: 20, credit_amount: 0, dimensions: { '6': 'P001' } },
+      ] }],
+    }
+    mockTrialBalance.mockResolvedValue(tb([
+      tbRow({ account_number: '7000', account_class: 7, closing_debit: 100 }),
+      tbRow({ account_number: '76991', account_class: 7, closing_debit: 50 }),
+      tbRow({ account_number: '7700', account_class: 7, closing_debit: 40 }),
+      tbRow({ account_number: '7821', account_class: 7, closing_debit: 30 }),
+      tbRow({ account_number: '7960', account_class: 7, closing_debit: 25 }),
+      tbRow({ account_number: '7990', account_class: 7, closing_debit: 75 }),
+      tbRow({ account_number: '79991', account_class: 7, closing_debit: 10 }),
+    ]))
+
+    const report = await generateDimensionPnl(supabase, 'company-1', 'period-1', '6')
+
+    expect(report.groups.map((g) => [g.class, g.class_label, g.rows.map((r) => r.account_number)])).toEqual([
+      [7, '70-76 Personalkostnader', ['7000', '76991']],
+      [7, '77-79 Avskrivningar, nedskrivningar och övriga rörelsekostnader', ['7700', '7821', '7960', '7990', '79991']],
+    ])
+    expect(report.groups.map((g) => [g.subtotals, g.subtotal_total])).toEqual([
+      [[-30, -120], -150], [[-20, -160], -180],
+    ])
+    expect(report.net_per_column).toEqual([-50, -280])
+    expect(report.net_total).toBe(-330)
+    expect(report.groups.reduce((sum, g) => sum + g.subtotal_total, 0)).toBe(report.net_total)
+  })
+
   it('builds the value-as-column matrix with an untagged residual that reconciles to the trial balance', async () => {
     mockResults = {
       fiscal_periods: [{ data: PERIOD, error: null }],

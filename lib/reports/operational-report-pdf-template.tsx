@@ -339,7 +339,7 @@ export function ResultatrapportPDF({ report, company, generatedAt, filterNote }:
           // No wrap={false} on the outer View: large account classes (80+
           // active accounts) would otherwise be silently clipped instead of
           // flowing onto the next page.
-          <View key={group.class}>
+          <View key={group.class_label}>
             <Text style={styles.groupHeading}>{group.class_label}</Text>
             {group.rows.map((row) => (
               <View key={row.account_number} style={styles.row} wrap={false}>

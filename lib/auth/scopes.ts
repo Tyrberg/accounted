@@ -185,10 +185,12 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'GET /api/v1/companies/:companyId/reports/trial-balance': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/balance-sheet': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/income-statement': 'reports:read',
-  // Binary reports: PDF exports of the two financial statements, sharing the
-  // dashboard's renderer (custom date ranges supported via query params).
+  // Binary reports: financial statements and operational reports share the
+  // dashboard renderers (custom date ranges supported via query params).
   'GET /api/v1/companies/:companyId/reports/balance-sheet/pdf': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/income-statement/pdf': 'reports:read',
+  'GET /api/v1/companies/:companyId/reports/resultatrapport/pdf': 'reports:read',
+  'GET /api/v1/companies/:companyId/reports/balansrapport/pdf': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/general-ledger': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/journal-register': 'reports:read',
   'GET /api/v1/companies/:companyId/reports/vat-declaration': 'reports:read',

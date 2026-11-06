@@ -186,6 +186,27 @@ Response `200` (`application/pdf`).
 
 ---
 
+### `GET /api/v1/companies/{companyId}/reports/balansrapport/pdf`
+
+**Operational Balansrapport as a PDF.**
+`scope:reports:read · risk:low · idempotent`
+
+Per-account operational report with comparison figures and no annual-report draft disclaimer. Requires `period_id`; optional `from_date` / `to_date` (YYYY-MM-DD) must be within the fiscal period. Dimension filters are not supported.
+
+**Use when:** You need an interim Balansrapport PDF for reconciliation or a bank request.
+**Do not use for:** The formal annual-report financial statement or machine-readable figures.
+
+**Pitfalls:**
+- Unknown query parameters are rejected. The date range must lie within the fiscal period.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+
+Response `200` (`application/pdf`).
+
+---
+
 ### `GET /api/v1/companies/{companyId}/reports/continuity-check`
 
 **IB/UB continuity check: opening balances match prior closing.**
@@ -458,6 +479,27 @@ Example response `200`:
   }
 }
 ```
+
+---
+
+### `GET /api/v1/companies/{companyId}/reports/resultatrapport/pdf`
+
+**Operational Resultatrapport as a PDF.**
+`scope:reports:read · risk:low · idempotent`
+
+Per-account operational report with comparison figures and no annual-report draft disclaimer. Requires `period_id`; optional `from_date` / `to_date` (YYYY-MM-DD) must be within the fiscal period. Optional `dim_no` / `dim_code` must be supplied together; filtered reports disclose the partial view and omit the comparison.
+
+**Use when:** You need an interim Resultatrapport PDF for reconciliation or a bank request.
+**Do not use for:** The formal annual-report financial statement or machine-readable figures.
+
+**Pitfalls:**
+- Unknown query parameters are rejected. The date range must lie within the fiscal period.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+
+Response `200` (`application/pdf`).
 
 ---
 

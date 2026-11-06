@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { PNL_GROUPS } from './pnl-groups'
 import { generateTrialBalance } from './trial-balance'
 import { getLatestPostedVouchers } from './latest-vouchers'
 import type {
@@ -8,15 +9,6 @@ import type {
   ResultatrapportGroup,
   TrialBalanceRow,
 } from '@/types'
-
-const CLASS_LABELS: Record<number, string> = {
-  3: '3 Rörelsens inkomster/intäkter',
-  4: '4 Material- och varukostnader',
-  5: '5 Övriga externa kostnader',
-  6: '6 Övriga externa kostnader',
-  7: '7 Personalkostnader',
-  8: '8 Finansiella poster och bokslutsdispositioner',
-}
 
 /**
  * Resultatrapport: operational P&L report.
@@ -263,9 +255,11 @@ function buildGroups(
   for (const r of currentRows) currentByAccount.set(r.account_number, r)
 
   const groups: ResultatrapportGroup[] = []
-  for (const klass of [3, 4, 5, 6, 7, 8] as const) {
+  for (const { klass, label, matchesAccount } of PNL_GROUPS) {
     const accountsInClass = [...accountIndex.entries()]
-      .filter(([, info]) => info.class === klass)
+      .filter(([number, info]) =>
+        info.class === klass && (!matchesAccount || matchesAccount(number))
+      )
       .map(([account_number, info]) => ({ account_number, name: info.name }))
       .sort((a, b) => a.account_number.localeCompare(b.account_number))
 
@@ -292,7 +286,7 @@ function buildGroups(
 
     groups.push({
       class: klass,
-      class_label: CLASS_LABELS[klass],
+      class_label: label,
       rows,
       subtotal_current: round2(subtotalCurrent),
       subtotal_prior: round2(subtotalPrior),
