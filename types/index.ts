@@ -2257,6 +2257,7 @@ export interface ResultatrapportRow {
 }
 
 export interface ResultatrapportGroup {
+  /** Class 7 spans two groups; use class_label as the unique group key. */
   class: number
   class_label: string
   rows: ResultatrapportRow[]
@@ -2291,6 +2292,7 @@ export interface DimensionPnlRow {
 }
 
 export interface DimensionPnlGroup {
+  /** Class 7 spans two groups; use class_label as the unique group key. */
   class: number
   class_label: string
   rows: DimensionPnlRow[]

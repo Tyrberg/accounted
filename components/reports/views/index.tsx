@@ -773,7 +773,7 @@ export function ResultatrapportView({ periodId, dateRange, dimensionFilter = nul
               </thead>
               <tbody>
                 {data.groups.map((group) => (
-                  <React.Fragment key={group.class}>
+                  <React.Fragment key={group.class_label}>
                     <tr className="bg-muted/30">
                       <td colSpan={colCount} className="px-4 py-2 text-[12px] font-semibold text-muted-foreground">
                         {group.class_label}
@@ -3587,7 +3587,7 @@ export function DimensionPnlView({ periodId, dateRange }: { periodId: string; da
               </thead>
               <tbody>
                 {data.groups.map((group) => (
-                  <React.Fragment key={group.class}>
+                  <React.Fragment key={group.class_label}>
                     <tr className="bg-muted/30">
                       <td colSpan={colCount} className="px-4 py-2 text-[12px] font-semibold text-muted-foreground">
                         {group.class_label}

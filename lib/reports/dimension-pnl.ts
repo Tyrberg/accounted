@@ -3,6 +3,7 @@ import { roundOre } from '@/lib/money'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { generateTrialBalance } from './trial-balance'
+import { PNL_GROUPS } from './pnl-groups'
 import type {
   DimensionPnlColumn,
   DimensionPnlGroup,
@@ -10,17 +11,6 @@ import type {
   DimensionPnlRow,
   TrialBalanceRow,
 } from '@/types'
-
-// Same class labels as resultatrapport: the report is its per-dimension
-// sibling and must read identically. Stays-Swedish surface (report labels).
-const CLASS_LABELS: Record<number, string> = {
-  3: '3 Rörelsens inkomster/intäkter',
-  4: '4 Material- och varukostnader',
-  5: '5 Övriga externa kostnader',
-  6: '6 Övriga externa kostnader',
-  7: '7 Personalkostnader',
-  8: '8 Finansiella poster och bokslutsdispositioner',
-}
 
 /**
  * Resultat per projekt / kostnadsställe (Fortnox "Resultatrapport projekt").
@@ -192,9 +182,9 @@ export async function generateDimensionPnl(
 
   // ── Groups by class, resultatrapport-style ──────────────────────
   const groups: DimensionPnlGroup[] = []
-  for (const klass of [3, 4, 5, 6, 7, 8] as const) {
+  for (const { klass, label, matchesAccount } of PNL_GROUPS) {
     const rows = accountRows
-      .filter((r) => r.account_class === klass)
+      .filter((r) => r.account_class === klass && (!matchesAccount || matchesAccount(r.account_number)))
       .sort((a, b) => a.account_number.localeCompare(b.account_number))
     if (rows.length === 0) continue
 
@@ -203,7 +193,7 @@ export async function generateDimensionPnl(
     )
     groups.push({
       class: klass,
-      class_label: CLASS_LABELS[klass],
+      class_label: label,
       rows: rows.map(({ account_class: _klass, ...row }) => row),
       subtotals,
       subtotal_total: round2(rows.reduce((s, r) => s + r.total, 0)),
