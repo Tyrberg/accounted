@@ -169,8 +169,8 @@ Example response `200`:
 
 Renders the balansräkning as application/pdf, byte-equivalent to the dashboard export. Optional `as_of` (alias for `to_date`, YYYY-MM-DD inside the fiscal period) returns the balance position at that date, e.g. the latest month-end for bank reporting. Refuses to render when tillgångar and eget kapital + skulder differ by a full krona or more.
 
-**Use when:** You need a presentable PDF of the balance position at period end or a custom date: bank requests, board packs, or sharing outside Accounted.
-**Do not use for:** Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
+**Use when:** You need the balansräkning in the årsredovisning layout (ÅRL Bilaga 2 headings, marked as an unsigned draft) at period end or a custom date.
+**Do not use for:** Interim reports for a bank or board: use reports/balansrapport/pdf (per-account, comparison column, no draft disclaimer). Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
 
 **Pitfalls:**
 - `period_id` is required; `as_of` (alias: `to_date`, pass at most one) is optional and must lie within that fiscal period. `from_date` is not accepted: a balance sheet is a cumulative position, not a flow over a window.
@@ -368,8 +368,8 @@ Example response `200`:
 
 Renders the resultaträkning as application/pdf, byte-equivalent to the dashboard export. Optional `from_date` / `to_date` (YYYY-MM-DD, inside the fiscal period) narrow the report to a custom range. The filename carries the effective date range and an "utkast" suffix (the document is a working report, not a signed årsredovisning).
 
-**Use when:** You need a presentable PDF of the profit/loss for a period or partial period: bank requests, board packs, or sharing outside Accounted.
-**Do not use for:** Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
+**Use when:** You need the resultaträkning in the årsredovisning layout (ÅRL Bilaga 2 headings, marked as an unsigned draft) for a period or partial period.
+**Do not use for:** Interim reports for a bank or board: use reports/resultatrapport/pdf (per-account, comparison column, no draft disclaimer). Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
 
 **Pitfalls:**
 - `period_id` is required; `from_date`/`to_date` are optional and must lie within that fiscal period.
