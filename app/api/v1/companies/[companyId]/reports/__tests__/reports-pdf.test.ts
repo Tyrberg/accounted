@@ -5,6 +5,8 @@
  * the balance gate, and the binary response headers.
  */
 
+// TESTÄNDRING app/api/v1/companies/[companyId]/reports/__tests__/reports-pdf.test.ts: the existing income-statement/pdf and balance-sheet/pdf scenarios are unchanged; the injected FinancialStatementPDF mock return value (FINANCIAL_DOCUMENT) and the template assertions are added so those tests also prove the årsredovisning routes keep rendering FinancialStatementPDF and never the new operational ResultatrapportPDF/BalansrapportPDF.
+
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
 import { createQueuedMockSupabase } from '@/tests/helpers'
@@ -31,6 +33,11 @@ vi.mock('@/lib/auth/api-keys', async () => {
     validateApiKey: vi.fn(),
     createServiceClientNoCookies: vi.fn(),
   }
+})
+
+vi.mock('@supabase/supabase-js', async () => {
+  const actual = await vi.importActual<typeof import('@supabase/supabase-js')>('@supabase/supabase-js')
+  return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
 const mocks = vi.hoisted(() => ({

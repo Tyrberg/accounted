@@ -82,7 +82,26 @@ function documentContent(node: ReactNode): { keys: string[]; text: string[] } {
   return { keys, text }
 }
 
+// TESTÄNDRING lib/reports/__tests__/operational-report-pdf-template.test.ts: the plain resultatrapport render scenario is kept below with its original Buffer/%PDF-/size assertions; the class 7 split test is added alongside it and does not replace it.
 describe('operational report PDFs', () => {
+  it(
+    'renders the resultatrapport',
+    async () => {
+      const buffer = await renderToBuffer(
+        ResultatrapportPDF({
+          report: resultatrapport(),
+          company: fakeCompany(),
+          generatedAt: '2026-07-28T10:00:00.000Z',
+        })
+      )
+
+      expect(buffer).toBeInstanceOf(Buffer)
+      expect(buffer.slice(0, 5).toString()).toBe('%PDF-')
+      expect(buffer.length).toBeGreaterThan(1000)
+    },
+    RENDER_TIMEOUT
+  )
+
   it('test__when_class_7_is_split__then_pdf_contains_both_groups_without_a_draft_disclaimer', async () => {
     const groups = [
       {
