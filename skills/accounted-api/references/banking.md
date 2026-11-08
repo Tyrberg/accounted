@@ -212,6 +212,7 @@ Accepts a bank statement file (UTF-8 / UTF-16 / Windows-1252, up to 10 MB) as mu
 
 **Pitfalls:**
 - File size cap: 10 MB. Larger files require splitting client-side.
+- `settlement_account` accepts a cash account ledger number (for example, 1930) as a form field or query parameter; the form field takes precedence. It must identify an enabled cash account for this company. If omitted, the only enabled cash account is selected automatically; otherwise VALIDATION_ERROR is returned.
 - `format` query parameter is optional; auto-detection works for all supported banks. Pass `format` only to force a specific format. Accepted values: seb, swedbank, handelsbanken, nordea, nordea_business, lansforsakringar, ica_banken, skandia, lunar, northmill, wise, wise_statement, generic_csv, camt053.
 - Wise transaction-history rows with refunded or unknown statuses, unknown directions, or different source and target currencies are rejected instead of guessed. Import the matching per-currency Wise balance statements.
 - Duplicate detection is by external_id (composed from format + date + description + amount + row index, or the camt.053 entry reference / Wise transfer id where the file carries one); a re-import of the same file typically deduplicates rather than creating doubles.
