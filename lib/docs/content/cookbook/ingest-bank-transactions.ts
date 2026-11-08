@@ -8,17 +8,18 @@ This is the operational companion to the [Transactions reference](/docs/api/refe
 
 - A test API key with \`transactions:write\`, \`transactions:read\`, and \`operations:read\` scopes. (There is no \`imports:write\` scope: the bank import runs under \`transactions:write\`, and polling the operation needs \`operations:read\`.)
 - A bank statement file in one of the supported formats: CSV (SEB / Swedbank / Handelsbanken / Nordea / Nordea Business / Länsförsäkringar / ICA Banken / Skandia / Lunar / Northmill / generic CSV auto-detected), CAMT.053 XML, or a generic account-statement CSV with at minimum date + amount + description columns.
-- The settlement account for the bank: typically \`1930\` for an SEK business account (check via \`GET /accounts\`). \`/imports/bank\` resolves the settlement account automatically; \`settlement_account\` is an explicit parameter of \`POST /transactions/ingest\`, not of the file upload.
+- The settlement account for the bank: typically \`1930\` for an SEK business account. Check enabled cash accounts and their \`ledger_account\` values via \`GET /cash-accounts\`; pass the ledger number as \`settlement_account\` on the file upload.
 
 ## 1. Upload the bank file
 
-\`POST /imports/bank\` accepts multipart upload. Format detection is automatic; the detected format is reported in the polled operation result (\`result.format\`), not in the upload response. The endpoint kicks off an async operation: you'll poll for the result.
+\`POST /imports/bank\` accepts multipart upload. Format detection is automatic; the detected format is reported in the polled operation result (\`result.format\`), not in the upload response. Pass \`settlement_account\` as a form field (as below) or query parameter; the form field takes precedence. It must identify an enabled cash account for this company. If omitted, exactly one enabled cash account is selected automatically. Zero or multiple enabled accounts return \`400 VALIDATION_ERROR\` before any writes: enable a cash account if none exists, or specify the intended account when several exist. The endpoint kicks off an async operation: you'll poll for the result.
 
 \`\`\`bash
 curl "https://app.gnubok.se/api/v1/companies/$COMPANY_ID/imports/bank" \\
   -H "Authorization: Bearer gnubok_sk_test_..." \\
   -H "Idempotency-Key: $(uuidgen)" \\
-  -F "file=@statement-2026-04.csv"
+  -F "file=@statement-2026-04.csv" \\
+  -F "settlement_account=1930"
 \`\`\`
 
 Response is a 202 with the operation handle:
@@ -213,7 +214,7 @@ The ledger is SEK-denominated; foreign amounts are converted to SEK automaticall
 ## Common pitfalls
 
 - **Re-running the same file is safe; date-only overlap is also safe.** Dedup is primarily by a stable \`external_id\` (date + amount + counterparty); a secondary content match on \`(date, amount, description)\` against already-booked rows also skips, so partial overlap of two statements doesn't double-import.
-- **Settlement account selection matters.** The wrong settlement account silently breaks bank reconciliation later. \`1930\` (företagskonto) is the SEK default; a foreign-currency bank account uses its own asset account (e.g. \`1932\` for USD). \`/imports/bank\` resolves the settlement account automatically — to set it explicitly, ingest via \`POST /transactions/ingest\` with \`settlement_account\`.
+- **Settlement account selection matters.** The wrong settlement account silently breaks bank reconciliation later. \`1930\` (företagskonto) is the SEK default; a foreign-currency bank account uses its own asset account (e.g. \`1932\` for USD). Pass \`settlement_account\` to \`POST /imports/bank\` for file uploads or \`POST /transactions/ingest\` for JSON batches. File uploads only select automatically when exactly one cash account is enabled.
 - **Cash-method companies and partial payments don't mix.** If \`company_settings.accounting_method = 'cash'\` and you try to match a partial payment, the response is \`VALIDATION_ERROR\` rather than booking accrual entries: cash-method cannot model the per-installment moms event correctly (bokslutsmetoden reports moms at payment, per installment). Either book the partial payment as a separate categorisation or switch to accrual.
 - **Batch-categorize is partial-success by default.** If one item hits a locked period, the others still commit. The summary block tells you the totals; check per-item \`ok\` flags.
 - **Private is a booking; ignore is not.** \`is_business: false\` books eget uttag / insättning, so in a locked or closed period it returns \`TX_CATEGORIZE_PRIVATE_PERIOD_LOCKED\`. A row that is not a business event at all (a PSD2 ghost row, a duplicate from a reconnect, a transfer that never executed) should be ignored instead: \`POST /transactions/{id}/ignore\` writes no verifikat and is allowed in a locked period; \`DELETE\` on the same path restores the row. Real purchases and owner withdrawals still need the period unlocked.

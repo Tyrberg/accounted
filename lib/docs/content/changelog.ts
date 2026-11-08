@@ -10,6 +10,12 @@ export const CHANGELOG_MD = `# Changelog
 
 The first stable release of the public REST API. Six phases of development covering the full agent-native surface: authentication + discovery, invoicing vertical, transactions vertical, bookkeeping engine + suppliers + compliance check, payroll + reports + import, webhooks.
 
+### Bank-file settlement account (2026-10-29)
+
+- **Behaviour change:** \`POST /companies/{companyId}/imports/bank\` accepts \`settlement_account\` (a ledger account number such as \`1930\`) as a multipart form field or query parameter; the form field takes precedence. It must match an enabled cash account for the company. Imported rows receive that account's \`cash_account_id\`.
+- Without the parameter, the only enabled cash account is selected automatically. Calls that previously succeeded with zero or multiple enabled cash accounts now return \`400 VALIDATION_ERROR\` before any writes. Enable a cash account if none exists; otherwise specify the intended account.
+- **Existing data follow-up:** this fix applies to new imports only. Previously imported rows with \`cash_account_id = NULL\` remain unbound and can still weaken reconciliation and duplicate account guards. A separate reviewed backfill must establish the correct account from each original import before updating those rows; the current account configuration alone is insufficient evidence. No backfill is included or executed by this change.
+
 ### Authentication + discovery (Phase 1)
 
 - API key auth via \`Authorization: Bearer gnubok_sk_<random>\` (live keys) / \`gnubok_sk_test_<random>\` (test keys). 100 RPM rate limit per key.
