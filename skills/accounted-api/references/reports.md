@@ -169,14 +169,35 @@ Example response `200`:
 
 Renders the balansräkning as application/pdf, byte-equivalent to the dashboard export. Optional `as_of` (alias for `to_date`, YYYY-MM-DD inside the fiscal period) returns the balance position at that date, e.g. the latest month-end for bank reporting. Refuses to render when tillgångar and eget kapital + skulder differ by a full krona or more.
 
-**Use when:** You need a presentable PDF of the balance position at period end or a custom date: bank requests, board packs, or sharing outside Accounted.
-**Do not use for:** Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
+**Use when:** You need the balansräkning in the årsredovisning layout (ÅRL Bilaga 2 headings, marked as an unsigned draft) at period end or a custom date.
+**Do not use for:** Interim reports for a bank or board: use reports/balansrapport/pdf (per-account, comparison column, no draft disclaimer). Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
 
 **Pitfalls:**
 - `period_id` is required; `as_of` (alias: `to_date`, pass at most one) is optional and must lie within that fiscal period. `from_date` is not accepted: a balance sheet is a cumulative position, not a flow over a window.
 - Unknown query parameters are rejected with VALIDATION_ERROR, not silently ignored.
 - An unbalanced balansräkning (>= 1 kr difference) returns REPORT_GENERATION_FAILED instead of a PDF: fix the imbalance first.
 - The PDF is marked "utkast": it is a working report, not a fastställd årsredovisning.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+
+Response `200` (`application/pdf`).
+
+---
+
+### `GET /api/v1/companies/{companyId}/reports/balansrapport/pdf`
+
+**Operational Balansrapport as a PDF.**
+`scope:reports:read · risk:low · idempotent`
+
+Per-account operational report with comparison figures and no annual-report draft disclaimer. Requires `period_id`; optional `from_date` / `to_date` (YYYY-MM-DD) must be within the fiscal period. Dimension filters are not supported.
+
+**Use when:** You need an interim Balansrapport PDF for reconciliation or a bank request.
+**Do not use for:** The formal annual-report financial statement or machine-readable figures.
+
+**Pitfalls:**
+- Unknown query parameters are rejected. The date range must lie within the fiscal period.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
@@ -347,8 +368,8 @@ Example response `200`:
 
 Renders the resultaträkning as application/pdf, byte-equivalent to the dashboard export. Optional `from_date` / `to_date` (YYYY-MM-DD, inside the fiscal period) narrow the report to a custom range. The filename carries the effective date range and an "utkast" suffix (the document is a working report, not a signed årsredovisning).
 
-**Use when:** You need a presentable PDF of the profit/loss for a period or partial period: bank requests, board packs, or sharing outside Accounted.
-**Do not use for:** Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
+**Use when:** You need the resultaträkning in the årsredovisning layout (ÅRL Bilaga 2 headings, marked as an unsigned draft) for a period or partial period.
+**Do not use for:** Interim reports for a bank or board: use reports/resultatrapport/pdf (per-account, comparison column, no draft disclaimer). Machine-readable figures (use the JSON endpoint without /pdf). The formal K2/K3 årsredovisning document (use the year-end flow).
 
 **Pitfalls:**
 - `period_id` is required; `from_date`/`to_date` are optional and must lie within that fiscal period.
@@ -458,6 +479,27 @@ Example response `200`:
   }
 }
 ```
+
+---
+
+### `GET /api/v1/companies/{companyId}/reports/resultatrapport/pdf`
+
+**Operational Resultatrapport as a PDF.**
+`scope:reports:read · risk:low · idempotent`
+
+Per-account operational report with comparison figures and no annual-report draft disclaimer. Requires `period_id`; optional `from_date` / `to_date` (YYYY-MM-DD) must be within the fiscal period. Optional `dim_no` / `dim_code` must be supplied together; filtered reports disclose the partial view and omit the comparison.
+
+**Use when:** You need an interim Resultatrapport PDF for reconciliation or a bank request.
+**Do not use for:** The formal annual-report financial statement or machine-readable figures.
+
+**Pitfalls:**
+- Unknown query parameters are rejected. The date range must lie within the fiscal period.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+
+Response `200` (`application/pdf`).
 
 ---
 

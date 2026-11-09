@@ -9917,7 +9917,7 @@ export const tools: McpTool[] = [
         },
         groups: {
           type: 'array',
-          description: 'BAS class groups (3-8); each row\'s values[] aligns with columns[].',
+          description: 'BAS class groups (3-8; class 7 splits into 70-76 and 77-79, so class is not unique, key on class_label); each row\'s values[] aligns with columns[].',
           items: {
             type: 'object',
             properties: {

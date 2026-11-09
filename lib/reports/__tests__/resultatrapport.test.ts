@@ -60,6 +60,38 @@ function tb(rows: TrialBalanceRow[]) {
 }
 
 describe('generateResultatrapport', () => {
+  it('test__when_class_7_has_prior_only_and_long_accounts__then_groups_and_subtotals_include_them', async () => {
+    const q = createQueuedMockSupabase()
+    q.enqueue({ data: { period_start: '2026-01-01', period_end: '2026-12-31', previous_period_id: 'period-0' } })
+    q.enqueue({ data: { period_start: '2025-01-01', period_end: '2025-12-31' } })
+    mockTrialBalance.mockResolvedValueOnce(tb([
+      makeRow({ account_number: '7000', account_class: 7, period_debit: 100 }),
+      makeRow({ account_number: '7699', account_class: 7, period_debit: 200 }),
+      makeRow({ account_number: '7700', account_class: 7, period_debit: 300 }),
+      makeRow({ account_number: '7821', account_class: 7, account_name: 'Avskrivningar på byggnader', period_debit: 400 }),
+      makeRow({ account_number: '7960', account_class: 7, account_name: 'Valutakursförluster på fordringar och skulder av rörelsekaraktär', period_debit: 25 }),
+      makeRow({ account_number: '7990', account_class: 7, account_name: 'Övriga rörelsekostnader', period_debit: 75 }),
+      makeRow({ account_number: '7999', account_class: 7, period_debit: 500 }),
+      makeRow({ account_number: '79991', account_class: 7, period_debit: 80 }),
+      makeRow({ account_number: '76991', account_class: 7, period_debit: 20 }),
+    ])).mockResolvedValueOnce(tb([
+      makeRow({ account_number: '7210', account_class: 7, period_debit: 50 }),
+      makeRow({ account_number: '7821', account_class: 7, period_debit: 60 }),
+      makeRow({ account_number: '7900', account_class: 7, period_debit: 70 }),
+      makeRow({ account_number: '79992', account_class: 7, period_debit: 10 }),
+    ]))
+    const report = await generateResultatrapport(q.supabase as unknown as Parameters<typeof generateResultatrapport>[0], 'company-1', 'period-1')
+    expect(report.groups.map((group) => [group.class_label, group.rows.map((row) => row.account_number)])).toEqual([
+      ['70-76 Personalkostnader', ['7000', '7210', '7699', '76991']],
+      ['77-79 Avskrivningar, nedskrivningar och övriga rörelsekostnader', ['7700', '7821', '7900', '7960', '7990', '7999', '79991', '79992']],
+    ])
+    expect(report.groups.map((group) => [group.subtotal_current, group.subtotal_prior])).toEqual([
+      [-320, -50], [-1380, -140],
+    ])
+    expect(report.net_result_current).toBe(-1700)
+    expect(report.net_result_prior).toBe(-190)
+  })
+
   it('groups P&L accounts by class with current and prior period values', async () => {
     const q = createQueuedMockSupabase()
     q.enqueue({
