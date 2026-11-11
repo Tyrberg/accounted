@@ -1009,6 +1009,109 @@ describe('calculateVatDeclaration: parent/summary accounts', () => {
 // "Standard moms" (chart_of_accounts.default_vat_rate).
 // ============================================================
 
+describe('calculateVatDeclaration: voucher-only revenue (imported/manual)', () => {
+  it('derives 05/08/42/10/49 from the ledger with no invoices or transactions', async () => {
+    chartAccounts = [
+      {
+        account_number: '3911',
+        account_name: 'Hyresintäkter, frivillig skattskyldighet',
+        default_vat_rate: null,
+        default_vat_treatment: 'rental_voluntary',
+      },
+      {
+        account_number: '3914',
+        account_name: 'Hyresintäkter, momsfri',
+        default_vat_rate: null,
+        default_vat_treatment: 'exempt',
+      },
+    ]
+    seedLedger([
+      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '3911', debit_amount: 0, credit_amount: 4000 },
+      { account_number: '3914', debit_amount: 0, credit_amount: 500 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 1250 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(1000)
+    expect(result.rutor.ruta08).toBe(4000)
+    expect(result.rutor.ruta42).toBe(500)
+    expect(result.rutor.ruta10).toBe(1250)
+    expect(result.rutor.ruta49).toBe(1250)
+    const codes = runVatDeclarationChecks(result.rutor).map((f) => f.code)
+    expect(codes).not.toContain('OUTPUT_VAT_EXCEEDS_SALES_BASE')
+  })
+
+  it('warns when output VAT exceeds 25/12/6% of the bases', async () => {
+    chartAccounts = []
+    seedLedger([
+      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 25250 },
+    ])
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    const codes = runVatDeclarationChecks(result.rutor).map((f) => f.code)
+    expect(codes).toContain('OUTPUT_VAT_EXCEEDS_SALES_BASE')
+  })
+
+  // The filed rutor follow explicit configuration only. A rent or momsfri
+  // account whose treatment was never set stays out of rutor 08/42 even when
+  // its name suggests one; the consistency warning surfaces the gap instead
+  // and points the user at the account's "Standard moms".
+  it('does not file an unconfigured account in ruta 08/42 from its name alone', async () => {
+    chartAccounts = [
+      { account_number: '3911', account_name: 'Hyresintäkter, frivillig skattskyldighet', default_vat_rate: null },
+      { account_number: '3914', account_name: 'Hyresintäkter, momsfri', default_vat_rate: null },
+    ]
+    seedLedger([
+      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '3911', debit_amount: 0, credit_amount: 4000 },
+      { account_number: '3914', debit_amount: 0, credit_amount: 500 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 1250 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(1000)
+    expect(result.rutor.ruta08).toBe(0)
+    expect(result.rutor.ruta42).toBe(0)
+    const finding = runVatDeclarationChecks(result.rutor)
+      .find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')
+    expect(finding?.status).toBe('WARNING')
+    expect(finding?.message).toMatch(/Standard moms/)
+  })
+})
+
+describe('calculateVatDeclaration: ruta 05/08 boundaries', () => {
+  it('keeps equipment hire with an explicit rate in ruta 05', async () => {
+    chartAccounts = [
+      { account_number: '3040', account_name: 'Uthyrning maskiner 25 % moms', default_vat_rate: 0.25 },
+    ]
+    seedLedger([
+      { account_number: '3040', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 250 },
+    ])
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    expect(result.rutor.ruta05).toBe(1000)
+    expect(result.rutor.ruta08).toBe(0)
+  })
+
+  it('warns but does not block when periodisering puts full moms on 2611 and revenue on 29xx', async () => {
+    chartAccounts = []
+    seedLedger([
+      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 2500 },
+    ])
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    const findings = runVatDeclarationChecks(result.rutor)
+    const finding = findings.find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')
+    // Documented, correct-by-design drift: a warning only, naming the cause.
+    expect(findings.every((f) => f.status === 'WARNING')).toBe(true)
+    expect(finding?.status).toBe('WARNING')
+    expect(finding?.message).toMatch(/periodisering/)
+  })
+})
+
 describe('calculateVatDeclaration: company-specific ruta 05 accounts', () => {
   it('infers a missing rate only from a matching domestic-sales number and label (#1289)', async () => {
     chartAccounts = [{

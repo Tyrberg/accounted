@@ -2,8 +2,10 @@
  * GET /api/v1/companies/{companyId}/reports/vat-declaration
  *
  * Computes the Swedish momsdeklaration for a period (monthly, quarterly,
- * or yearly). Returns all 12 declaration rutor (05/06/07/10/11/12/30/31/32/39/40/48/49)
- * mapped from the BAS accounts (2611/2621/2631/3001/3002/3003/etc.).
+ * or yearly). Returns the declaration rutor (05/06/07/08/10/11/12/20-24/30/31/32/
+ * 39/40/42/48/50/60-62/49) mapped from the BAS accounts and the accounts'
+ * configured VAT treatment, plus `checks`: the local consistency findings
+ * (runVatDeclarationChecks) for those rutor.
  */
 
 import { z } from 'zod'
@@ -12,7 +14,11 @@ import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ValidationError } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
-import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
+import {
+  calculateVatDeclaration,
+  rcInputTotalsFromDeclaration,
+} from '@/lib/reports/vat-declaration'
+import { runVatDeclarationChecks } from '@/lib/reports/vat-declaration-checks'
 import type { VatPeriodType } from '@/types'
 
 const VatPeriodTypeEnum = z.enum(['monthly', 'quarterly', 'yearly'])
@@ -24,7 +30,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/reports/vat-declaration',
   summary: 'Swedish VAT declaration (momsdeklaration) for a period.',
   description:
-    'Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå: the bottom line). Mapping rules match SKV 4700.',
+    'Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 08 (rent with voluntary tax liability), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 42 (other VAT-exempt sales), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå: the bottom line). Mapping rules match SKV 4700.',
   useWhen:
     'Submitting momsdeklaration to Skatteverket, reconciling VAT balances at month/quarter end, or building a VAT-payable dashboard.',
   doNotUseFor:
@@ -34,6 +40,7 @@ registerEndpoint({
     'For monthly: period is 1-12. For quarterly: period is 1-4. For yearly: period is 1.',
     '`accounting_method` is accepted for backward compatibility but has no effect on the figures: the declaration is a pure ledger projection, and the method (faktureringsmetoden vs kontantmetoden per ML 15 kap 8-11 §§, ML 2023:200) is already reflected in when VAT-bearing journal entries are posted.',
     'Output ruta 49 = (10+11+12+30+31+32+60+61+62) − 48. Positive = pay; negative = refund.',
+    '`checks` lists the rutor-level consistency findings (`code`, `status` ERROR|WARNING, Swedish `message`, `rutor`). An empty array means none were found. It does not include the per-voucher reverse-charge basis scan that the web UI and MCP add on top. Read it before filing: for example OUTPUT_VAT_EXCEEDS_SALES_BASE means rutor 10-12 imply a larger base than rutor 05-08 report, usually a revenue account without a configured VAT treatment.',
   ],
   example: {
     response: {
@@ -43,6 +50,7 @@ registerEndpoint({
         period: 4,
         rutor: {
           ruta05: 0,
+          ruta08: 0,
           ruta10: 0,
           ruta11: 0,
           ruta12: 0,
@@ -56,6 +64,7 @@ registerEndpoint({
           ruta32: 0,
           ruta39: 0,
           ruta40: 0,
+          ruta42: 0,
           ruta48: 0,
           ruta50: 0,
           ruta60: 0,
@@ -63,6 +72,7 @@ registerEndpoint({
           ruta62: 0,
           ruta49: 0,
         },
+        checks: [],
       },
       meta: { request_id: 'req_…', api_version: '2026-05-12' },
     },
@@ -130,6 +140,17 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     )
     if (!gen.ok) return gen.response
 
-    return ok(gen.result, { requestId: ctx.requestId })
+    // The rutor-level consistency checks (runVatDeclarationChecks), so an API
+    // client never receives an internally inconsistent declaration (for
+    // example ruta 10 implying a larger base than rutor 05-08 carry) without a
+    // warning. The UI and MCP additionally run a per-voucher reverse-charge
+    // basis scan (findRcBasisGaps + withRcBasisGapFindings); that extra DB scan
+    // is not part of this endpoint.
+    const checks = runVatDeclarationChecks(
+      gen.result.rutor,
+      rcInputTotalsFromDeclaration(gen.result),
+    )
+
+    return ok({ ...gen.result, checks }, { requestId: ctx.requestId })
   },
 )
