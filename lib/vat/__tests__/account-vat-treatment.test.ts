@@ -90,6 +90,15 @@ describe('suggestVatTreatment', () => {
     expect(suggestVatTreatment('4010', 'Reumatologiska varor')).toBeNull()
   })
 
+  it('suggests rental_voluntary for a "Hyresintäkter" label only when it says frivillig', () => {
+    expect(suggestVatTreatment('3913', 'Hyresintäkter, frivillig skattskyldighet')).toEqual({
+      treatment: 'rental_voluntary', rate: 0.25,
+    })
+    // Rent without voluntary tax liability is momsfri (ML 10 kap.) and must
+    // not be suggested as taxable rent.
+    expect(suggestVatTreatment('3913', 'Hyresintäkter')?.treatment).not.toBe('rental_voluntary')
+  })
+
   it('keeps VMB without a generic booking rate', () => {
     expect(suggestVatTreatment('3211', 'Försäljning VMB')).toEqual({
       treatment: 'vmb', rate: null,

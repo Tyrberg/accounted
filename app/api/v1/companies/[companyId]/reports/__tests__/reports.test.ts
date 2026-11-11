@@ -56,7 +56,9 @@ vi.mock('@/lib/reports/income-statement', () => ({
 vi.mock('@/lib/reports/sie-export', () => ({
   generateSIEExport: mocks.generateSIEExport,
 }))
-vi.mock('@/lib/reports/vat-declaration', () => ({
+// TESTÄNDRING app/api/v1/companies/[companyId]/reports/__tests__/reports.test.ts: the route now also imports rcInputTotalsFromDeclaration from this module to build `checks`, so the mock keeps the real module and still replaces only calculateVatDeclaration; the happy-path scenario and its injected rutor are unchanged.
+vi.mock('@/lib/reports/vat-declaration', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/reports/vat-declaration')>()),
   calculateVatDeclaration: mocks.calculateVatDeclaration,
 }))
 
@@ -664,5 +666,43 @@ describe('GET /reports/vat-declaration', () => {
       2026,
       4,
     )
+    expect(body.data.checks).toEqual([])
+  })
+
+  it('returns a consistency warning when output VAT implies a larger base than rutor 05-08', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+    const zeroRutor = Object.fromEntries(
+      [
+        '05', '06', '07', '08', '10', '11', '12', '20', '21', '22', '23', '24',
+        '30', '31', '32', '35', '36', '37', '38', '39', '40', '41', '42',
+        '48', '49', '50', '60', '61', '62',
+      ].map((n) => [`ruta${n}`, 0]),
+    )
+    // Revenue booked on an account without a VAT treatment: 2 500 kr of
+    // output VAT implies a 10 000 kr base, but only 540 kr reaches ruta 05.
+    mocks.calculateVatDeclaration.mockResolvedValue({
+      rutor: { ...zeroRutor, ruta05: 540, ruta10: 2500, ruta49: 2500 },
+    })
+
+    const res = await vatDeclaration(
+      makeReq(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/reports/vat-declaration?period_type=quarterly&year=2026&period=3`,
+      ),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.rutor.ruta10).toBe(2500)
+    const codes = body.data.checks.map((c: { code: string }) => c.code)
+    expect(codes).toContain('OUTPUT_VAT_EXCEEDS_SALES_BASE')
+    const finding = body.data.checks.find(
+      (c: { code: string }) => c.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE',
+    )
+    expect(finding.status).toBe('WARNING')
   })
 })

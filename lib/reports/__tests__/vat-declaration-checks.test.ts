@@ -356,22 +356,11 @@ describe('runVatDeclarationChecks', () => {
       expect(runVatDeclarationChecks(rutor)).toEqual([])
     })
 
-    it('absorbs drift inside the 0.5% tolerance', () => {
+    // TESTÄNDRING lib/reports/__tests__/vat-declaration-checks.test.ts: the 0.5% allowance was removed in favour of a flat 1 kr limit (review of the ruta 08/42 change), so 40 kr drift on a 100 000 kr base now warns instead of passing.
+    it('warns on drift that a percentage allowance would have hidden', () => {
       const rutor: VatDeclarationRutor = {
         ...emptyRutor,
-        ruta05: 100040, // implied base 100 000, tolerance 500
-        ruta10: 25000,
-        ruta49: 25000,
-      }
-      expect(
-        runVatDeclarationChecks(rutor).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL'),
-      ).toBeUndefined()
-    })
-
-    it('warns just outside the 0.5% tolerance', () => {
-      const rutor: VatDeclarationRutor = {
-        ...emptyRutor,
-        ruta05: 100600, // implied base 100 000, tolerance 500
+        ruta05: 100040, // implied base 100 000: 40 kr of base without output VAT
         ruta10: 25000,
         ruta49: 25000,
       }
@@ -380,10 +369,45 @@ describe('runVatDeclarationChecks', () => {
       ).toBe('WARNING')
     })
 
-    it('applies the 1 kr tolerance floor at a small base', () => {
+    it('warns at a 500 kr shortfall on a 100 000 kr base', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100600, // implied base 100 000
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')?.status,
+      ).toBe('WARNING')
+    })
+
+    it('applies a flat 1 kr tolerance: 1 kr passes, 1.01 kr warns', () => {
+      const atLimit: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100001, // implied base 100 000: exactly 1 kr
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(atLimit).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL'),
+      ).toBeUndefined()
+
+      const overLimit: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100001.01,
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(overLimit).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')
+          ?.status,
+      ).toBe('WARNING')
+    })
+
+    it('applies the same 1 kr tolerance at a small base', () => {
       const inside: VatDeclarationRutor = {
         ...emptyRutor,
-        ruta05: 100.8, // implied 100, floor tolerance 1 kr
+        ruta05: 100.8, // implied 100, 0.80 kr drift
         ruta10: 25,
         ruta49: 25,
       }
@@ -411,6 +435,50 @@ describe('runVatDeclarationChecks', () => {
       const findings = runVatDeclarationChecks(rutor)
       expect(findings.find((f) => f.code === 'TAXABLE_SALES_WITHOUT_OUTPUT')?.status).toBe('ERROR')
       expect(findings.find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')).toBeUndefined()
+    })
+  })
+
+  // The opposite direction: rutor 10-12 imply a larger base than rutor 05-08
+  // report, e.g. voucher-booked revenue on an account with no VAT treatment
+  // whose output VAT still lands on 2611. Flat 1 kr tolerance, never silent.
+  describe('OUTPUT_VAT_EXCEEDS_SALES_BASE (warning tier)', () => {
+    it('warns, names periodisering/VMB, and never blocks', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 1000,
+        ruta10: 25250, // implied base 101 000: 100 000 kr of base missing
+        ruta49: 25250,
+      }
+      const findings = runVatDeclarationChecks(rutor)
+      const finding = findings.find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')
+      expect(finding?.status).toBe('WARNING')
+      expect(finding?.message).toMatch(/periodisering/)
+      expect(finding?.message).toMatch(/VMB/)
+      expect(findings.every((f) => f.status === 'WARNING')).toBe(true)
+    })
+
+    it('warns on a deviation over 1 kr even at a large base (no percentage allowance)', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 99600, // implied base 100 000: 400 kr missing, far below 0.5%
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')?.status,
+      ).toBe('WARNING')
+    })
+
+    it('stays silent at or under 1 kr of deviation', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 99999, // implied base 100 000: exactly 1 kr
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE'),
+      ).toBeUndefined()
     })
   })
 

@@ -50,6 +50,7 @@ export interface VatDeclarationCheck {
     | 'IMPORT_OUTPUT_WITHOUT_BASE'
     | 'OUTPUT_VAT_WITHOUT_SALES_BASE'
     | 'SALES_OUTPUT_VAT_SHORTFALL'
+    | 'OUTPUT_VAT_EXCEEDS_SALES_BASE'
   status: VatDeclarationCheckStatus
   /** Swedish user-facing message; safe to render directly in the UI. */
   message: string
@@ -235,12 +236,12 @@ export function runVatDeclarationChecks(
   //     full moms untouched on 2611 (invoice-entries.ts), then credit 3001 with
   //     no moms in each dissolution month, so both directions drift by design.
   // Any of those would turn a proportional check into a permanent filing-
-  // blocking ERROR (isFilingBlocked) on a correct declaration. Making rutor 07
-  // and 08 mappable and reconciling the revenue_account override is the
-  // prerequisite; see the report accompanying this change.
-  //
-  // ONE direction is proportionally checkable without blocking: see
-  // SALES_OUTPUT_VAT_SHORTFALL below.
+  // blocking ERROR (isFilingBlocked) on a correct declaration. Note that ruta
+  // 08 (and ruta 42) is now derived from the ledger for voucher-booked revenue
+  // on accounts classified as rental_voluntary/exempt, but ruta 07 (VMB), the
+  // revenue_account override and periodisering drift remain, so both
+  // proportional directions are WARNING tier only: see
+  // SALES_OUTPUT_VAT_SHORTFALL and OUTPUT_VAT_EXCEEDS_SALES_BASE below.
   const taxableSalesBase = rutor.ruta05 + rutor.ruta06 + rutor.ruta07 + rutor.ruta08
   const taxableSalesOutput = rutor.ruta10 + rutor.ruta11 + rutor.ruta12
   if (taxableSalesBase > eps && taxableSalesOutput <= eps) {
@@ -281,23 +282,26 @@ export function runVatDeclarationChecks(
   // "Inga fel hittades" banner: undeclared moms and skattetillägg exposure
   // under SFL 49 kap 4 §.
   //
-  // Only THIS direction (reported base implies more output VAT than rutor
-  // 10-12 carry) is proportionally checkable: every unmapped drift source
-  // listed above (VMB, frivillig uthyrning, revenue_account overrides,
-  // periodisering in the invoice month) inflates the OUTPUT side and can only
-  // suppress this finding, never trigger it. The one legitimate trigger is
+  // In this direction (reported base implies more output VAT than rutor
+  // 10-12 carry) the drift sources listed above (VMB, revenue_account
+  // overrides, periodisering in the invoice month) inflate the OUTPUT side and
+  // can only suppress this finding, never trigger it. The one legitimate trigger is
   // periodiserade invoice lines dissolving (3001 credited with the moms
   // already declared in the invoice month), which is why this is a WARNING
   // that names that cause and never blocks filing (isFilingBlocked reads
   // ERROR only), following the RC_INPUT_VAT_MISMATCH precedent.
   //
   // The base comparison is exact per rate (basbelopp = moms/sats summed over
-  // 25/12/6), so legitimate mixed-rate declarations net to zero drift; the
-  // shared max(1 kr, 0.5%) tolerance absorbs per-voucher öre rounding.
+  // 25/12/6), so legitimate mixed-rate declarations net to zero drift. The
+  // tolerance is a flat 1 kr, the same as OUTPUT_VAT_EXCEEDS_SALES_BASE below:
+  // a percentage allowance (formerly max(1 kr, 0.5%)) let 500 kr of base on a
+  // 100 000 kr declaration, about 125 kr of utgående moms, pass silently. The
+  // cost of the tight limit is a warning (never a block) when öre rounding
+  // sums past 1 kr, and the message names when the warning can be left as is.
   const expectedSalesBase =
     rutor.ruta10 / 0.25 + rutor.ruta11 / 0.12 + rutor.ruta12 / 0.06
-  const salesTolerance = Math.max(1, expectedSalesBase * 0.005)
-  if (taxableSalesOutput > eps && taxableSalesBase > expectedSalesBase + salesTolerance) {
+  const SALES_BASE_TOLERANCE = 1
+  if (taxableSalesOutput > eps && taxableSalesBase > expectedSalesBase + SALES_BASE_TOLERANCE) {
     const shortfall = Math.round(taxableSalesBase - expectedSalesBase)
     findings.push({
       code: 'SALES_OUTPUT_VAT_SHORTFALL',
@@ -313,6 +317,36 @@ export function runVatDeclarationChecks(
         'rätt ruta (35/36/39/40). Använder du periodisering av fakturarader ' +
         'är skillnaden korrekt (momsen redovisas i fakturamånaden, intäkten ' +
         'löpande) och varningen kan lämnas utan åtgärd.',
+      rutor: ['ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12'],
+    })
+  }
+
+  // The opposite direction: output VAT (ruta 10-12) implies a larger base than
+  // rutor 05-08 carry. The usual cause is revenue whose account maps to no
+  // ruta (voucher-booked rent with voluntary tax liability, unclassified
+  // revenue accounts). Never silent: a deviation over a flat 1 kr warns, with
+  // no percentage allowance, because on a large base a percentage would hide
+  // a whole missing revenue account. The cost is a warning (never a block) on
+  // a period whose öre rounding sums past 1 kr; the message names the
+  // legitimate causes so the user can leave it.
+  const excessOutputBase = expectedSalesBase - taxableSalesBase
+  if (taxableSalesOutput > eps && taxableSalesBase > eps && excessOutputBase > SALES_BASE_TOLERANCE) {
+    findings.push({
+      code: 'OUTPUT_VAT_EXCEEDS_SALES_BASE',
+      status: 'WARNING',
+      message:
+        'Den utgående momsen (ruta 10-12) motsvarar ett underlag på cirka ' +
+        `${Math.round(expectedSalesBase).toLocaleString('sv-SE')} kr, men den ` +
+        'redovisade momspliktiga försäljningen (ruta 05-08) är bara ' +
+        `${Math.round(taxableSalesBase).toLocaleString('sv-SE')} kr: cirka ` +
+        `${Math.round(excessOutputBase).toLocaleString('sv-SE')} kr av underlaget ` +
+        'saknas. Kontrollera att intäktskonton (till exempel uthyrning med ' +
+        'frivillig skattskyldighet, ruta 08) har rätt "Standard moms" i ' +
+        'kontoplanen. Använder du periodisering av fakturarader, ' +
+        'vinstmarginalbeskattning (VMB) eller ett annat intäktskonto på ' +
+        'fakturaraden är skillnaden korrekt (momsen redovisas i ' +
+        'fakturamånaden eller på ett konto utan ruta) och varningen kan ' +
+        'lämnas utan åtgärd.',
       rutor: ['ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12'],
     })
   }
