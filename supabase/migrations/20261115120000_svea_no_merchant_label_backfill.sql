@@ -7,7 +7,7 @@
 -- 'Kortköp, handlare saknas i bankdata' (sendsCardPurchasesWithoutMerchant in
 -- extensions/general/enable-banking/lib/transaction-label.ts), and the
 -- underlag list asks for their receipt by matching that label in
--- original_description (purchaseRowFilter in
+-- original_description (fetchPurchasesWithoutUnderlag in
 -- lib/transactions/purchases-without-underlag.ts). Rows synced before the
 -- change still carry the old no-text label and would be neither relabelled nor
 -- listed, so this one-shot backfill gives them the title a fresh sync of the
