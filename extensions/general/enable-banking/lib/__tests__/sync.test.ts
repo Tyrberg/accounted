@@ -159,11 +159,11 @@ describe('syncAccountTransactions', () => {
 
   it('passes the connection bank name to the converter so it can pick the empty-row title', async () => {
     mockGetAllTransactionsWithRaw.mockResolvedValue({
-      transactions: [{ transaction_amount: { amount: '194.29', currency: 'SEK' }, booking_date: '2026-08-12' }],
+      transactions: [{ transaction_amount: { amount: '123.45', currency: 'SEK' }, booking_date: '2026-08-03' }],
       rawPages: [],
     })
     mockConvertTransaction.mockReturnValue({
-      id: 'tx-1', date: '2026-08-12', booking_date: '2026-08-12', amount: 194.29, currency: 'SEK', description: 'X',
+      id: 'tx-1', date: '2026-08-03', booking_date: '2026-08-03', amount: 123.45, currency: 'SEK', description: 'X',
     })
 
     await syncAccountTransactions(

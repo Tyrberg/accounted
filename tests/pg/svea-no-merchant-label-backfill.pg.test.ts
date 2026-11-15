@@ -43,7 +43,7 @@ async function insertBankRow(params: {
     companyId: params.companyId,
     userId: params.userId,
     description,
-    amount: params.amount ?? 194.29,
+    amount: params.amount ?? 123.45,
   })
   await getPool().query(
     `UPDATE public.transactions
@@ -72,14 +72,14 @@ describe('svea no-merchant label backfill', () => {
   it('relabels an empty Svea row and leaves amount and sign alone', async () => {
     const { userId, companyId } = await seedCompany()
     const svea = await insertConnection(companyId, userId, 'Svea Bank')
-    const row = await insertBankRow({ companyId, userId, connectionId: svea, amount: 2837.58 })
+    const row = await insertBankRow({ companyId, userId, connectionId: svea, amount: 987.65 })
 
     await runBackfill()
 
     expect(await getRow(row)).toEqual({
       description: LABEL,
       original_description: LABEL,
-      amount: '2837.58',
+      amount: '987.65',
     })
   })
 

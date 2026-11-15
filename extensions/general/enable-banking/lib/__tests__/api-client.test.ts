@@ -761,9 +761,9 @@ describe('convertTransaction', () => {
         {
           entry_reference: 'EX-0001',
           transaction_id: null,
-          booking_date: '2026-08-12',
+          booking_date: '2026-08-03',
           value_date: null,
-          transaction_amount: { amount: '194.29', currency: 'SEK' },
+          transaction_amount: { amount: '123.45', currency: 'SEK' },
           credit_debit_indicator: 'CRDT',
           creditor: null,
           debtor: null,
@@ -776,9 +776,9 @@ describe('convertTransaction', () => {
         {
           entry_reference: 'EX-0002',
           transaction_id: null,
-          booking_date: '2026-10-19',
+          booking_date: '2026-09-07',
           value_date: null,
-          transaction_amount: { amount: '2837.58', currency: 'SEK' },
+          transaction_amount: { amount: '987.65', currency: 'SEK' },
           credit_debit_indicator: 'CRDT',
           creditor: null,
           debtor: null,

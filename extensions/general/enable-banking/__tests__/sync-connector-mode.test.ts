@@ -80,7 +80,7 @@ describe('syncAccountTransactions in connector mode', () => {
   })
 
   it('titles an empty connector row with the no-merchant label only when the bank is Svea', async () => {
-    const emptyRow = { booking_date: '2026-10-19', amount: 2837.58, currency: 'SEK', description: 'Okänd transaktion', counterparty_name: null, counterparty_account: null, reference: null, merchant_category_code: null, bank_transaction_code: null, proprietary_bank_transaction_code: null }
+    const emptyRow = { booking_date: '2026-09-07', amount: 987.65, currency: 'SEK', description: 'Okänd transaktion', counterparty_name: null, counterparty_account: null, reference: null, merchant_category_code: null, bank_transaction_code: null, proprietary_bank_transaction_code: null }
     const body = () => new Response(JSON.stringify({ ...remote, transactions: [emptyRow], skipped_pending: 0 }), { status: 200, headers: { 'content-type': 'application/json' } })
     const ingest = vi.fn().mockResolvedValue({ imported: 1, duplicates: 0, errors: 0, reconciled: 0, auto_categorized: 0, auto_matched_invoices: 0, transaction_ids: [] })
 
@@ -89,8 +89,8 @@ describe('syncAccountTransactions in connector mode', () => {
     fetchMock.mockResolvedValueOnce(body())
     await syncAccountTransactions(supabase, 'company-1', 'user-1', 'conn-1', { ...account }, '2026-08-01', '2026-11-03', ingest, { bankName: 'Example Bank' })
 
-    expect(ingest.mock.calls[0][3][0]).toMatchObject({ description: 'Kortköp, handlare saknas i bankdata', amount: 2837.58 })
-    expect(ingest.mock.calls[1][3][0]).toMatchObject({ description: 'Okänd transaktion', amount: 2837.58 })
+    expect(ingest.mock.calls[0][3][0]).toMatchObject({ description: 'Kortköp, handlare saknas i bankdata', amount: 987.65 })
+    expect(ingest.mock.calls[1][3][0]).toMatchObject({ description: 'Okänd transaktion', amount: 987.65 })
     // The connector request body is unchanged: the bank name stays local.
     expect(JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string)).not.toHaveProperty('bank_name')
   })

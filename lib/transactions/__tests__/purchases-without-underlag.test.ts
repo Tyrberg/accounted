@@ -134,11 +134,11 @@ describe('fetchPurchasesWithoutUnderlag', () => {
 describe('no-merchant card rows in the list', () => {
   it('applies a floor to the size of the purchase whatever its sign', () => {
     expect(clearsPurchaseFloor(-50, 0)).toBe(true)
-    expect(clearsPurchaseFloor(194.29, 0)).toBe(true)
+    expect(clearsPurchaseFloor(123.45, 0)).toBe(true)
     expect(clearsPurchaseFloor(-100, 100)).toBe(false)
     expect(clearsPurchaseFloor(-100.01, 100)).toBe(true)
     expect(clearsPurchaseFloor(99, 100)).toBe(false)
-    expect(clearsPurchaseFloor(194.29, 100)).toBe(true)
+    expect(clearsPurchaseFloor(123.45, 100)).toBe(true)
   })
 
   it('drops rows under a passed floor before the link lookups', async () => {
@@ -149,7 +149,7 @@ describe('no-merchant card rows in the list', () => {
 
   it('lists a positive Svea card row the query returned like any other purchase', async () => {
     rows.mockReturnValue([
-      tx({ id: 'svea', amount: 194.29, description: NO_MERCHANT_DESCRIPTION, merchant_name: null }),
+      tx({ id: 'svea', amount: 123.45, description: NO_MERCHANT_DESCRIPTION, merchant_name: null }),
     ])
     const out = await fetchPurchasesWithoutUnderlag(db(), 'company-1')
     expect(out.map((p) => p.id)).toEqual(['svea'])
