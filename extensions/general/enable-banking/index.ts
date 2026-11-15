@@ -794,6 +794,7 @@ export const enableBankingExtension: Extension = {
             ...(sieOverlap ? { skipAutoCategorization: true } : {}),
             ...(isViewer ? { rawInsertOnly: true } : {}),
             ...(days_back >= 30 ? { strategy: 'longest' as const } : {}),
+            ...(connection.bank_name ? { bankName: connection.bank_name as string } : {}),
           }
 
           if (sieOverlap) {
@@ -1595,6 +1596,7 @@ export const enableBankingExtension: Extension = {
                   strategy: 'longest',
                   ...(sieOverlap ? { skipAutoCategorization: true } : {}),
                   ...(isViewer ? { rawInsertOnly: true } : {}),
+                  ...(connection.bank_name ? { bankName: connection.bank_name as string } : {}),
                 }
               ))
             )

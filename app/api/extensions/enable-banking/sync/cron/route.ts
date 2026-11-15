@@ -270,6 +270,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       const syncOptions = {
         ...(sieOverlap ? { skipAutoCategorization: true } : {}),
         ...(isFirstSync || lookbackDays >= 30 ? { strategy: 'longest' as const } : {}),
+        ...(connection.bank_name ? { bankName: connection.bank_name as string } : {}),
       }
 
       const syncResults = await Promise.all(

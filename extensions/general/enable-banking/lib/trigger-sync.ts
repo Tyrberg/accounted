@@ -184,6 +184,7 @@ export async function triggerConnectionSync(
       ...(sieOverlap ? { skipAutoCategorization: true } : {}),
       ...(isViewer ? { rawInsertOnly: true } : {}),
       ...(lookbackDays >= 30 ? { strategy: 'longest' as const } : {}),
+      ...(connection.bank_name ? { bankName: connection.bank_name as string } : {}),
     }
 
     const results = await Promise.all(
