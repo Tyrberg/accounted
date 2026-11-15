@@ -729,6 +729,89 @@ describe('convertTransaction', () => {
     expect(convertTransaction(tx, 'SEK').description).toBe('Okänd transaktion')
   })
 
+  it('keeps the neutral for an empty incoming row from a bank other than Svea', () => {
+    const tx = makeTx({ credit_debit_indicator: 'CRDT' })
+    expect(convertTransaction(tx, 'SEK', { aspspName: 'Example Bank' }).description).toBe('Okänd transaktion')
+  })
+
+  it('does not treat a bank whose name merely starts with the letters as Svea', () => {
+    const tx = makeTx({})
+    expect(convertTransaction(tx, 'SEK', { aspspName: 'Sveaexample' }).description).toBe('Okänd transaktion')
+  })
+
+  it('labels an empty Svea row with an unrecognized proprietary code as a card purchase without merchant', () => {
+    const tx = makeTx({ proprietary_bank_transaction_code: 'ZZZZ' })
+    expect(convertTransaction(tx, 'SEK', { aspspName: 'Svea Bank' }).description).toBe(
+      'Kortköp, handlare saknas i bankdata',
+    )
+  })
+
+  it('still prefers the bank text over the Svea label when Svea does send some', () => {
+    const tx = makeTx({ remittance_information: ['Example AB'] })
+    expect(convertTransaction(tx, 'SEK', { aspspName: 'Svea Bank' }).description).toBe('Example AB')
+  })
+
+  describe('Svea card purchases without merchant data (anonymised raw response)', () => {
+    // Shape of a stored psd2-response page from a Svea B2B debit account, verified
+    // 2026-11-15: every merchant field is null or empty; only entry_reference,
+    // booking_date, amount and credit_debit_indicator are present. Values are
+    // invented; the structure is the real one.
+    const SVEA_PAGE = {
+      transactions: [
+        {
+          entry_reference: 'EX-0001',
+          transaction_id: null,
+          booking_date: '2026-08-12',
+          value_date: null,
+          transaction_amount: { amount: '194.29', currency: 'SEK' },
+          credit_debit_indicator: 'CRDT',
+          creditor: null,
+          debtor: null,
+          remittance_information: [],
+          merchant_category_code: null,
+          bank_transaction_code: null,
+          proprietary_bank_transaction_code: null,
+          note: null,
+        },
+        {
+          entry_reference: 'EX-0002',
+          transaction_id: null,
+          booking_date: '2026-10-19',
+          value_date: null,
+          transaction_amount: { amount: '2837.58', currency: 'SEK' },
+          credit_debit_indicator: 'CRDT',
+          creditor: null,
+          debtor: null,
+          remittance_information: [],
+          merchant_category_code: null,
+          bank_transaction_code: null,
+          proprietary_bank_transaction_code: null,
+          note: null,
+        },
+      ],
+    } as unknown as { transactions: Transaction[] }
+
+    it('maps each row to the no-merchant label with merchant_name and counterparty empty', () => {
+      for (const tx of SVEA_PAGE.transactions) {
+        const out = convertTransaction(tx, 'SEK', { aspspName: 'Svea Bank' })
+        expect(out.description).toBe('Kortköp, handlare saknas i bankdata')
+        expect(out.counterparty_name).toBeFalsy()
+        expect(out.merchant_category_code).toBeFalsy()
+        expect(out.bank_transaction_code).toBeFalsy()
+        expect(out.id).toBe(tx.entry_reference)
+        expect(out.booking_date).toBe(tx.booking_date)
+        // Sign untouched by this change: CRDT stays positive (under separate review).
+        expect(out.amount).toBe(parseFloat(tx.transaction_amount.amount))
+      }
+    })
+
+    it('gives the same rows the generic neutral when the bank is not Svea', () => {
+      for (const tx of SVEA_PAGE.transactions) {
+        expect(convertTransaction(tx, 'SEK', { aspspName: 'Example Bank' }).description).toBe('Okänd transaktion')
+      }
+    })
+  })
+
   it('carries the ISO codes through onto the converted transaction', () => {
     const tx = makeTx({ bank_transaction_code: 'PMNT/RCDT', proprietary_bank_transaction_code: 'XB' })
     const out = convertTransaction(tx, 'SEK')

@@ -7,6 +7,7 @@ import {
   ConnectorSyncError,
 } from './api-client'
 import { historyWindowDays } from './history-window'
+import { NO_MERCHANT_LABEL, sendsCardPurchasesWithoutMerchant } from './transaction-label'
 import { bankSyncResponseSchema, connectorErrorSchema } from '@accounted/connect-contract'
 import { bankConnectorMode, CONNECTOR_COMPANY_HEADER } from '@/lib/connect/instance/upstreams'
 import { uploadDocument } from '@/lib/core/documents/document-service'
@@ -34,6 +35,13 @@ export interface SyncOptions {
    * to fetch the deepest available history (slower); omit for incremental syncs.
    */
   strategy?: TransactionsFetchStrategy
+  /**
+   * The connection's bank (bank_connections.bank_name). Only decides the title
+   * of a row the bank sent with no text at all: Svea card purchases get
+   * NO_MERCHANT_LABEL (and so reach the receipt list), every other bank keeps
+   * 'Okänd transaktion'. See sendsCardPurchasesWithoutMerchant.
+   */
+  bankName?: string | null
 }
 
 /**
@@ -243,7 +251,14 @@ export async function syncAccountTransactions(
       tx: {
         amount: tx.amount,
         currency: tx.currency,
-        description: tx.description,
+        // The connector normalizes without knowing the bank, so its empty-row
+        // fallback is the generic one; apply the same per-bank title the
+        // direct path gets from convertTransaction.
+        description:
+          tx.description === FALLBACK_DESCRIPTION &&
+          sendsCardPurchasesWithoutMerchant(syncOptions?.bankName)
+            ? NO_MERCHANT_LABEL
+            : tx.description,
         counterparty_name: tx.counterparty_name ?? undefined,
         counterparty_account: tx.counterparty_account ?? undefined,
         reference: tx.reference ?? undefined,
@@ -284,7 +299,8 @@ export async function syncAccountTransactions(
         toDate,
       })
     }
-    const bankTransactions = fetched.transactions.map(tx => convertTransaction(tx, account.currency))
+    const bankTransactions = fetched.transactions.map(tx =>
+      convertTransaction(tx, account.currency, { aspspName: syncOptions?.bankName }))
     // Only ingest BOOKED transactions: those the ASPSP returned with a real
     // booking_date. Pending entries are intentionally skipped: a pending row is
     // unstable across syncs (a later "synka nu" returns the same transaction

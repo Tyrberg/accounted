@@ -61,8 +61,22 @@ const COLUMNS =
   'id, company_id, date, description, merchant_name, amount, currency, amount_sek, exchange_rate, journal_entry_id'
 
 /**
- * Outflows with no document, not ignored, not privately flagged, and not booked
- * by any of the three routes a transaction can be booked through.
+ * Whether a row the query returned clears the amount floor. The query's `or`
+ * filter (see fetchPurchasesWithoutUnderlag) already restricts rows to
+ * outflows plus no-merchant card rows, so a non-negative amount here is always
+ * one of the latter: Svea delivers its card purchases as CRDT with no merchant
+ * data (verified 2026-11-15) and their sign is under separate review, so the
+ * floor is applied to the size of the purchase, not its sign.
+ */
+export function clearsPurchaseFloor(amount: number, minAmountSek: number): boolean {
+  if (minAmountSek <= 0) return true
+  return Math.abs(amount) > minAmountSek
+}
+
+/**
+ * Outflows, plus no-merchant card rows whatever their sign, with no document,
+ * not ignored, not privately flagged, and not booked by any of the three
+ * routes a transaction can be booked through.
  *
  * Ordered newest first: a receipt for last week is findable, one from a year ago
  * usually is not.
@@ -91,18 +105,25 @@ export async function fetchPurchasesWithoutUnderlag(
       // "business, not yet booked". Only an explicit false means the user
       // called it private, and a private purchase needs no underlag.
       .not('is_business', 'is', false)
-      // Outflows only. With no floor this is simply every negative row.
-      .lt('amount', minAmount > 0 ? -minAmount : 0)
+      // Outflows plus the no-merchant card rows whatever their sign: the
+      // label, not the amount, says such a row is a purchase needing its
+      // receipt. Reads original_description, which title edits never touch,
+      // so naming the merchant by hand does not hide a purchase with no paper.
+      // The literal must equal NO_MERCHANT_DESCRIPTION (pinned by the test);
+      // it stays a literal so the phantom-column scanner can check it. The
+      // amount floor, when one is passed, is applied below.
+      .or('amount.lt.0,original_description.eq."Kortköp, handlare saknas i bankdata"')
       .gte('date', sinceDate)
       .order('date', { ascending: false })
       .range(range.from, range.to),
   )
 
-  if (rows.length === 0) return []
+  const purchases = rows.filter((tx) => clearsPurchaseFloor(tx.amount, minAmount))
+  if (purchases.length === 0) return []
 
   // The column filter above cannot see these two. Fetched once for the whole
   // page rather than per row.
-  const ids = rows.map((r) => r.id)
+  const ids = purchases.map((r) => r.id)
   const [{ data: voucherLinks }, { data: invoicePayments }, { data: supplierPayments }] =
     await Promise.all([
       supabase.from('transaction_voucher_links').select('transaction_id').in('transaction_id', ids),
@@ -111,5 +132,5 @@ export async function fetchPurchasesWithoutUnderlag(
     ])
 
   const payments = [...(invoicePayments ?? []), ...(supplierPayments ?? [])]
-  return rows.filter((tx) => !isTransactionBooked(tx, payments, voucherLinks ?? []))
+  return purchases.filter((tx) => !isTransactionBooked(tx, payments, voucherLinks ?? []))
 }

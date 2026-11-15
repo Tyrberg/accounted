@@ -40,6 +40,27 @@ export function amountToOre(amount: number | string): number {
 export const FALLBACK_DESCRIPTION = 'Okänd transaktion'
 
 /**
+ * Title for a bank row whose ASPSP is known to send card purchases with every
+ * merchant field empty (Svea, verified 2026-11-15 against a stored raw PSD2
+ * response). Says what is known and marks the row as one that needs its
+ * receipt: rows whose original_description is this label are listed among the
+ * purchases still missing underlag (fetchPurchasesWithoutUnderlag). Lives in
+ * core because ingest dedup and the underlag list both read it.
+ */
+export const NO_MERCHANT_DESCRIPTION = 'Kortköp, handlare saknas i bankdata'
+
+/**
+ * Titles that carry no information about the transaction itself, only that
+ * the source sent none. Two rows titled with any of them are the same "no
+ * text" signal: a row stored as 'Okänd transaktion' before the Svea label
+ * existed must still bridge the same row re-synced under the new label.
+ * Compared in descriptionsBridge's whitespace-stripped lowercase form.
+ */
+const NO_TEXT_LABELS = new Set(
+  [FALLBACK_DESCRIPTION, NO_MERCHANT_DESCRIPTION].map((s) => s.toLowerCase().replace(/\s+/g, '')),
+)
+
+/**
  * Normalize an imported transaction title for storage and display.
  *
  * Maps both an empty/whitespace title AND the legacy English 'Unknown'
@@ -175,6 +196,11 @@ export function descriptionsBridge(
   const y = (b ?? '').toLowerCase().replace(/\s+/g, '')
   // A blank never wildcards a described row; only two blanks bridge each other.
   if (x === '' || y === '') return x === y
+  // Two no-text labels are the same signal even when the label changed
+  // between syncs ('Okänd transaktion' stored, the Svea no-merchant label
+  // incoming). Neither ever bridges a described row: they are not prefixes
+  // of real titles, and this branch only fires when BOTH are no-text labels.
+  if (NO_TEXT_LABELS.has(x) && NO_TEXT_LABELS.has(y)) return true
   return x.startsWith(y) || y.startsWith(x)
 }
 

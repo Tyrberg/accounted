@@ -13,11 +13,16 @@
  * user could do to clear them.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fetchPurchasesWithoutUnderlag } from '../purchases-without-underlag'
+import { fetchPurchasesWithoutUnderlag, clearsPurchaseFloor } from '../purchases-without-underlag'
+import { NO_MERCHANT_DESCRIPTION } from '../external-id'
 
 const rows = vi.fn()
+let lastBuild: ((range: { from: number; to: number }) => unknown) | undefined
 vi.mock('@/lib/supabase/fetch-all', () => ({
-  fetchAllRows: async () => rows(),
+  fetchAllRows: async (build: (range: { from: number; to: number }) => unknown) => {
+    lastBuild = build
+    return rows()
+  },
 }))
 
 function tx(over: Record<string, unknown> = {}) {
@@ -106,5 +111,47 @@ describe('fetchPurchasesWithoutUnderlag', () => {
     rows.mockReturnValue([tx({ journal_entry_id: 'je-1' })])
     const out = await fetchPurchasesWithoutUnderlag(db(), 'company-1')
     expect(out).toEqual([])
+  })
+
+  it('asks for outflows plus the no-merchant card rows whatever their sign', async () => {
+    rows.mockReturnValue([])
+    // Recording client: every builder call returns the chain and is logged.
+    const calls: Array<[string, unknown[]]> = []
+    const chain: unknown = new Proxy(
+      {},
+      { get: (_t, name: string) => (...a: unknown[]) => { calls.push([name, a]); return chain } },
+    )
+    await fetchPurchasesWithoutUnderlag({ from: () => chain } as never, 'company-1')
+    lastBuild!({ from: 0, to: 999 })
+    const or = calls.find(([name]) => name === 'or')
+    // The query keeps the label as a literal for the column scanner; it must
+    // stay byte-equal to the constant the sync writes.
+    expect(or?.[1][0]).toBe(`amount.lt.0,original_description.eq."${NO_MERCHANT_DESCRIPTION}"`)
+    expect(calls.some(([name]) => name === 'lt')).toBe(false)
+  })
+})
+
+describe('no-merchant card rows in the list', () => {
+  it('applies a floor to the size of the purchase whatever its sign', () => {
+    expect(clearsPurchaseFloor(-50, 0)).toBe(true)
+    expect(clearsPurchaseFloor(194.29, 0)).toBe(true)
+    expect(clearsPurchaseFloor(-100, 100)).toBe(false)
+    expect(clearsPurchaseFloor(-100.01, 100)).toBe(true)
+    expect(clearsPurchaseFloor(99, 100)).toBe(false)
+    expect(clearsPurchaseFloor(194.29, 100)).toBe(true)
+  })
+
+  it('drops rows under a passed floor before the link lookups', async () => {
+    rows.mockReturnValue([tx({ id: 'small', amount: -40 }), tx({ id: 'big', amount: -400 })])
+    const out = await fetchPurchasesWithoutUnderlag(db(), 'company-1', { minAmountSek: 100 })
+    expect(out.map((p) => p.id)).toEqual(['big'])
+  })
+
+  it('lists a positive Svea card row the query returned like any other purchase', async () => {
+    rows.mockReturnValue([
+      tx({ id: 'svea', amount: 194.29, description: NO_MERCHANT_DESCRIPTION, merchant_name: null }),
+    ])
+    const out = await fetchPurchasesWithoutUnderlag(db(), 'company-1')
+    expect(out.map((p) => p.id)).toEqual(['svea'])
   })
 })
