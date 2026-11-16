@@ -124,6 +124,11 @@ export const V1_ENDPOINT_SCOPES: Record<string, ApiKeyScope> = {
   'POST /api/v1/companies/:companyId/documents': 'documents:write',
   'GET /api/v1/companies/:companyId/documents/:id/download': 'documents:read',
   'POST /api/v1/companies/:companyId/documents/:id/link': 'documents:write',
+  // Locked-period archive attach (founder-approved 2026-11-09): links an
+  // already-uploaded object to a verifikat in a closed/locked period via the
+  // audited attach_document_to_locked_period_entry RPC. Rides documents:write
+  // like the link verb; the period stays locked and the entry is untouched.
+  'POST /api/v1/companies/:companyId/journal-entries/:id/locked-period-attachments': 'documents:write',
   // Inbox item stamp: closes an invoice_inbox_items row against the JE it
   // was booked to. Rides documents:write like the link verb it complements.
   'POST /api/v1/companies/:companyId/inbox-items/:id/stamp': 'documents:write',

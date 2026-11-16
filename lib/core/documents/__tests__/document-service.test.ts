@@ -1012,6 +1012,29 @@ describe('storage key layout helpers', () => {
     expect(isCompanyScopedDocumentPath(`documents/${user}/1_a.pdf`, company)).toBe(false)
   })
 
+  it('never treats a key with a . or .. segment as company-scoped or translatable', () => {
+    const escaping = `documents/${company}/../other/1_a.pdf`
+    expect(isCompanyScopedDocumentPath(escaping, company)).toBe(false)
+    expect(isCompanyScopedDocumentPath(`documents/${company}/./1_a.pdf`, company)).toBe(false)
+    expect(isCompanyScopedDocumentPath(`documents/${company}/${user}/..`, company)).toBe(false)
+    expect(companyScopedDocumentPath(`documents/../${user}/1_a.pdf`, company)).toBeNull()
+    expect(companyScopedDocumentPath(`documents/${user}/../x/1_a.pdf`, company)).toBeNull()
+  })
+
+  it('keeps file names with consecutive dots scoped and translatable', () => {
+    // sanitizeFileName preserves `..` inside a name: an uploaded receipt..pdf
+    // is a legitimate key, not a traversal.
+    const fileName = 'receipt..pdf'
+    expect(buildReservedDocumentStoragePath(company, user, '1', fileName)).toBe(
+      `documents/${company}/${user}/1_receipt..pdf`,
+    )
+    const scoped = `documents/${company}/${user}/1_receipt..pdf`
+    const legacy = `documents/${user}/1_receipt..pdf`
+    expect(isCompanyScopedDocumentPath(scoped, company)).toBe(true)
+    expect(companyScopedDocumentPath(legacy, company)).toBe(scoped)
+    expect(documentStoragePathCandidates(legacy, company)).toEqual([legacy, scoped])
+  })
+
   it('translates legacy to company-scoped and back', () => {
     const legacy = `documents/${user}/1_a.pdf`
     const scoped = `documents/${company}/${user}/1_a.pdf`
@@ -1188,6 +1211,39 @@ describe('deleteDocument', () => {
         error: null,
       },
       { data: null, error: { message: 'blocked by Bokföringslagen retention trigger' } },
+    ]
+
+    const serviceRemove = vi.fn().mockResolvedValue({ data: [], error: null })
+    serviceClientOverride = makeClient({ remove: serviceRemove })
+
+    const result = await deleteDocument(makeClient() as never, 'company-1', 'doc-1')
+
+    expect(result).toMatchObject({ ok: false, reason: 'linked_to_entry', status: 409 })
+    expect(serviceRemove).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unlinked upload whose stored file was archived on a locked-period verifikat', async () => {
+    // block_shared_document_storage_deletion (migration 20261116120000)
+    // refuses the row delete because a linked sibling row shares the object;
+    // the shared bytes must survive, so storage is never touched.
+    results = [
+      {
+        data: {
+          id: 'doc-1',
+          file_name: 'a.pdf',
+          storage_path: 'documents/company-1/user-1/1_a.pdf',
+          journal_entry_id: null,
+          user_id: 'user-1',
+        },
+        error: null,
+      },
+      {
+        data: null,
+        error: {
+          message:
+            'Cannot delete document: its stored file is retained underlag on journal entry entry-1 (Bokföringslagen)',
+        },
+      },
     ]
 
     const serviceRemove = vi.fn().mockResolvedValue({ data: [], error: null })
