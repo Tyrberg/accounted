@@ -40,6 +40,7 @@ import { fetchDynamicVatAccounts, type DynamicVatAccounts } from './vat-revenue-
  *   top of this fixed list: see fetchDynamicRuta05Accounts (#1261). This map
  *   only covers the accounts Accounted itself seeds.
  * Uttag (3401-3403) → ruta 06 (credit)
+ * Rent with frivillig skattskyldighet (3913) → ruta 08 (credit)
  * EU goods (3108) → ruta 35; EU services (3308) → ruta 39 (credit)
  * Export (3105/3305) → ruta 36/40; Exempt (3004/3100/3404/3994/3980) → ruta 42 (credit)
  * Reverse-charge purchase bases: read from the cost account the journal
@@ -99,6 +100,10 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '3401': { box: 'ruta06', side: 'credit' },
   '3402': { box: 'ruta06', side: 'credit' },
   '3403': { box: 'ruta06', side: 'credit' },
+  // Revenue: rent under frivillig skattskyldighet (ML 12 kap) → ruta 08. The
+  // BAS account itself defines the treatment, so it needs no configured
+  // "Standard moms"; its output VAT lands on 2613 (ruta 10).
+  '3913': { box: 'ruta08', side: 'credit' },  // Frivilligt momspliktiga hyresintäkter
   // Revenue: EU goods/services → ruta 35/39
   '3108': { box: 'ruta35', side: 'credit' },  // Varuförsäljning till EU
   '3308': { box: 'ruta39', side: 'credit' },  // Tjänsteförsäljning till EU

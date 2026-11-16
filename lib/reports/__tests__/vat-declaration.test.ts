@@ -1043,6 +1043,38 @@ describe('calculateVatDeclaration: voucher-only revenue (imported/manual)', () =
     expect(codes).not.toContain('OUTPUT_VAT_EXCEEDS_SALES_BASE')
   })
 
+  // SIE-imported vouchers on the plain BAS accounts, no chart configuration:
+  // 3913 is BAS's own account for rent under frivillig skattskyldighet (ruta
+  // 08, output VAT on 2613) and 3004 is momsfri försäljning (ruta 42). The
+  // invoice/transaction counters stay 0, the rutor still come out whole.
+  it('files BAS 3913 in ruta 08 without any configured treatment', async () => {
+    chartAccounts = []
+    seedLedger(
+      [
+        { account_number: '3001', debit_amount: 0, credit_amount: 2000 },
+        { account_number: '2611', debit_amount: 0, credit_amount: 500 },
+        { account_number: '3913', debit_amount: 0, credit_amount: 40000 },
+        { account_number: '2613', debit_amount: 0, credit_amount: 10000 },
+        { account_number: '3004', debit_amount: 0, credit_amount: 3000 },
+        { account_number: '2641', debit_amount: 1500, credit_amount: 0 },
+      ],
+      ['sie_import', 'sie_import', 'manual'],
+    )
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'quarterly', 2024, 3)
+
+    expect(result.invoiceCount).toBe(0)
+    expect(result.transactionCount).toBe(0)
+    expect(result.rutor.ruta05).toBe(2000)
+    expect(result.rutor.ruta08).toBe(40000)
+    expect(result.rutor.ruta42).toBe(3000)
+    expect(result.rutor.ruta10).toBe(10500)
+    expect(result.rutor.ruta48).toBe(1500)
+    expect(result.rutor.ruta49).toBe(9000)
+    // ruta 10 is exactly 25% of 05 + 08: no consistency finding at all.
+    expect(runVatDeclarationChecks(result.rutor)).toEqual([])
+  })
+
   it('warns when output VAT exceeds 25/12/6% of the bases', async () => {
     chartAccounts = []
     seedLedger([

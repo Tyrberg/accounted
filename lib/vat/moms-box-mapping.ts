@@ -65,6 +65,9 @@ export const ACCOUNT_TO_BOX: Record<string, MomsBox> = {
   '3402': '06',
   '3403': '06',
 
+  // Rent with frivillig skattskyldighet → Box 08
+  '3913': '08',  // Frivilligt momspliktiga hyresintäkter
+
   // EU goods (reverse charge, VAT-free) → Box 35
   '3108': '35',  // Försäljning varor till annat EU-land
   '3521': '35',  // Fakturerade frakter EU (follows goods treatment)
