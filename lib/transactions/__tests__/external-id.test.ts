@@ -7,6 +7,7 @@ import {
   normalizeImportedDescription,
   shiftIsoDate,
   FALLBACK_DESCRIPTION,
+  NO_MERCHANT_DESCRIPTION,
 } from '../external-id'
 
 describe('amountToOre', () => {
@@ -122,6 +123,19 @@ describe('contentBucketKey', () => {
 })
 
 describe('descriptionsBridge', () => {
+  it('bridges a row stored as the old no-text label to the same row re-synced under the Svea label', () => {
+    // A Svea row synced before the label existed must not be re-imported as a
+    // duplicate when its external_id misses and only the content bridge is left.
+    expect(descriptionsBridge(FALLBACK_DESCRIPTION, NO_MERCHANT_DESCRIPTION)).toBe(true)
+    expect(descriptionsBridge(NO_MERCHANT_DESCRIPTION, FALLBACK_DESCRIPTION)).toBe(true)
+    expect(descriptionsBridge(NO_MERCHANT_DESCRIPTION, NO_MERCHANT_DESCRIPTION)).toBe(true)
+  })
+
+  it('never lets either no-text label bridge a described row', () => {
+    expect(descriptionsBridge(NO_MERCHANT_DESCRIPTION, 'Example AB')).toBe(false)
+    expect(descriptionsBridge(FALLBACK_DESCRIPTION, 'Example AB')).toBe(false)
+  })
+
   it('bridges prefix-preserving PSD2 enrichment (the June 2026 drift)', () => {
     // The same transaction whose title grew between syncs must still bridge.
     // (Synthetic stand-ins for the real prefix-preserving enrichment pattern.)

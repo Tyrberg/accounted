@@ -24,6 +24,8 @@
  * against real archived `psd2-response_*.json` samples as they surface.
  */
 
+import { NO_MERCHANT_DESCRIPTION } from '@/lib/transactions/external-id'
+
 export interface TransactionLabelInput {
   /** ISO 20022 bank transaction code, e.g. "PMNT-CCRD-POSD" or "PMNT/RCDT". */
   bankTransactionCode?: string | null
@@ -33,6 +35,29 @@ export interface TransactionLabelInput {
   mcc?: string | number | null
   /** CRDT (money in) vs DBIT (money out): used only for the bare-domain case. */
   isCredit?: boolean
+}
+
+/**
+ * Label for a booked transaction the ASPSP sent with no usable merchant or
+ * counterparty text and no recognizable code, used ONLY for ASPSPs known to
+ * send card purchases that way (see sendsCardPurchasesWithoutMerchant). Says
+ * what is known, and routes the row to the receipt list, instead of the
+ * uninformative "Okänd transaktion".
+ */
+export const NO_MERCHANT_LABEL = NO_MERCHANT_DESCRIPTION
+
+/**
+ * Whether this ASPSP is known to deliver card purchases with every merchant
+ * field empty. Svea (verified 2026-11-15 against a stored raw response: creditor,
+ * debtor, remittance_information, merchant_category_code and every code null or
+ * empty; all rows on the account card purchases). Scoped by bank on purpose:
+ * for any other bank an empty row is genuinely unknown (it can be an incoming
+ * payment), so it keeps 'Okänd transaktion' rather than a card-purchase guess.
+ * Svea's card purchases arrive as CRDT (sign under separate review), so the
+ * direction cannot be used to narrow this further.
+ */
+export function sendsCardPurchasesWithoutMerchant(aspspName: string | null | undefined): boolean {
+  return /^\s*svea\b/i.test(aspspName ?? '')
 }
 
 // ISO 20022 External Bank Transaction Codes, keyed by `DOMAIN/FAMILY`.

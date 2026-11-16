@@ -157,6 +157,25 @@ describe('syncAccountTransactions', () => {
     )
   })
 
+  it('passes the connection bank name to the converter so it can pick the empty-row title', async () => {
+    mockGetAllTransactionsWithRaw.mockResolvedValue({
+      transactions: [{ transaction_amount: { amount: '123.45', currency: 'SEK' }, booking_date: '2026-08-03' }],
+      rawPages: [],
+    })
+    mockConvertTransaction.mockReturnValue({
+      id: 'tx-1', date: '2026-08-03', booking_date: '2026-08-03', amount: 123.45, currency: 'SEK', description: 'X',
+    })
+
+    await syncAccountTransactions(
+      {} as never, COMPANY_ID, USER_ID, CONNECTION_ID, makeAccount(),
+      '2026-08-01', '2026-11-03', mockIngest, { bankName: 'Svea Bank' },
+    )
+
+    expect(mockConvertTransaction).toHaveBeenCalledWith(
+      expect.anything(), 'SEK', { aspspName: 'Svea Bank' },
+    )
+  })
+
   it('omits strategy when sync options do not include it', async () => {
     mockGetAllTransactionsWithRaw.mockResolvedValue({
       transactions: [],

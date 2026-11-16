@@ -13,7 +13,7 @@
  */
 
 import { getAuthorizationHeader } from './jwt'
-import { deriveTransactionLabel } from './transaction-label'
+import { deriveTransactionLabel, NO_MERCHANT_LABEL, sendsCardPurchasesWithoutMerchant } from './transaction-label'
 import { FALLBACK_DESCRIPTION } from '@/lib/transactions/external-id'
 import { bankConnectorMode, CONNECTOR_COMPANY_HEADER } from '@/lib/connect/instance/upstreams'
 import { dateFromDaysBefore, historyWindowDays } from './history-window'
@@ -1332,9 +1332,16 @@ export async function getAllTransactionsWithRaw(
 }
 
 /**
- * Convert Enable Banking transaction to legacy format
+ * Convert Enable Banking transaction to legacy format.
+ *
+ * `options.aspspName` is the connection's bank name; it only decides the final
+ * fallback title (see sendsCardPurchasesWithoutMerchant).
  */
-export function convertTransaction(tx: Transaction, accountCurrency: string): BankTransaction {
+export function convertTransaction(
+  tx: Transaction,
+  accountCurrency: string,
+  options?: { aspspName?: string | null },
+): BankTransaction {
   const rawAmount = parseFloat(tx.transaction_amount.amount)
 
   // Use credit_debit_indicator to determine sign
@@ -1355,9 +1362,9 @@ export function convertTransaction(tx: Transaction, accountCurrency: string): Ba
     currency: tx.transaction_amount.currency || accountCurrency,
     // Fallback chain: bank's payment message → counterparty name → a Swedish
     // label derived from the ISO 20022 / MCC codes the bank DID send (card
-    // purchases, ATM, fees, interest) → 'Okänd transaktion'. The final fallback
-    // is also normalized at the ingest boundary, so any leftover lands as the
-    // same Swedish neutral.
+    // purchases, ATM, fees, interest) → 'Kortköp, handlare saknas i bankdata'
+    // for a bank known to send card purchases with no merchant data (Svea;
+    // the row then goes to the receipt list), otherwise 'Okänd transaktion'.
     description: tx.remittance_information?.filter(r => r.trim()).join(' ') ||
                  (isCredit ? debtorName : creditorName) ||
                  deriveTransactionLabel({
@@ -1366,7 +1373,9 @@ export function convertTransaction(tx: Transaction, accountCurrency: string): Ba
                    mcc: tx.merchant_category_code,
                    isCredit,
                  }) ||
-                 FALLBACK_DESCRIPTION,
+                 (sendsCardPurchasesWithoutMerchant(options?.aspspName)
+                   ? NO_MERCHANT_LABEL
+                   : FALLBACK_DESCRIPTION),
     counterparty_name: isCredit ? debtorName : creditorName,
     counterparty_account: isCredit
       ? pickAccountIdentifier(tx.debtor_account, tx.debtor_account_additional_identification)
