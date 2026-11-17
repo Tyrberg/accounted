@@ -34,7 +34,8 @@ describe('LockedAttachHistory (verifikat history for locked-period archiving)', 
       },
     ])
     expect(html).toContain('Arkiverade underlag i låst period')
-    expect(html).toContain('2026-11-16')
+    // When = date AND time of the archive, not just the day.
+    expect(html).toMatch(/2026-11-1[67] \d{2}:\d{2}/)
     expect(html).toContain('user@example.com')
     expect(html).toContain('via nyckel Backoffice')
     expect(html).toContain('kvitto.pdf')

@@ -2,7 +2,7 @@
 
 import { useTranslations } from 'next-intl'
 import { DetailSection } from '@/components/ui/detail-section'
-import { formatDate } from '@/lib/utils'
+import { formatDateTime } from '@/lib/utils'
 
 /** One LOCKED_PERIOD_ATTACH audit row, as returned by the locked-attach-log route. */
 export type LockedAttachLogRow = {
@@ -34,7 +34,7 @@ export default function LockedAttachHistory({ rows }: { rows: LockedAttachLogRow
             <div className="flex items-center justify-between gap-3">
               {/* data-ph-mask: the actor label is a person's e-mail or name */}
               <span data-ph-mask="" className="text-muted-foreground">
-                <span className="tabular-nums">{formatDate(row.created_at)}</span>
+                <span className="tabular-nums">{formatDateTime(row.created_at)}</span>
                 {row.actor_label ? ` · ${row.actor_label}` : ''}
                 {row.api_key_name ? ` · ${t('locked_attach_by_key', { key: row.api_key_name })}` : ''}
               </span>
