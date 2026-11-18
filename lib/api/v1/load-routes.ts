@@ -41,6 +41,7 @@ import '@/app/api/v1/companies/[companyId]/fiscal-periods/[id]/currency-revaluat
 import '@/app/api/v1/companies/[companyId]/documents/route'
 import '@/app/api/v1/companies/[companyId]/documents/[id]/download/route'
 import '@/app/api/v1/companies/[companyId]/documents/[id]/link/route'
+import '@/app/api/v1/companies/[companyId]/journal-entries/[id]/locked-period-attachments/route'
 
 // Phase 2 PR-A: invoice + customer reads.
 import '@/app/api/v1/companies/[companyId]/invoices/route'

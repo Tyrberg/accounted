@@ -843,6 +843,24 @@ function journalEntryAuditEvent(
           `Databasroll: ${fmtValue(newState?.jwt_role)}`,
         ],
       })
+    case 'LOCKED_PERIOD_ATTACH': {
+      // attach_document_to_locked_period_entry (20261116120000): underlag
+      // archived against a verifikat whose period stays closed/locked. The
+      // verifikat itself is unchanged; this row is its who/when/why trail.
+      const apiKey = str(newState?.api_key_name) ?? str(newState?.api_key_id)
+      return auditEvent(row, {
+        category: 'verifikation',
+        code: 'journal_entry.locked_period_attach',
+        event: 'Underlag kopplat till verifikation i låst period',
+        object: object ?? (row.record_id ? `Verifikat ${row.record_id.slice(0, 8)}` : null),
+        details: [
+          `Fil: ${fmtValue(newState?.file_name)}`,
+          `SHA-256: ${fmtValue(newState?.sha256_hash)}`,
+          `Orsak: ${fmtValue(newState?.reason)}`,
+          ...(apiKey ? [`API-nyckel: ${apiKey}`] : []),
+        ],
+      })
+    }
     case 'UPDATE': {
       if (!isBookedStatus(oldState?.status) && !isBookedStatus(newState?.status)) return null
       const { lines, keys } = diffFields(oldState, newState, JOURNAL_ENTRY_FIELDS)
