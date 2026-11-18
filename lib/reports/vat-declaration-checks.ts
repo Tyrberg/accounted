@@ -1,4 +1,5 @@
-import type { VatDeclarationRutor } from '@/types'
+import type { VatDeclarationRutor, VatRevenueAccountWithoutRuta } from '@/types'
+import { roundOre } from '@/lib/money'
 
 /**
  * Local pre-flight checks for the momsdeklaration, run BEFORE the SKV
@@ -50,9 +51,16 @@ export interface VatDeclarationCheck {
     | 'IMPORT_OUTPUT_WITHOUT_BASE'
     | 'OUTPUT_VAT_WITHOUT_SALES_BASE'
     | 'SALES_OUTPUT_VAT_SHORTFALL'
+    | 'OUTPUT_VAT_EXCEEDS_SALES_BASE'
+    | 'REVENUE_ACCOUNT_WITHOUT_RUTA'
   status: VatDeclarationCheckStatus
   /** Swedish user-facing message; safe to render directly in the UI. */
   message: string
+  /**
+   * The figures and the rule behind the message, for whoever wants them. The
+   * UI in this tree does not render it yet; API and MCP clients receive it.
+   */
+  detail?: string
   /** Optional rutor that the user should investigate. */
   rutor?: Array<keyof VatDeclarationRutor>
 }
@@ -65,6 +73,79 @@ export interface VatDeclarationCheck {
  * of its own.
  */
 export type VatCheckAccountTotals = ReadonlyMap<string, { debit: number; credit: number }>
+
+/**
+ * Account-level facts about the declared period that the rutor alone cannot
+ * carry. Every field is optional: an absent field keeps its check silent
+ * rather than reading as "nothing found".
+ */
+export interface VatDeclarationCheckContext {
+  /**
+   * Class 3 accounts with a balance that reach no ruta, exactly as
+   * `revenueAccountsWithoutRuta()` (lib/reports/vat-declaration.ts) derives
+   * them from the declaration's own account resolution, or as
+   * `VatDeclaration.revenueAccountsWithoutRuta` carries them over HTTP.
+   */
+  revenueAccountsWithoutRuta?: readonly VatRevenueAccountWithoutRuta[]
+}
+
+/** How many accounts REVENUE_ACCOUNT_WITHOUT_RUTA names before summarising the rest. */
+const REVENUE_ACCOUNTS_NAMED_MAX = 5
+
+function formatOre(amount: number): string {
+  return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function describeRevenueAccount(account: VatRevenueAccountWithoutRuta): string {
+  const label = account.account_name
+    ? `${account.account_number} ${account.account_name}`
+    : account.account_number
+  return `${label} (${formatOre(account.amount)} kr)`
+}
+
+/**
+ * REVENUE_ACCOUNT_WITHOUT_RUTA (#3387): revenue booked on a class 3 account the
+ * declaration cannot classify reaches no ruta at all, while the output VAT
+ * booked with it on 2611/2621/2631 still reaches rutor 10-12 by account number.
+ * Ruta 49 stays right and ruta 05 is understated, and when the company has any
+ * other ruta 05 sales none of the rutor-level checks can see it: the base is
+ * missing from both sides of their comparison.
+ *
+ * WARNING, never ERROR: the account may just as well be momsfri or not a sale
+ * at all, and the declaration deliberately does not infer ruta 05 for it (an
+ * open founder decision). The user is told which accounts and how much, and
+ * where to fix it: the momskod on the account in Kontoplan.
+ */
+function revenueAccountWithoutRutaFinding(
+  accounts: readonly VatRevenueAccountWithoutRuta[],
+): VatDeclarationCheck {
+  const named = accounts.slice(0, REVENUE_ACCOUNTS_NAMED_MAX).map(describeRevenueAccount)
+  const rest = accounts.length - named.length
+  const list = rest > 0 ? `${named.join(', ')} och ${rest} till` : named.join(', ')
+  const lead =
+    accounts.length === 1
+      ? `Intäktskontot ${list} saknar momskod och momssats, så beloppet kommer inte med i någon ruta.`
+      : `${accounts.length} intäktskonton saknar momskod och momssats, så beloppen kommer inte med ` +
+        `i någon ruta: ${list}.`
+  return {
+    code: 'REVENUE_ACCOUNT_WITHOUT_RUTA',
+    status: 'WARNING',
+    message:
+      `${lead} Är det momspliktig försäljning blir ruta 05 för låg, medan momsen på ` +
+      '2611/2621/2631 ändå redovisas i ruta 10-12. Ange momskod på kontot i Kontoplanen, ' +
+      'till exempel Försäljning Sverige, 25 % (ruta 05) eller Momsfri försäljning (ruta 42). ' +
+      'Avser kontot inte försäljning, sätt momssats 0 % på kontot.',
+    detail:
+      'Deklarationen tar med ett intäktskonto (klass 3) när kontot har en momskod, en ' +
+      'momssats på 25, 12 eller 6 % eller en fast ruta enligt BAS, till exempel 3001 i ' +
+      'ruta 05. De här kontona ' +
+      'har ingetdera, och deklarationen gissar inte ruta 05 eftersom kontot lika gärna kan ' +
+      'avse momsfri försäljning. Utgående moms följer däremot kontonumret (2611/2621/2631 ' +
+      'till ruta 10-12), så moms att betala (ruta 49) påverkas inte, bara ' +
+      'försäljningsunderlaget. Varningen hindrar inte inlämning.',
+    rutor: ['ruta05', 'ruta42'],
+  }
+}
 
 /**
  * The two BAS accounts that carry the deductible input half of an omvänd-
@@ -100,8 +181,12 @@ function reverseChargeInputVat(accountTotals: VatCheckAccountTotals): number {
  *
  * `accountTotals` is optional and only sharpens `RC_INPUT_VAT_MISMATCH`: with it
  * the check compares the reverse-charge output against the reverse-charge INPUT
- * accounts, without it against the ruta 48 aggregate (see there). Every other
- * check reads the rutor alone.
+ * accounts, without it against the ruta 48 aggregate (see there).
+ *
+ * `context` is optional and feeds `REVENUE_ACCOUNT_WITHOUT_RUTA`, which
+ * needs account-level facts the rutor cannot carry, and decides whether
+ * `OUTPUT_VAT_EXCEEDS_SALES_BASE` is already explained by those accounts.
+ * Every other check reads the rutor alone.
  *
  * Returns an empty array when the declaration looks consistent. Order
  * within the returned array is stable so the UI can rely on it for
@@ -110,6 +195,7 @@ function reverseChargeInputVat(accountTotals: VatCheckAccountTotals): number {
 export function runVatDeclarationChecks(
   rutor: VatDeclarationRutor,
   accountTotals?: VatCheckAccountTotals,
+  context: VatDeclarationCheckContext = {},
 ): VatDeclarationCheck[] {
   const findings: VatDeclarationCheck[] = []
 
@@ -225,9 +311,10 @@ export function runVatDeclarationChecks(
   // (rutor 05-08 vs ruta10/0.25 + ruta11/0.12 + ruta12/0.06) is NOT sound on
   // the sales side as a filing-blocking ERROR, because ACCOUNT_RUTA's two
   // halves are not a closed set:
-  //   - rutor 07 (VMB) and 08 (frivillig uthyrning) have NO source accounts at
-  //     all, while their output VAT (2616/2626/2636, 2613/2623/2633) does feed
-  //     rutor 10-12, so the implied base permanently exceeds the reported one;
+  //   - ruta 07 (VMB) has NO source accounts at all, and ruta 08 (frivillig
+  //     uthyrning) only BAS 3913 plus accounts with that momskod, while their
+  //     output VAT (2616/2626/2636, 2613/2623/2633) does feed rutor 10-12, so
+  //     the implied base can exceed the reported one;
   //   - ruta 05 recognises only 3001/3002/3003, but an invoice line may carry
   //     any revenue_account override (3590, 3910, ...) while its moms still
   //     lands on 2611/2621/2631;
@@ -235,12 +322,12 @@ export function runVatDeclarationChecks(
   //     full moms untouched on 2611 (invoice-entries.ts), then credit 3001 with
   //     no moms in each dissolution month, so both directions drift by design.
   // Any of those would turn a proportional check into a permanent filing-
-  // blocking ERROR (isFilingBlocked) on a correct declaration. Making rutor 07
-  // and 08 mappable and reconciling the revenue_account override is the
-  // prerequisite; see the report accompanying this change.
-  //
-  // ONE direction is proportionally checkable without blocking: see
-  // SALES_OUTPUT_VAT_SHORTFALL below.
+  // blocking ERROR (isFilingBlocked) on a correct declaration. Note that ruta
+  // 08 (and ruta 42) is now derived from the ledger for voucher-booked revenue
+  // on accounts classified as rental_voluntary/exempt, but ruta 07 (VMB), the
+  // revenue_account override and periodisering drift remain, so both
+  // proportional directions are WARNING tier only: see
+  // SALES_OUTPUT_VAT_SHORTFALL and OUTPUT_VAT_EXCEEDS_SALES_BASE below.
   const taxableSalesBase = rutor.ruta05 + rutor.ruta06 + rutor.ruta07 + rutor.ruta08
   const taxableSalesOutput = rutor.ruta10 + rutor.ruta11 + rutor.ruta12
   if (taxableSalesBase > eps && taxableSalesOutput <= eps) {
@@ -281,23 +368,26 @@ export function runVatDeclarationChecks(
   // "Inga fel hittades" banner: undeclared moms and skattetillägg exposure
   // under SFL 49 kap 4 §.
   //
-  // Only THIS direction (reported base implies more output VAT than rutor
-  // 10-12 carry) is proportionally checkable: every unmapped drift source
-  // listed above (VMB, frivillig uthyrning, revenue_account overrides,
-  // periodisering in the invoice month) inflates the OUTPUT side and can only
-  // suppress this finding, never trigger it. The one legitimate trigger is
+  // In this direction (reported base implies more output VAT than rutor
+  // 10-12 carry) the drift sources listed above (VMB, revenue_account
+  // overrides, periodisering in the invoice month) inflate the OUTPUT side and
+  // can only suppress this finding, never trigger it. The one legitimate trigger is
   // periodiserade invoice lines dissolving (3001 credited with the moms
   // already declared in the invoice month), which is why this is a WARNING
   // that names that cause and never blocks filing (isFilingBlocked reads
   // ERROR only), following the RC_INPUT_VAT_MISMATCH precedent.
   //
   // The base comparison is exact per rate (basbelopp = moms/sats summed over
-  // 25/12/6), so legitimate mixed-rate declarations net to zero drift; the
-  // shared max(1 kr, 0.5%) tolerance absorbs per-voucher öre rounding.
+  // 25/12/6), so legitimate mixed-rate declarations net to zero drift. The
+  // tolerance is a flat 1 kr, the same as OUTPUT_VAT_EXCEEDS_SALES_BASE below:
+  // a percentage allowance (formerly max(1 kr, 0.5%)) let 500 kr of base on a
+  // 100 000 kr declaration, about 125 kr of utgående moms, pass silently. The
+  // cost of the tight limit is a warning (never a block) when öre rounding
+  // sums past 1 kr, and the message names when the warning can be left as is.
   const expectedSalesBase =
     rutor.ruta10 / 0.25 + rutor.ruta11 / 0.12 + rutor.ruta12 / 0.06
-  const salesTolerance = Math.max(1, expectedSalesBase * 0.005)
-  if (taxableSalesOutput > eps && taxableSalesBase > expectedSalesBase + salesTolerance) {
+  const SALES_BASE_TOLERANCE = 1
+  if (taxableSalesOutput > eps && taxableSalesBase > expectedSalesBase + SALES_BASE_TOLERANCE) {
     const shortfall = Math.round(taxableSalesBase - expectedSalesBase)
     findings.push({
       code: 'SALES_OUTPUT_VAT_SHORTFALL',
@@ -315,6 +405,61 @@ export function runVatDeclarationChecks(
         'löpande) och varningen kan lämnas utan åtgärd.',
       rutor: ['ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12'],
     })
+  }
+
+  // The opposite direction: output VAT (ruta 10-12) implies a larger base than
+  // rutor 05-08 carry. The usual cause is revenue whose account maps to no
+  // ruta (voucher-booked rent with voluntary tax liability, unclassified
+  // revenue accounts). Never silent: a deviation over a flat 1 kr warns, with
+  // no percentage allowance, because on a large base a percentage would hide
+  // a whole missing revenue account. The cost is a warning (never a block) on
+  // a period whose öre rounding sums past 1 kr; the message names the
+  // legitimate causes so the user can leave it.
+  //
+  // When the class 3 accounts the declaration names as reaching no ruta
+  // (REVENUE_ACCOUNT_WITHOUT_RUTA below) sum to the gap within the tolerance,
+  // that finding already states the cause per account and this one would
+  // only repeat it, so it stays quiet. In every other case it still warns:
+  // a small named account cannot hide a large gap, and a large named one
+  // (exempt rent, a bidrag) cannot hide an unrelated taxable gap, for example
+  // a sale on an account with momssats 0 %, which is never named.
+  const revenueWithoutRuta = context.revenueAccountsWithoutRuta ?? []
+  const namedRevenue = revenueWithoutRuta.reduce((sum, a) => sum + a.amount, 0)
+  const excessOutputBase = expectedSalesBase - taxableSalesBase
+  const explainedByNamedAccounts =
+    revenueWithoutRuta.length > 0 &&
+    Math.abs(roundOre(excessOutputBase - namedRevenue)) <= SALES_BASE_TOLERANCE
+  if (
+    !explainedByNamedAccounts &&
+    taxableSalesOutput > eps &&
+    taxableSalesBase > eps &&
+    excessOutputBase > SALES_BASE_TOLERANCE
+  ) {
+    findings.push({
+      code: 'OUTPUT_VAT_EXCEEDS_SALES_BASE',
+      status: 'WARNING',
+      message:
+        'Den utgående momsen (ruta 10-12) motsvarar ett underlag på cirka ' +
+        `${Math.round(expectedSalesBase).toLocaleString('sv-SE')} kr, men den ` +
+        'redovisade momspliktiga försäljningen (ruta 05-08) är bara ' +
+        `${Math.round(taxableSalesBase).toLocaleString('sv-SE')} kr: cirka ` +
+        `${Math.round(excessOutputBase).toLocaleString('sv-SE')} kr av underlaget ` +
+        'saknas. Kontrollera att intäktskonton (till exempel uthyrning med ' +
+        'frivillig skattskyldighet, ruta 08) har rätt "Standard moms" i ' +
+        'kontoplanen. Använder du periodisering av fakturarader, ' +
+        'vinstmarginalbeskattning (VMB) eller ett annat intäktskonto på ' +
+        'fakturaraden är skillnaden korrekt (momsen redovisas i ' +
+        'fakturamånaden eller på ett konto utan ruta) och varningen kan ' +
+        'lämnas utan åtgärd.',
+      rutor: ['ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12'],
+    })
+  }
+
+  // Revenue that reaches no ruta at all is invisible to every sales check above:
+  // it is missing from rutor 05-08 while its output VAT sits in rutor 10-12, so
+  // the binary pair clears and the proportional one only gets MORE lenient.
+  if (revenueWithoutRuta.length > 0) {
+    findings.push(revenueAccountWithoutRutaFinding(revenueWithoutRuta))
   }
 
   // SKV §4.1.1.4 rules 5 and 6: import base and import output VAT require each

@@ -113,7 +113,7 @@ export function suggestVatTreatment(
   if (accountClass === 3) {
     if (/\boss\b|one stop shop|unionsordning/.test(name)) return { treatment: 'oss', rate: null }
     if (/vmb|vinstmarginal/.test(name)) return { treatment: 'vmb', rate: null }
-    if (/hyra|uthyrning/.test(name) && /frivillig/.test(name)) return { treatment: 'rental_voluntary', rate }
+    if (/hyra|hyres|uthyrning/.test(name) && /frivillig/.test(name)) return { treatment: 'rental_voluntary', rate }
     if (/omvänd/.test(name)) return { treatment: 'reverse_charge_domestic', rate: 0 }
     if (/export|utanför eu/.test(name) && /var/.test(name)) return { treatment: 'export_goods', rate: 0 }
     if (/export|utanför eu/.test(name) && /tjänst|tjanst/.test(name)) return { treatment: 'export_services', rate: 0 }

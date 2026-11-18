@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import type { VatDeclarationRutor } from '@/types'
 import { runVatDeclarationChecks } from '../vat-declaration-checks'
+import { isFilingBlocked } from '../vat-filing-gate'
 
 const emptyRutor: VatDeclarationRutor = {
   ruta05: 0, ruta06: 0, ruta07: 0, ruta08: 0,
@@ -356,22 +357,11 @@ describe('runVatDeclarationChecks', () => {
       expect(runVatDeclarationChecks(rutor)).toEqual([])
     })
 
-    it('absorbs drift inside the 0.5% tolerance', () => {
+    // TESTÄNDRING lib/reports/__tests__/vat-declaration-checks.test.ts: the 0.5% allowance was removed in favour of a flat 1 kr limit (review of the ruta 08/42 change), so 40 kr drift on a 100 000 kr base now warns instead of passing.
+    it('warns on drift that a percentage allowance would have hidden', () => {
       const rutor: VatDeclarationRutor = {
         ...emptyRutor,
-        ruta05: 100040, // implied base 100 000, tolerance 500
-        ruta10: 25000,
-        ruta49: 25000,
-      }
-      expect(
-        runVatDeclarationChecks(rutor).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL'),
-      ).toBeUndefined()
-    })
-
-    it('warns just outside the 0.5% tolerance', () => {
-      const rutor: VatDeclarationRutor = {
-        ...emptyRutor,
-        ruta05: 100600, // implied base 100 000, tolerance 500
+        ruta05: 100040, // implied base 100 000: 40 kr of base without output VAT
         ruta10: 25000,
         ruta49: 25000,
       }
@@ -380,10 +370,45 @@ describe('runVatDeclarationChecks', () => {
       ).toBe('WARNING')
     })
 
-    it('applies the 1 kr tolerance floor at a small base', () => {
+    it('warns at a 500 kr shortfall on a 100 000 kr base', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100600, // implied base 100 000
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')?.status,
+      ).toBe('WARNING')
+    })
+
+    it('applies a flat 1 kr tolerance: 1 kr passes, 1.01 kr warns', () => {
+      const atLimit: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100001, // implied base 100 000: exactly 1 kr
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(atLimit).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL'),
+      ).toBeUndefined()
+
+      const overLimit: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 100001.01,
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(overLimit).find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')
+          ?.status,
+      ).toBe('WARNING')
+    })
+
+    it('applies the same 1 kr tolerance at a small base', () => {
       const inside: VatDeclarationRutor = {
         ...emptyRutor,
-        ruta05: 100.8, // implied 100, floor tolerance 1 kr
+        ruta05: 100.8, // implied 100, 0.80 kr drift
         ruta10: 25,
         ruta49: 25,
       }
@@ -411,6 +436,77 @@ describe('runVatDeclarationChecks', () => {
       const findings = runVatDeclarationChecks(rutor)
       expect(findings.find((f) => f.code === 'TAXABLE_SALES_WITHOUT_OUTPUT')?.status).toBe('ERROR')
       expect(findings.find((f) => f.code === 'SALES_OUTPUT_VAT_SHORTFALL')).toBeUndefined()
+    })
+  })
+
+  // The opposite direction: rutor 10-12 imply a larger base than rutor 05-08
+  // report, e.g. voucher-booked revenue on an account with no VAT treatment
+  // whose output VAT still lands on 2611. Flat 1 kr tolerance, never silent.
+  describe('OUTPUT_VAT_EXCEEDS_SALES_BASE (warning tier)', () => {
+    it('warns, names periodisering/VMB, and never blocks', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 1000,
+        ruta10: 25250, // implied base 101 000: 100 000 kr of base missing
+        ruta49: 25250,
+      }
+      const findings = runVatDeclarationChecks(rutor)
+      const finding = findings.find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')
+      expect(finding?.status).toBe('WARNING')
+      expect(finding?.message).toMatch(/periodisering/)
+      expect(finding?.message).toMatch(/VMB/)
+      expect(findings.every((f) => f.status === 'WARNING')).toBe(true)
+    })
+
+    it('warns on a deviation over 1 kr even at a large base (no percentage allowance)', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 99600, // implied base 100 000: 400 kr missing, far below 0.5%
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE')?.status,
+      ).toBe('WARNING')
+    })
+
+    it('yields to REVENUE_ACCOUNT_WITHOUT_RUTA only when the named accounts sum to the gap', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 10000,
+        ruta10: 27500, // implied base 110 000: 100 000 kr missing
+        ruta49: 27500,
+      }
+      // A 200 kr named account cannot explain a 100 000 kr gap: both warn.
+      const small = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3999', account_name: 'Övrigt', amount: 200 }],
+      }).map((f) => f.code)
+      expect(small).toEqual(['OUTPUT_VAT_EXCEEDS_SALES_BASE', 'REVENUE_ACCOUNT_WITHOUT_RUTA'])
+
+      // Named accounts covering the whole gap: only the per-account finding.
+      const covered = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3999', account_name: 'Övrigt', amount: 100000 }],
+      }).map((f) => f.code)
+      expect(covered).toEqual(['REVENUE_ACCOUNT_WITHOUT_RUTA'])
+
+      // A named account larger than the gap (exempt revenue, a bidrag) does
+      // not explain an unrelated taxable gap: both warn.
+      const larger = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3985', account_name: 'Bidrag', amount: 150000 }],
+      }).map((f) => f.code)
+      expect(larger).toEqual(['OUTPUT_VAT_EXCEEDS_SALES_BASE', 'REVENUE_ACCOUNT_WITHOUT_RUTA'])
+    })
+
+    it('stays silent at or under 1 kr of deviation', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 99999, // implied base 100 000: exactly 1 kr
+        ruta10: 25000,
+        ruta49: 25000,
+      }
+      expect(
+        runVatDeclarationChecks(rutor).find((f) => f.code === 'OUTPUT_VAT_EXCEEDS_SALES_BASE'),
+      ).toBeUndefined()
     })
   })
 
@@ -625,5 +721,94 @@ describe('runVatDeclarationChecks', () => {
     expect(codes).toContain('TAXABLE_SALES_WITHOUT_OUTPUT')
     expect(codes).toContain('RC_BASIS_MISSING')
     expect(codes).toContain('IMPORT_BASE_WITHOUT_OUTPUT')
+  })
+})
+
+// #3387: revenue on a class 3 account the declaration cannot classify reaches
+// no ruta, while its output VAT on 2611 still reaches ruta 10. With other
+// ruta 05 sales in the period every rutor-level check stays green, so the
+// finding needs the account list the declaration carries.
+describe('REVENUE_ACCOUNT_WITHOUT_RUTA', () => {
+  // 10 000 kr on 3001 with its 2 500 kr moms, plus 1 250 kr of moms on 2611 for
+  // sales booked on an unconfigured account: rutor-consistent on their own.
+  const rutor: VatDeclarationRutor = {
+    ...emptyRutor,
+    ruta05: 10000,
+    ruta10: 2812.5,
+    ruta49: 2812.5,
+  }
+
+  // TESTÄNDRING: upstream asserts no finding at all here. In this tree the
+  // rutor-level OUTPUT_VAT_EXCEEDS_SALES_BASE covers that hole (ruta 10 implies
+  // 11 250 kr, rutor 05-08 carry 10 000 kr), so only the per-account finding
+  // is absent without the account list.
+  it('names no account without the account list; the rutor-level warning covers it', () => {
+    for (const findings of [
+      runVatDeclarationChecks(rutor),
+      runVatDeclarationChecks(rutor, undefined, { revenueAccountsWithoutRuta: [] }),
+    ]) {
+      expect(findings.map((f) => [f.code, f.status])).toEqual([
+        ['OUTPUT_VAT_EXCEEDS_SALES_BASE', 'WARNING'],
+      ])
+    }
+  })
+
+  it('warns, naming the account and its amount, and does not block filing', () => {
+    const findings = runVatDeclarationChecks(rutor, undefined, {
+      revenueAccountsWithoutRuta: [
+        { account_number: '3543', account_name: 'Faktureringsavgift', amount: 1250 },
+      ],
+    })
+
+    expect(findings).toHaveLength(1)
+    const [finding] = findings
+    expect(finding.code).toBe('REVENUE_ACCOUNT_WITHOUT_RUTA')
+    expect(finding.status).toBe('WARNING')
+    // \s, not a literal space: sv-SE groups thousands with a no-break space.
+    expect(finding.message).toMatch(/Intäktskontot 3543 Faktureringsavgift \(1\s250,00 kr\)/)
+    expect(finding.message).toMatch(/Kontoplanen/)
+    expect(finding.message).toMatch(/momskod/)
+    expect(finding.message).toMatch(/ruta 05/)
+    expect(finding.detail).toMatch(/hindrar inte inlämning/)
+    expect(finding.rutor).toEqual(['ruta05', 'ruta42'])
+    expect(isFilingBlocked(findings)).toBe(false)
+  })
+
+  it('names at most five accounts and counts the rest', () => {
+    const accounts = ['3510', '3520', '3530', '3540', '3550', '3560', '3570'].map((n) => ({
+      account_number: n,
+      account_name: `Konto ${n}`,
+      amount: 100,
+    }))
+    // TESTÄNDRING: picked by code, not position. The named amounts do not cover
+    // the 1 250 kr gap here, so OUTPUT_VAT_EXCEEDS_SALES_BASE also fires first.
+    const finding = runVatDeclarationChecks(rutor, undefined, {
+      revenueAccountsWithoutRuta: accounts,
+    }).find((f) => f.code === 'REVENUE_ACCOUNT_WITHOUT_RUTA')!
+
+    expect(finding.message).toMatch(/^7 intäktskonton/)
+    expect(finding.message).toContain('3550 Konto 3550')
+    expect(finding.message).not.toContain('3560 Konto 3560')
+    expect(finding.message).toMatch(/och 2 till/)
+  })
+
+  it('keeps a net debit balance (a rabatt) visible with its sign', () => {
+    // TESTÄNDRING: picked by code, not position. The named amounts do not cover
+    // the 1 250 kr gap here, so OUTPUT_VAT_EXCEEDS_SALES_BASE also fires first.
+    const finding = runVatDeclarationChecks(rutor, undefined, {
+      revenueAccountsWithoutRuta: [{ account_number: '3731', account_name: '', amount: -500 }],
+    }).find((f) => f.code === 'REVENUE_ACCOUNT_WITHOUT_RUTA')!
+
+    expect(finding.message).toMatch(/Intäktskontot 3731 \(.500,00 kr\)/)
+  })
+
+  it('sits with the sales checks and leaves their order intact', () => {
+    const codes = runVatDeclarationChecks(
+      { ...emptyRutor, ruta05: 10000, ruta49: 0 },
+      undefined,
+      { revenueAccountsWithoutRuta: [{ account_number: '3543', account_name: 'X', amount: 1 }] },
+    ).map((f) => f.code)
+
+    expect(codes).toEqual(['TAXABLE_SALES_WITHOUT_OUTPUT', 'REVENUE_ACCOUNT_WITHOUT_RUTA'])
   })
 })

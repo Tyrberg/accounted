@@ -3,6 +3,7 @@ import type {
   VatDeclaration,
   VatDeclarationRutor,
   VatPeriodType,
+  VatRevenueAccountWithoutRuta,
 } from '@/types'
 import type { VatCheckAccountTotals } from './vat-declaration-checks'
 import { rcBasisTotalsByRate } from './vat-filing-gate'
@@ -40,6 +41,7 @@ import { fetchDynamicVatAccounts, type DynamicVatAccounts } from './vat-revenue-
  *   top of this fixed list: see fetchDynamicRuta05Accounts (#1261). This map
  *   only covers the accounts Accounted itself seeds.
  * Uttag (3401-3403) → ruta 06 (credit)
+ * Rent with frivillig skattskyldighet (3913) → ruta 08 (credit)
  * EU goods (3108) → ruta 35; EU services (3308) → ruta 39 (credit)
  * Export (3105/3305) → ruta 36/40; Exempt (3004/3100/3404/3994/3980) → ruta 42 (credit)
  * Reverse-charge purchase bases: read from the cost account the journal
@@ -99,6 +101,10 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '3401': { box: 'ruta06', side: 'credit' },
   '3402': { box: 'ruta06', side: 'credit' },
   '3403': { box: 'ruta06', side: 'credit' },
+  // Revenue: rent under frivillig skattskyldighet (ML 12 kap) → ruta 08. The
+  // BAS account itself defines the treatment, so it needs no configured
+  // "Standard moms"; its output VAT lands on 2613 (ruta 10).
+  '3913': { box: 'ruta08', side: 'credit' },  // Frivilligt momspliktiga hyresintäkter
   // Revenue: EU goods/services → ruta 35/39
   '3108': { box: 'ruta35', side: 'credit' },  // Varuförsäljning till EU
   '3308': { box: 'ruta39', side: 'credit' },  // Tjänsteförsäljning till EU
@@ -506,6 +512,57 @@ export function rcInputTotalsFromDeclaration(
 }
 
 /**
+ * Class 3 accounts that are not omsättning at all and that Accounted's own
+ * flows book without moms on ordinary sales and payments: 3740 Öres- och
+ * kronutjämning (invoice and payment rounding, the momsredovisning's own
+ * rounding line) and 3960 Valutakursvinster (exchange differences on
+ * receivables and payables). Neither belongs in any ruta and no momskod fits
+ * them, so listing them in REVENUE_ACCOUNT_WITHOUT_RUTA would fire for nearly
+ * every invoicing company every period with advice that cannot be followed.
+ * Any other account that is not a sale is silenced by setting momssats 0 %.
+ */
+const NON_TURNOVER_REVENUE_ACCOUNTS: ReadonlySet<string> = new Set([
+  '3740', // Öres- och kronutjämning
+  '3960',
+])
+
+/**
+ * The class 3 accounts with a balance in the period that this declaration puts
+ * in no ruta (#3387): no momskod, no momssats (configured or inferred) and not
+ * in ACCOUNT_RUTA. Feeds the REVENUE_ACCOUNT_WITHOUT_RUTA warning.
+ *
+ * Derived from the SAME resolution the figures use, so the warning and the
+ * declaration cannot disagree: `unconfiguredRevenueAccounts` is what
+ * fetchDynamicVatAccounts left out of `mappingByAccount` for want of any
+ * classification, and ACCOUNT_RUTA is exactly what rutorFromTotals sums by
+ * number. An account in ACCOUNT_TO_BOX (lib/vat/moms-box-mapping.ts) but not
+ * in ACCOUNT_RUTA is listed on purpose: the declaration does not sum it.
+ *
+ * Read-only: nothing here changes a filed figure. Whether such an account
+ * should be inferred into ruta 05 is an open decision; until then the user is
+ * told and sets the momskod.
+ *
+ * `amount` is the net credit balance rounded to öre; zero balances (activity
+ * that nets out) are dropped because they understate nothing. Sorted by
+ * account number so the message is stable.
+ */
+export function revenueAccountsWithoutRuta(
+  totals: VatCheckAccountTotals,
+  dynamicVatAccounts: Partial<Pick<DynamicVatAccounts, 'unconfiguredRevenueAccounts'>>,
+): VatRevenueAccountWithoutRuta[] {
+  const result: VatRevenueAccountWithoutRuta[] = []
+  for (const [account, name] of dynamicVatAccounts.unconfiguredRevenueAccounts ?? []) {
+    if (ACCOUNT_RUTA[account] || NON_TURNOVER_REVENUE_ACCOUNTS.has(account)) continue
+    const t = totals.get(account)
+    if (!t) continue
+    const amount = round(t.credit - t.debit)
+    if (amount === 0) continue
+    result.push({ account_number: account, account_name: name, amount })
+  }
+  return result.sort((a, b) => a.account_number.localeCompare(b.account_number))
+}
+
+/**
  * Calculate VAT declaration from the general ledger.
  *
  * Sums posted journal entry lines on the BAS accounts in ACCOUNT_RUTA per the
@@ -544,8 +601,14 @@ export async function calculateVatDeclaration(
 
   // Fetch and aggregate posted VAT-account activity for the period. The same
   // RPC round trip carries the per-source_type entry counts for the metadata.
+  //
+  // The unconfigured class 3 accounts ride along so the declaration can name
+  // the ones with a balance (revenueAccountsWithoutRuta). They join p_accounts
+  // only, which measures; rutorFromTotals never sums them, so no filed figure
+  // moves.
   const { totals, sourceTypeCounts } = await fetchVatAccountTotals(
-    supabase, companyId, start, end, dynamicVatAccounts.accounts
+    supabase, companyId, start, end,
+    [...dynamicVatAccounts.accounts, ...dynamicVatAccounts.unconfiguredRevenueAccounts.keys()],
   )
 
   // Map account balances to momsdeklaration boxes
@@ -614,6 +677,9 @@ export async function calculateVatDeclaration(
     // Per-momssats RC basis balances (44xx/45xx), the downgrade evidence for
     // the per-voucher gap tiering: see VatDeclaration.rcBasisByRate.
     rcBasisByRate: rcBasisTotalsByRate(totals, dynamicVatAccounts),
+    // Class 3 balances that reach no ruta, for REVENUE_ACCOUNT_WITHOUT_RUTA:
+    // see VatDeclaration.revenueAccountsWithoutRuta.
+    revenueAccountsWithoutRuta: revenueAccountsWithoutRuta(totals, dynamicVatAccounts),
     invoiceCount,
     transactionCount,
     breakdown: {
