@@ -1,4 +1,5 @@
 import type { VatDeclarationRutor, VatRevenueAccountWithoutRuta } from '@/types'
+import { roundOre } from '@/lib/money'
 
 /**
  * Local pre-flight checks for the momsdeklaration, run BEFORE the SKV
@@ -182,9 +183,10 @@ function reverseChargeInputVat(accountTotals: VatCheckAccountTotals): number {
  * the check compares the reverse-charge output against the reverse-charge INPUT
  * accounts, without it against the ruta 48 aggregate (see there).
  *
- * `context` is optional and only feeds `REVENUE_ACCOUNT_WITHOUT_RUTA`, which
- * needs account-level facts the rutor cannot carry. Every other check reads
- * the rutor alone.
+ * `context` is optional and feeds `REVENUE_ACCOUNT_WITHOUT_RUTA`, which
+ * needs account-level facts the rutor cannot carry, and decides whether
+ * `OUTPUT_VAT_EXCEEDS_SALES_BASE` is already explained by those accounts.
+ * Every other check reads the rutor alone.
  *
  * Returns an empty array when the declaration looks consistent. Order
  * within the returned array is stable so the UI can rely on it for
@@ -309,9 +311,10 @@ export function runVatDeclarationChecks(
   // (rutor 05-08 vs ruta10/0.25 + ruta11/0.12 + ruta12/0.06) is NOT sound on
   // the sales side as a filing-blocking ERROR, because ACCOUNT_RUTA's two
   // halves are not a closed set:
-  //   - rutor 07 (VMB) and 08 (frivillig uthyrning) have NO source accounts at
-  //     all, while their output VAT (2616/2626/2636, 2613/2623/2633) does feed
-  //     rutor 10-12, so the implied base permanently exceeds the reported one;
+  //   - ruta 07 (VMB) has NO source accounts at all, and ruta 08 (frivillig
+  //     uthyrning) only BAS 3913 plus accounts with that momskod, while their
+  //     output VAT (2616/2626/2636, 2613/2623/2633) does feed rutor 10-12, so
+  //     the implied base can exceed the reported one;
   //   - ruta 05 recognises only 3001/3002/3003, but an invoice line may carry
   //     any revenue_account override (3590, 3910, ...) while its moms still
   //     lands on 2611/2621/2631;
@@ -413,15 +416,21 @@ export function runVatDeclarationChecks(
   // a period whose öre rounding sums past 1 kr; the message names the
   // legitimate causes so the user can leave it.
   //
-  // When the declaration already names the class 3 accounts that reach no
-  // ruta (REVENUE_ACCOUNT_WITHOUT_RUTA below), that finding states the cause
-  // per account and this rutor-level one would only repeat it, so it stays
-  // quiet. Without the account list (or with none of those accounts) it is
-  // the fallback that keeps the inconsistency from passing silently.
+  // When the class 3 accounts the declaration names as reaching no ruta
+  // (REVENUE_ACCOUNT_WITHOUT_RUTA below) sum to the gap within the tolerance,
+  // that finding already states the cause per account and this one would
+  // only repeat it, so it stays quiet. In every other case it still warns:
+  // a small named account cannot hide a large gap, and a large named one
+  // (exempt rent, a bidrag) cannot hide an unrelated taxable gap, for example
+  // a sale on an account with momssats 0 %, which is never named.
   const revenueWithoutRuta = context.revenueAccountsWithoutRuta ?? []
+  const namedRevenue = revenueWithoutRuta.reduce((sum, a) => sum + a.amount, 0)
   const excessOutputBase = expectedSalesBase - taxableSalesBase
+  const explainedByNamedAccounts =
+    revenueWithoutRuta.length > 0 &&
+    Math.abs(roundOre(excessOutputBase - namedRevenue)) <= SALES_BASE_TOLERANCE
   if (
-    revenueWithoutRuta.length === 0 &&
+    !explainedByNamedAccounts &&
     taxableSalesOutput > eps &&
     taxableSalesBase > eps &&
     excessOutputBase > SALES_BASE_TOLERANCE

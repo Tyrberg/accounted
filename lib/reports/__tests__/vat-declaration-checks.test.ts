@@ -470,6 +470,33 @@ describe('runVatDeclarationChecks', () => {
       ).toBe('WARNING')
     })
 
+    it('yields to REVENUE_ACCOUNT_WITHOUT_RUTA only when the named accounts sum to the gap', () => {
+      const rutor: VatDeclarationRutor = {
+        ...emptyRutor,
+        ruta05: 10000,
+        ruta10: 27500, // implied base 110 000: 100 000 kr missing
+        ruta49: 27500,
+      }
+      // A 200 kr named account cannot explain a 100 000 kr gap: both warn.
+      const small = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3999', account_name: 'Övrigt', amount: 200 }],
+      }).map((f) => f.code)
+      expect(small).toEqual(['OUTPUT_VAT_EXCEEDS_SALES_BASE', 'REVENUE_ACCOUNT_WITHOUT_RUTA'])
+
+      // Named accounts covering the whole gap: only the per-account finding.
+      const covered = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3999', account_name: 'Övrigt', amount: 100000 }],
+      }).map((f) => f.code)
+      expect(covered).toEqual(['REVENUE_ACCOUNT_WITHOUT_RUTA'])
+
+      // A named account larger than the gap (exempt revenue, a bidrag) does
+      // not explain an unrelated taxable gap: both warn.
+      const larger = runVatDeclarationChecks(rutor, undefined, {
+        revenueAccountsWithoutRuta: [{ account_number: '3985', account_name: 'Bidrag', amount: 150000 }],
+      }).map((f) => f.code)
+      expect(larger).toEqual(['OUTPUT_VAT_EXCEEDS_SALES_BASE', 'REVENUE_ACCOUNT_WITHOUT_RUTA'])
+    })
+
     it('stays silent at or under 1 kr of deviation', () => {
       const rutor: VatDeclarationRutor = {
         ...emptyRutor,
@@ -753,9 +780,11 @@ describe('REVENUE_ACCOUNT_WITHOUT_RUTA', () => {
       account_name: `Konto ${n}`,
       amount: 100,
     }))
-    const [finding] = runVatDeclarationChecks(rutor, undefined, {
+    // TESTÄNDRING: picked by code, not position. The named amounts do not cover
+    // the 1 250 kr gap here, so OUTPUT_VAT_EXCEEDS_SALES_BASE also fires first.
+    const finding = runVatDeclarationChecks(rutor, undefined, {
       revenueAccountsWithoutRuta: accounts,
-    })
+    }).find((f) => f.code === 'REVENUE_ACCOUNT_WITHOUT_RUTA')!
 
     expect(finding.message).toMatch(/^7 intäktskonton/)
     expect(finding.message).toContain('3550 Konto 3550')
@@ -764,9 +793,11 @@ describe('REVENUE_ACCOUNT_WITHOUT_RUTA', () => {
   })
 
   it('keeps a net debit balance (a rabatt) visible with its sign', () => {
-    const [finding] = runVatDeclarationChecks(rutor, undefined, {
+    // TESTÄNDRING: picked by code, not position. The named amounts do not cover
+    // the 1 250 kr gap here, so OUTPUT_VAT_EXCEEDS_SALES_BASE also fires first.
+    const finding = runVatDeclarationChecks(rutor, undefined, {
       revenueAccountsWithoutRuta: [{ account_number: '3731', account_name: '', amount: -500 }],
-    })
+    }).find((f) => f.code === 'REVENUE_ACCOUNT_WITHOUT_RUTA')!
 
     expect(finding.message).toMatch(/Intäktskontot 3731 \(.500,00 kr\)/)
   })

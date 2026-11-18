@@ -40,7 +40,7 @@ registerEndpoint({
     'For monthly: period is 1-12. For quarterly: period is 1-4. For yearly: period is 1.',
     '`accounting_method` is accepted for backward compatibility but has no effect on the figures: the declaration is a pure ledger projection, and the method (faktureringsmetoden vs kontantmetoden per ML 15 kap 8-11 §§, ML 2023:200) is already reflected in when VAT-bearing journal entries are posted.',
     'Output ruta 49 = (10+11+12+30+31+32+60+61+62) − 48. Positive = pay; negative = refund.',
-    '`checks` lists the rutor-level consistency findings (`code`, `status` ERROR|WARNING, Swedish `message`, `rutor`). An empty array means none were found. It does not include the per-voucher reverse-charge basis scan that the web UI and MCP add on top. Read it before filing: for example OUTPUT_VAT_EXCEEDS_SALES_BASE means rutor 10-12 imply a larger base than rutor 05-08 report, usually a revenue account without a configured VAT treatment, and REVENUE_ACCOUNT_WITHOUT_RUTA names the class 3 accounts whose balance reaches no ruta (including exempt revenue, which has no output VAT to compare).',
+    '`checks` lists the rutor-level consistency findings (`code`, `status` ERROR|WARNING, Swedish `message`, `rutor`). An empty array means none were found. It does not include the per-voucher reverse-charge basis scan that the web UI and MCP add on top. Read it before filing: for example OUTPUT_VAT_EXCEEDS_SALES_BASE means rutor 10-12 imply a larger base than rutor 05-08 report, usually a revenue account without a configured VAT treatment, and REVENUE_ACCOUNT_WITHOUT_RUTA names the class 3 accounts whose balance reaches no ruta (including exempt revenue, which has no output VAT to compare). The same accounts are listed with their period balance in `revenueAccountsWithoutRuta` (`account_number`, `account_name`, `amount`), empty or absent when there are none.',
   ],
   example: {
     response: {
@@ -72,6 +72,7 @@ registerEndpoint({
           ruta62: 0,
           ruta49: 0,
         },
+        revenueAccountsWithoutRuta: [],
         checks: [],
       },
       meta: { request_id: 'req_…', api_version: '2026-05-12' },
