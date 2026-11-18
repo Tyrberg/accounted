@@ -1021,7 +1021,7 @@ describe('calculateVatDeclaration: voucher-only revenue (imported/manual)', () =
         default_vat_treatment: 'rental_voluntary',
       },
       {
-        account_number: '3914',
+        account_number: '3919',
         account_name: 'Hyresintäkter, momsfri',
         default_vat_rate: null,
         default_vat_treatment: 'exempt',
@@ -1030,7 +1030,7 @@ describe('calculateVatDeclaration: voucher-only revenue (imported/manual)', () =
     seedLedger([
       { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
       { account_number: '3911', debit_amount: 0, credit_amount: 4000 },
-      { account_number: '3914', debit_amount: 0, credit_amount: 500 },
+      { account_number: '3919', debit_amount: 0, credit_amount: 500 },
       { account_number: '2611', debit_amount: 0, credit_amount: 1250 },
     ])
 
@@ -1095,12 +1095,12 @@ describe('calculateVatDeclaration: voucher-only revenue (imported/manual)', () =
   it('does not file an unconfigured account in ruta 08/42 from its name alone', async () => {
     chartAccounts = [
       { account_number: '3911', account_name: 'Hyresintäkter, frivillig skattskyldighet', default_vat_rate: null },
-      { account_number: '3914', account_name: 'Hyresintäkter, momsfri', default_vat_rate: null },
+      { account_number: '3919', account_name: 'Hyresintäkter, momsfri', default_vat_rate: null },
     ]
     seedLedger([
       { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
       { account_number: '3911', debit_amount: 0, credit_amount: 4000 },
-      { account_number: '3914', debit_amount: 0, credit_amount: 500 },
+      { account_number: '3919', debit_amount: 0, credit_amount: 500 },
       { account_number: '2611', debit_amount: 0, credit_amount: 1250 },
     ])
 
@@ -1934,5 +1934,25 @@ describe('revenueAccountsWithoutRuta: parity with the declaration (#3387)', () =
   it('tolerates a resolution without the field (older mocks and callers)', () => {
     const totals = new Map([['3543', { debit: 0, credit: 1 }]])
     expect(revenueAccountsWithoutRuta(totals, {})).toEqual([])
+  })
+})
+
+describe('calculateVatDeclaration: exempt rent with no momskod is never silent', () => {
+  // Exempt revenue carries no output VAT, so no rutor-level comparison can see
+  // it missing from ruta 42. The per-account finding names it instead.
+  it('names an unconfigured rent account with no output VAT at all', async () => {
+    chartAccounts = [{ account_number: '3911', account_name: 'Hyresintäkter', default_vat_rate: null }]
+    seedLedger([{ account_number: '3911', debit_amount: 0, credit_amount: 10000 }])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta42).toBe(0)
+    const findings = runVatDeclarationChecks(result.rutor, undefined, {
+      revenueAccountsWithoutRuta: result.revenueAccountsWithoutRuta,
+    })
+    expect(findings.map((f) => [f.code, f.status])).toEqual([
+      ['REVENUE_ACCOUNT_WITHOUT_RUTA', 'WARNING'],
+    ])
+    expect(findings[0].message).toMatch(/3911 Hyresintäkter/)
   })
 })

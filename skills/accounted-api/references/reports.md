@@ -750,7 +750,7 @@ Example response `200`:
 **Swedish VAT declaration (momsdeklaration) for a period.**
 `scope:reports:read · risk:low · idempotent`
 
-Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå: the bottom line). Mapping rules match SKV 4700.
+Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 08 (rent with voluntary tax liability), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 42 (other VAT-exempt sales), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå: the bottom line). Mapping rules match SKV 4700.
 
 **Use when:** Submitting momsdeklaration to Skatteverket, reconciling VAT balances at month/quarter end, or building a VAT-payable dashboard.
 **Do not use for:** Specific transaction VAT lookups (use /transactions/{id}). Period-mismatch reconciliation (use /reports/general-ledger filtered to 26xx accounts).
@@ -760,6 +760,7 @@ Computes momsdeklaration rutor for the given period_type / year / period. The re
 - For monthly: period is 1-12. For quarterly: period is 1-4. For yearly: period is 1.
 - `accounting_method` is accepted for backward compatibility but has no effect on the figures: the declaration is a pure ledger projection, and the method (faktureringsmetoden vs kontantmetoden per ML 15 kap 8-11 §§, ML 2023:200) is already reflected in when VAT-bearing journal entries are posted.
 - Output ruta 49 = (10+11+12+30+31+32+60+61+62) − 48. Positive = pay; negative = refund.
+- `checks` lists the rutor-level consistency findings (`code`, `status` ERROR|WARNING, Swedish `message`, `rutor`). An empty array means none were found. It does not include the per-voucher reverse-charge basis scan that the web UI and MCP add on top. Read it before filing: for example OUTPUT_VAT_EXCEEDS_SALES_BASE means rutor 10-12 imply a larger base than rutor 05-08 report, usually a revenue account without a configured VAT treatment, and REVENUE_ACCOUNT_WITHOUT_RUTA names the class 3 accounts whose balance reaches no ruta (including exempt revenue, which has no output VAT to compare).
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
@@ -789,6 +790,7 @@ Example response `200`:
     "period": 4,
     "rutor": {
       "ruta05": 0,
+      "ruta08": 0,
       "ruta10": 0,
       "ruta11": 0,
       "ruta12": 0,
@@ -802,13 +804,15 @@ Example response `200`:
       "ruta32": 0,
       "ruta39": 0,
       "ruta40": 0,
+      "ruta42": 0,
       "ruta48": 0,
       "ruta50": 0,
       "ruta60": 0,
       "ruta61": 0,
       "ruta62": 0,
       "ruta49": 0
-    }
+    },
+    "checks": []
   },
   "meta": {
     "request_id": "req_…",

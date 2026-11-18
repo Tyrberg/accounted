@@ -55,6 +55,11 @@ export interface VatDeclarationCheck {
   status: VatDeclarationCheckStatus
   /** Swedish user-facing message; safe to render directly in the UI. */
   message: string
+  /**
+   * The figures and the rule behind the message, for whoever wants them. The
+   * UI in this tree does not render it yet; API and MCP clients receive it.
+   */
+  detail?: string
   /** Optional rutor that the user should investigate. */
   rutor?: Array<keyof VatDeclarationRutor>
 }
