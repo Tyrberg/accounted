@@ -38,6 +38,9 @@ const manifest = parseManifest(readFileSync(join(REPO_ROOT, 'fork/adaptations.js
 // (e.g. keying by adaptation id alone instead of exact paths) fails both
 // tests together instead of leaving a hand-copied regression test green.
 const REVIEWED_OUTSIDE_FORK: Record<string, readonly string[]> = {
+  'migration-registration-links-fixed-fx': [
+    'extensions/general/arcim-migration/__tests__/migration-registration-links.test.ts',
+  ],
   'sie-migration-validation': [
     'lib/import/sie-migration-validation.ts',
     'lib/import/__tests__/sie-migration-validation.test.ts',
@@ -97,6 +100,26 @@ describe('the committed manifest', () => {
     const local = results.filter((result) => result.check.kind.startsWith('local-'))
     expect(local.length).toBeGreaterThan(0)
     expect(local.filter((result) => result.status !== 'pass').map((result) => result.detail)).toEqual([])
+  })
+
+  it('detects reverting either the fixed FX mock or the exact registration-link total', () => {
+    const adaptation = manifest.adaptations.find((candidate) => candidate.id === 'migration-registration-links-fixed-fx')
+    expect(adaptation).toBeDefined()
+    if (!adaptation) return
+
+    const path = 'extensions/general/arcim-migration/__tests__/migration-registration-links.test.ts'
+    const source = workingTree.read(path)!
+    for (const reverted of [
+      source.replace('rate: 11.5,', 'rate: 1,'),
+      source.replace('totalSek: 11500,', 'totalSek: expect.any(Number),'),
+    ]) {
+      const results = evaluateAdaptations([adaptation], {
+        local: { read: (candidate) => candidate === path ? reverted : workingTree.read(candidate) },
+        upstream: UNAVAILABLE_TREE,
+        includeUpstream: false,
+      })
+      expect(results.some((result) => result.status === 'fail')).toBe(true)
+    }
   })
 
   it('holds every upstream anchor against OUR copy of those files, which is the most CI can see', () => {
