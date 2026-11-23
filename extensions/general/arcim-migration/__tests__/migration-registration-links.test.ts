@@ -35,6 +35,18 @@ vi.mock('@/lib/invoices/link-migrated-registration-vouchers', () => ({
   linkMigratedRegistrationVouchers: vi.fn(),
 }))
 
+// The EUR invoice's SEK total comes from the run's rate index. A fixed rate
+// keeps the suite off the live Riksbank API, whose misses (network, rate
+// limit) would otherwise leave totalSek null.
+// TESTÄNDRING migration-registration-links.test.ts: the scenario is unchanged (same EUR invoice, same linker call); only the live Riksbank rate is replaced by a fixed 11.5, and the totalSek assertion is tightened from any number to the exact 11500.
+vi.mock('@/lib/currency/riksbanken', () => ({
+  fetchExchangeRate: vi.fn(async (currency: string, date: Date) => ({
+    currency,
+    rate: 11.5,
+    date: date.toISOString().split('T')[0],
+  })),
+}))
+
 vi.mock('@/lib/supabase/fetch-all', () => ({
   fetchAllRows: vi.fn().mockResolvedValue([]),
 }))
@@ -183,7 +195,8 @@ describe('executeMigration: registration voucher links', () => {
         invoiceDate: '2025-03-14',
         // The SEK total comes from the run's rate index; the linker gets the
         // currency so a mismatch can be explained as a rate difference.
-        totalSek: expect.any(Number),
+        // 1000 EUR at the mocked rate 11.5.
+        totalSek: 11500,
         currencyCode: 'EUR',
         invoiceNumber: '1003',
       },
