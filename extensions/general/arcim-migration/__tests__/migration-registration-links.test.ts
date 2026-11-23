@@ -35,6 +35,18 @@ vi.mock('@/lib/invoices/link-migrated-registration-vouchers', () => ({
   linkMigratedRegistrationVouchers: vi.fn(),
 }))
 
+// TESTÄNDRING migration-registration-links.test.ts: Preserve the EUR invoice scenario with a deterministic rate instead of a live network dependency.
+// The EUR invoice's SEK total comes from the run's rate index. A fixed rate
+// keeps the suite off the live Riksbank API, whose misses (network, rate
+// limit) would otherwise leave totalSek null.
+vi.mock('@/lib/currency/riksbanken', () => ({
+  fetchExchangeRate: vi.fn(async (currency: string, date: Date) => ({
+    currency,
+    rate: 11.5,
+    date: date.toISOString().split('T')[0],
+  })),
+}))
+
 vi.mock('@/lib/supabase/fetch-all', () => ({
   fetchAllRows: vi.fn().mockResolvedValue([]),
 }))
@@ -54,6 +66,7 @@ vi.mock('../lib/insert-fallback', () => ({
 }))
 
 import { executeMigration } from '../lib/migration-orchestrator'
+import { fetchExchangeRate } from '@/lib/currency/riksbanken'
 import {
   fetchSalesInvoicesHydrated,
   fetchSupplierInvoicesHydrated,
@@ -151,6 +164,9 @@ describe('executeMigration: registration voucher links', () => {
       baseOptions({ importSalesInvoices: true, importSupplierInvoices: true }),
     )
 
+    expect(fetchExchangeRate).toHaveBeenCalledExactlyOnceWith(
+      'EUR', new Date('2025-03-14'), expect.anything(),
+    )
     expect(mLink).toHaveBeenCalledTimes(1)
     const call = mLink.mock.calls[0][0]
     expect(call.companyId).toBe('company-1')
@@ -183,7 +199,8 @@ describe('executeMigration: registration voucher links', () => {
         invoiceDate: '2025-03-14',
         // The SEK total comes from the run's rate index; the linker gets the
         // currency so a mismatch can be explained as a rate difference.
-        totalSek: expect.any(Number),
+        // 1000 EUR at the mocked rate 11.5.
+        totalSek: 11500,
         currencyCode: 'EUR',
         invoiceNumber: '1003',
       },

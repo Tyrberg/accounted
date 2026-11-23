@@ -7,6 +7,34 @@
   "maxSyncAgeDays": 10,
   "adaptations": [
     {
+      "id": "migration-registration-links-fixed-fx",
+      "tier": 2,
+      "summary": "Make the registration-link migration test independent of the live exchange-rate service and assert the exact SEK total.",
+      "why": "An unrelated test stabilization needed for offline PR checks: configuration cannot replace a module dependency inside this upstream-owned test. Keep this temporary patch declared until it can be contributed upstream. The reviewed PR carries it into main, its permanent maintenance branch until upstream adopts it. This test-only exception to fork/patches is recorded in fork/DECISIONS.md; upgrades preserve it with the main merge and rerun its local checks.",
+      "paths": [
+        "extensions/general/arcim-migration/__tests__/migration-registration-links.test.ts"
+      ],
+      "tracked": true,
+      "branch": "main",
+      "upstream": {
+        "status": "planned"
+      },
+      "checks": [
+        {
+          "kind": "local-contains",
+          "path": "extensions/general/arcim-migration/__tests__/migration-registration-links.test.ts",
+          "pattern": "vi\\.mock\\('@/lib/currency/riksbanken', [\\s\\S]*?fetchExchangeRate: vi\\.fn\\([\\s\\S]*?rate: 11\\.5,",
+          "reason": "The fixed exchange-rate mock disappeared, so registration-link tests may depend on the live rate service again."
+        },
+        {
+          "kind": "local-contains",
+          "path": "extensions/general/arcim-migration/__tests__/migration-registration-links.test.ts",
+          "pattern": "totalSek: 11500,",
+          "reason": "The exact SEK assertion disappeared, weakening the fixed-rate registration-link scenario."
+        }
+      ]
+    },
+    {
       "id": "fork-maintenance-layer",
       "tier": 1,
       "summary": "The fork/ directory itself: manifest, sync routine, tests and the upgrade/AGPL/upstream-contribution documentation.",

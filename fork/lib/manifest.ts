@@ -192,6 +192,14 @@ function parseAdaptation(raw: unknown, index: number): Adaptation {
   if (branch !== undefined && (typeof branch !== 'string' || branch.trim() === '')) {
     fail(at, '"branch" must be a non-empty string when present')
   }
+  if (typeof branch === 'string' && (
+    branch.startsWith('-') || branch === 'HEAD' ||
+    /[\x00-\x20\x7f~^:?*\[\\]/.test(branch) ||
+    branch.includes('..') || branch.includes('@{') || branch.endsWith('.') ||
+    branch.split('/').some((part) => !part || part.startsWith('.') || part.endsWith('.lock'))
+  )) {
+    fail(at, '"branch" must be a valid Git branch name')
+  }
   if (tier === 2 && branch === undefined) {
     fail(at, 'tier 2 requires "branch": a thin patch must say which branch carries it')
   }

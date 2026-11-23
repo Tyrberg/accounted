@@ -153,6 +153,27 @@ describe('parseManifest', () => {
     ).toThrow(/tier 1 must not set "branch"/)
   })
 
+  it.each([
+    'harness-managed task branch', 'fork/patch\tseries', 'fork/patch\nseries',
+    'fork/patch\x00series', 'fork/patch\x7fseries',
+    '-patch', 'HEAD', '/patch', 'fork/', 'fork//patch', 'fork/.patch',
+    'fork/patch.lock', 'fork/patch.lock/next', 'fork/patch.', 'fork/patch..next',
+    'fork/patch@{1}', 'fork/patch~1', 'fork/patch^', 'fork/patch:next',
+    'fork/patch?', 'fork/patch*', 'fork/patch[1]', 'fork\\patch',
+  ])('rejects invalid carrying branch %j', (branch) => {
+    expect(() => parseManifest(manifest({
+      adaptations: [{ ...trackedAdaptation, tier: 2, branch }],
+    }))).toThrow(/"branch" must be a valid Git branch name/)
+  })
+
+  it.each(['main', 'fork/patches', 'fix/offline-fx-test', 'release/v1.2.3', 'patch@next'])(
+    'preserves valid carrying branch %s', (branch) => {
+      expect(parseManifest(manifest({
+        adaptations: [{ ...trackedAdaptation, tier: 2, branch }],
+      })).adaptations[0].branch).toBe(branch)
+    },
+  )
+
   it('refuses a ref that does not live on the configured remote', () => {
     expect(() =>
       parseManifest(manifest({ upstream: { repo: 'x/y', remote: 'upstream', ref: 'origin/main' } })),
