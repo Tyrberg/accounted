@@ -242,6 +242,32 @@ describe('auditRowToEvent: journal_entries', () => {
     expect(ev.actor.type).toBe('system')
     expect(ev.details[0]).toContain('2025-01-01')
   })
+
+  it('emits LOCKED_PERIOD_ATTACH on the verifikat with file, sha256, reason and key', () => {
+    const ev = auditRowToEvent(
+      auditRow({
+        action: 'LOCKED_PERIOD_ATTACH',
+        record_id: 'entry-7',
+        new_state: {
+          voucher_series: 'A',
+          voucher_number: 7,
+          file_name: 'kvitto.pdf',
+          sha256_hash: 'ab'.repeat(32),
+          reason: 'Underlag till stängt år',
+          api_key_name: 'backoffice',
+        },
+      }),
+    )!
+    expect(ev.code).toBe('journal_entry.locked_period_attach')
+    expect(ev.category).toBe('verifikation')
+    expect(ev.object).toContain('7')
+    expect(ev.details).toEqual([
+      'Fil: kvitto.pdf',
+      `SHA-256: ${'ab'.repeat(32)}`,
+      'Orsak: Underlag till stängt år',
+      'API-nyckel: backoffice',
+    ])
+  })
 })
 
 describe('auditRowToEvent: system changes', () => {

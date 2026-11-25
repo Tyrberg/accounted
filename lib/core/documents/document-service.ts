@@ -92,9 +92,21 @@ export function buildReservedDocumentStoragePath(
   return `${DOCUMENTS_PATH_ROOT}/${companyId}/${userId}/${uploadId}_${sanitizeFileName(fileName)}`
 }
 
-/** True when the key already sits under the company-scoped prefix. */
+/**
+ * True when a `/`-separated segment of the key is `.` or `..`. Only whole
+ * segments can resolve outside a prefix; consecutive dots inside a file name
+ * (`receipt..pdf`, which sanitizeFileName preserves) are ordinary characters.
+ */
+function hasDotPathSegment(storagePath: string): boolean {
+  return storagePath.split('/').some((segment) => segment === '.' || segment === '..')
+}
+
+/**
+ * True when the key already sits under the company-scoped prefix. A key with
+ * a `.` or `..` path segment never counts: it could resolve outside that prefix.
+ */
 export function isCompanyScopedDocumentPath(storagePath: string, companyId: string): boolean {
-  return storagePath.startsWith(`${DOCUMENTS_PATH_ROOT}/${companyId}/`)
+  return storagePath.startsWith(`${DOCUMENTS_PATH_ROOT}/${companyId}/`) && !hasDotPathSegment(storagePath)
 }
 
 /**
@@ -107,7 +119,7 @@ export function companyScopedDocumentPath(
   storagePath: string,
   companyId: string
 ): string | null {
-  if (isCompanyScopedDocumentPath(storagePath, companyId)) return null
+  if (hasDotPathSegment(storagePath) || isCompanyScopedDocumentPath(storagePath, companyId)) return null
   const prefix = `${DOCUMENTS_PATH_ROOT}/`
   if (!storagePath.startsWith(prefix)) return null
   return `${prefix}${companyId}/${storagePath.slice(prefix.length)}`

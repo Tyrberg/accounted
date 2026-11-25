@@ -47,6 +47,7 @@ import CorrectMetadataDialog from '@/components/bookkeeping/CorrectMetadataDialo
 import EditDraftEntryDialog from '@/components/bookkeeping/EditDraftEntryDialog'
 import RecordateEntryDialog from '@/components/bookkeeping/RecordateEntryDialog'
 import CorrectionChain from '@/components/bookkeeping/CorrectionChain'
+import LockedAttachHistory, { type LockedAttachLogRow } from '@/components/bookkeeping/LockedAttachHistory'
 import RetagLineDialog, { type RetagLine } from '@/components/dimensions/RetagLineDialog'
 import { useCompanySettings } from '@/components/settings/useSettings'
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
@@ -142,6 +143,8 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
   const [showStrikeLines, setShowStrikeLines] = useState(false)
   const [showCorrectMetadata, setShowCorrectMetadata] = useState(false)
   const [rattelseLog, setRattelseLog] = useState<RattelseLogRow[]>([])
+  // Audit trail of underlag archived into a locked/closed period (LOCKED_PERIOD_ATTACH).
+  const [lockedAttachLog, setLockedAttachLog] = useState<LockedAttachLogRow[]>([])
   // Lock state of the period covering entry_date, from the period-status
   // preview endpoint. Gates the visible "Stryk rader" button: inline rättelse
   // only applies while the period is open, so the promoted button hides
@@ -193,12 +196,17 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
     setIsLoading(true)
     setError(null)
     try {
-      const [chainRes, refsRes, retagRes, rattelseRes] = await Promise.all([
+      const [chainRes, refsRes, retagRes, rattelseRes, lockedAttachRes] = await Promise.all([
         fetch(`/api/bookkeeping/journal-entries/${id}/chain`),
         fetch(`/api/bookkeeping/journal-entries/${id}/references`),
         fetch(`/api/bookkeeping/journal-entries/${id}/retag-log`),
         fetch(`/api/bookkeeping/journal-entries/${id}/rattelse-log`),
+        fetch(`/api/bookkeeping/journal-entries/${id}/locked-attach-log`),
       ])
+      if (lockedAttachRes.ok) {
+        const lockedAttachPayload = await lockedAttachRes.json()
+        setLockedAttachLog(Array.isArray(lockedAttachPayload.data) ? lockedAttachPayload.data : [])
+      }
       if (retagRes.ok) {
         const retagPayload = await retagRes.json()
         setRetagLog(Array.isArray(retagPayload.data) ? retagPayload.data : [])
@@ -1079,6 +1087,10 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
           </ul>
         </DetailSection>
       )}
+
+      {/* Underlag archived into a locked/closed period: who, key, when, file,
+          sha256 and reason from audit_log (LOCKED_PERIOD_ATTACH). */}
+      <LockedAttachHistory rows={lockedAttachLog} />
 
       {/* Dimension retag history (dimensions plan PR6): the immutable
           before/after trail. Stays Swedish (voucher detail surface). */}

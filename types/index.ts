@@ -3415,6 +3415,7 @@ export type AuditAction =
   | 'INTEGRITY_FAILURE'
   | 'COMMITTED_AT_OVERRIDE'
   | 'RESET_SNAPSHOT'
+  | 'LOCKED_PERIOD_ATTACH'
 
 export interface AuditLogEntry {
   id: string
